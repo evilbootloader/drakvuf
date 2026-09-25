@@ -857,6 +857,7 @@ AC_CONFIG_FILES([Makefile src/Makefile
                  src/plugins/Makefile
                  src/dirwatch/Makefile
                  src/libusermode/Makefile
+                 src/libusermode-linux/Makefile
                  src/librepl/Makefile
                  src/libhook/Makefile
                  src/helpers/hiddump/Makefile
