@@ -27,6 +27,13 @@ fi
 
 arch=amd64
 
+# Stitch the upstream Xen version together with the DRAKVUF build version
+# (which already contains the submodule sha + plugin hash + patch hash).
+# The result is unique per CI build, so apt no longer treats two different
+# patch revisions as "same version, nothing to do" -- and `dpkg -l
+# xen-hypervisor` actually shows which build is installed.
+xen_full_version="$xenversion-$version"
+
 ## BUILD XEN DEB
 
 # Prepare the directory to package
@@ -43,7 +50,7 @@ mkdir -p deb/DEBIAN
 cat >deb/DEBIAN/control <<EOF
 Package: xen-hypervisor
 Source: xen-hypervisor
-Version: $xenversion
+Version: $xen_full_version
 Architecture: $arch
 Maintainer: Tamas K Lengyel <tamas@tklengyel.com>
 Depends: libpixman-1-0, libpng16-16, libnettle6 | libnettle7 | libnettle8, libgnutls30, libfdt1, libyajl2, libaio1 | libaio1t64, libncurses6, libc6, libtinfo6, libgnutls28-dev, systemd, lvm2
@@ -62,6 +69,17 @@ cp package/extra/usr/bin/drak-find-xen-defaults deb/usr/bin/
 
 # Find all /etc files and add them to conffiles
 find deb/etc -type f -printf /etc/%P\\n >deb/DEBIAN/conffiles
+
+# Drop a build-info marker outside /etc so dpkg always replaces it on
+# upgrade (anything in /etc would get conffile-managed). One-liner check
+# from any host: `cat /usr/share/doc/xen-hypervisor/BUILD-INFO`
+mkdir -p deb/usr/share/doc/xen-hypervisor
+cat >deb/usr/share/doc/xen-hypervisor/BUILD-INFO <<EOF
+xen_version=$xenversion
+drakvuf_build=$version
+deb_version=$xen_full_version
+EOF
+
 cp package/postinst deb/DEBIAN/postinst
 cp package/postrm deb/DEBIAN/postrm
 

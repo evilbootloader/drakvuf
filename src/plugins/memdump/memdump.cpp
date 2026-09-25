@@ -109,6 +109,8 @@
 #include "plugins/output_format.h"
 
 #include "memdump.h"
+#include "win.h"
+#include "linux.h"
 #include "private.h"
 
 #define DUMP_NAME_PLACEHOLDER "(not configured)"
@@ -133,13 +135,13 @@ static void save_file_metadata(const drakvuf_trap_info_t* info,
         return;
 
     json_object* jobj = json_object_new_object();
-    json_object_object_add(jobj, "Method", json_object_new_string(method));
-    json_object_object_add(jobj, "DumpReason", json_object_new_string(dump_reason));
+    json_object_object_add(jobj, "Method", json_object_new_string(method ? method : ""));
+    json_object_object_add(jobj, "DumpReason", json_object_new_string(dump_reason ? dump_reason : ""));
     json_object_object_add(jobj, "DumpAddress", json_object_new_string_fmt("0x%" PRIx64, dump_address));
     json_object_object_add(jobj, "DumpSize", json_object_new_string_fmt("0x%" PRIx64, dump_size));
     json_object_object_add(jobj, "PID", json_object_new_int(info->attached_proc_data.pid));
     json_object_object_add(jobj, "PPID", json_object_new_int(info->attached_proc_data.ppid));
-    json_object_object_add(jobj, "ProcessName", json_object_new_string(info->attached_proc_data.name));
+    json_object_object_add(jobj, "ProcessName", json_object_new_string(info->attached_proc_data.name ? info->attached_proc_data.name : ""));
 
     if (extras && extras->type == WriteVirtualMemoryExtras)
     {
@@ -157,14 +159,6 @@ static void save_file_metadata(const drakvuf_trap_info_t* info,
     json_object_put(jobj);
 }
 
-/**
- * Dumps the memory specified by access context, from `ctx->addr` (first byte) to `ctx->addr + len_bytes - 1` (last byte).
- * File is stored in a path provided in --memdump-dir command line option and named according to the scheme:
- * <process_pid>_<base_address>_<counter>.dmp
- *
- * For some dumps, a custom structure `extras` may be optionally provided
- * which will enrich the default data printout.
- */
 bool dump_memory_region(
     drakvuf_t drakvuf,
     vmi_instance_t vmi,
@@ -203,7 +197,6 @@ bool dump_memory_region(
 
     if (!plugin->memdump_dir)
     {
-        // dry run, just print that the dump would be saved
         ret = true;
         display_file = DUMP_NAME_PLACEHOLDER;
         goto printout;
@@ -219,10 +212,7 @@ bool dump_memory_region(
     access_ptrs = (void**)g_malloc(num_pages * sizeof(void*));
 
     if (VMI_SUCCESS != vmi_mmap_guest(vmi, ctx, num_pages, PROT_READ, access_ptrs))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed mmap guest\n");
         goto done;
-    }
 
     checksum = g_checksum_new(G_CHECKSUM_SHA256);
 
@@ -232,14 +222,9 @@ bool dump_memory_region(
     fp = fopen(tmp_file_path, "w");
 
     if (!fp)
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to open file\n");
         goto done;
-    }
-
     for (size_t i = 0; i < num_pages; i++)
     {
-        // sometimes we are supposed to write less than the whole page
         size_t write_length = tmp_len_bytes;
 
         if (write_length > VMI_PS_4KB - intra_page_offset)
@@ -253,13 +238,11 @@ bool dump_memory_region(
         }
         else
         {
-            // unaccessible page, pad with zeros to ensure proper alignment of the data
             uint8_t zeros[VMI_PS_4KB] = {};
             fwrite(zeros + intra_page_offset, write_length, 1, fp);
             g_checksum_update(checksum, (const guchar*)zeros + intra_page_offset, write_length);
         }
 
-        // this applies only to the first page
         intra_page_offset = 0;
         tmp_len_bytes -= write_length;
     }
@@ -295,8 +278,6 @@ bool dump_memory_region(
     ret = true;
 
 printout:
-    // scoping the block as goto jumps
-    // bypasses variable initialization
     {
         auto default_print = std::make_tuple(
                 keyval("DumpReason", fmt::Qstr(reason)),
@@ -332,59 +313,10 @@ done:
     return ret;
 }
 
-static bool dump_if_points_to_executable_memory(
-    drakvuf_t drakvuf,
-    drakvuf_trap_info* info,
-    vmi_instance_t vmi,
-    addr_t process_base,
-    addr_t target_addr,
-    const char* reason,
-    extras_t* extras)
+bool is_kernel_addr(drakvuf_t drakvuf, addr_t addr)
 {
-    memdump* plugin = get_trap_plugin<memdump>(info);
-
-    addr_t dtb;
-    if (!drakvuf_get_process_dtb(drakvuf, process_base, &dtb))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to retrieve process dtb\n");
-        return false;
-    }
-
-    // Get page protection flags.
-    page_info_t p_info = {};
-    if (VMI_SUCCESS != vmi_pagetable_lookup_extended(vmi, dtb, target_addr, &p_info))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to retrieve page protection flags\n");
-        return false;
-    }
-
-    bool page_valid = (p_info.x86_ia32e.pte_value & (1UL << 0)) != 0;
-    bool page_execute = (p_info.x86_ia32e.pte_value & (1UL << 63)) == 0;
-    if (!page_valid || !page_execute)
-    {
-        return false;
-    }
-
-    // Segment is valid and executable – dump it.
-    mmvad_info_t mmvad;
-    if (!drakvuf_find_mmvad(drakvuf, process_base, target_addr, &mmvad))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to find mmvad\n");
-        return false;
-    }
-
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = dtb,
-        .addr = mmvad.starting_vpn * VMI_PS_4KB
-    );
-    size_t dump_size = (mmvad.ending_vpn - mmvad.starting_vpn + 1) * VMI_PS_4KB;
-    if (!dump_memory_region(drakvuf, vmi, info, plugin, &ctx, dump_size, reason, extras, extras != nullptr))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to dump memory\n");
-        return false;
-    }
-    return true;
+    bool const is_os_64bit = (drakvuf_get_page_mode(drakvuf) == VMI_PM_IA32E);
+    return is_os_64bit ? VMI_GET_BIT(addr, 47) : VMI_GET_BIT(addr, 31);
 }
 
 bool inspect_stack_ptr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, memdump* plugin, bool is_32bit, addr_t stack_ptr)
@@ -399,8 +331,6 @@ bool inspect_stack_ptr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, memdump* pl
 
     size_t bytes_read = 0;
     uint8_t buf[512];
-    // read up to 512 bytes of stack, this may fail returning a partial result
-    // thus, the following for loop analyzes the buffer only up to the `bytes_read` value
 
     (void)vmi_read(vmi, &ctx, 512, buf, &bytes_read);
 
@@ -423,7 +353,6 @@ bool inspect_stack_ptr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, memdump* pl
             continue;
 
         bool page_valid = (p_info.x86_ia32e.pte_value & (1UL << 0)) != 0;
-        //bool page_write = (p_info.x86_ia32e.pte_value & (1UL << 1)) != 0;
         bool page_execute = (p_info.x86_ia32e.pte_value & (1UL << 63)) == 0;
 
         if (page_valid && page_execute && mmvad.file_name_ptr)
@@ -472,12 +401,6 @@ bool inspect_stack_ptr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, memdump* pl
     return VMI_EVENT_RESPONSE_NONE;
 }
 
-bool is_kernel_addr(drakvuf_t drakvuf, addr_t addr)
-{
-    bool const is_os_64bit = (drakvuf_get_page_mode(drakvuf) == VMI_PM_IA32E);
-    return is_os_64bit ? VMI_GET_BIT(addr, 47) : VMI_GET_BIT(addr, 31);
-}
-
 bool dump_from_stack(drakvuf_t drakvuf, drakvuf_trap_info_t* info, memdump* plugin)
 {
     bool is_32bit = drakvuf_process_is32bit(drakvuf, info);
@@ -486,7 +409,6 @@ bool dump_from_stack(drakvuf_t drakvuf, drakvuf_trap_info_t* info, memdump* plug
 
     if (is_kernel_addr(drakvuf, info->regs->rip))
     {
-        // We're in kernel context, we need to get stack from trap frame (syscall hook)
         bool result = false;
         if (is_32bit)
         {
@@ -504,418 +426,11 @@ bool dump_from_stack(drakvuf_t drakvuf, drakvuf_trap_info_t* info, memdump* plug
     }
     else
     {
-        // We're in user context, so we can get stack directly from registers (usermode hook)
         stack_ptr = info->regs->rsp;
     }
 
     PRINT_DEBUG("[MEMDUMP] Got stack pointer: %llx\n", (unsigned long long)stack_ptr);
     return inspect_stack_ptr(drakvuf, info, plugin, is_32bit, stack_ptr);
-}
-
-static event_response_t terminate_process_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
-{
-    // HANDLE ProcessHandle
-    uint64_t process_handle = drakvuf_get_function_argument(drakvuf, info, 1);
-
-    if (process_handle != ~0ULL)
-    {
-        PRINT_DEBUG("[MEMDUMP] Terminate process handle not pointing to self, ignore %lx\n", process_handle);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    auto plugin = get_trap_plugin<memdump>(info);
-
-    dump_from_stack(drakvuf, info, plugin);
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-static event_response_t shellcode_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
-{
-    // HANDLE ProcessHandle
-    uint64_t handle = drakvuf_get_function_argument(drakvuf, info, 1);
-    // OUT PVOID *BaseAddress
-    addr_t base_address_ptr = drakvuf_get_function_argument(drakvuf, info, 2);
-
-    addr_t process = 0;
-    addr_t dtb     = 0;
-
-    if (!drakvuf_get_process_by_handle(drakvuf, info, handle, &process, &dtb))
-    {
-        PRINT_DEBUG("[MEMDUMP] Shellcode cb: Failed to get process by handle %lx\n", handle);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    auto plugin = get_trap_plugin<memdump>(info);
-
-    auto vmi = vmi_lock_guard(drakvuf);
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = info->regs->cr3,
-        .addr = base_address_ptr
-    );
-
-    addr_t base_address;
-    if (VMI_SUCCESS != vmi_read_addr(vmi, &ctx, &base_address))
-    {
-        PRINT_DEBUG("[MEMDUMP] Shellcode cb: Failed to read base address in NtFreeVirtualMemory\n");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    mmvad_info_t mmvad;
-    if (!drakvuf_find_mmvad(drakvuf, process, base_address, &mmvad))
-    {
-        PRINT_DEBUG("[MEMDUMP] Shellcode cb: failed to find MMVAD for memory passed to NtFreeVirtualMemory\n");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    page_info_t p_info = {};
-    if (vmi_pagetable_lookup_extended(vmi, dtb, base_address, &p_info) == VMI_SUCCESS)
-    {
-        bool pte_valid       = (p_info.x86_ia32e.pte_value & (1UL << 0))  != 0;
-        bool page_writeable  = (p_info.x86_ia32e.pte_value & (1UL << 1))  != 0;
-        bool page_executable = (p_info.x86_ia32e.pte_value & (1UL << 63)) == 0;
-        size_t len_bytes     = (mmvad.ending_vpn - mmvad.starting_vpn + 1) * VMI_PS_4KB;
-        if (pte_valid && page_writeable && page_executable && len_bytes >= 0x1000)
-        {
-            PRINT_DEBUG("[MEMDUMP] Dumping RWX vad\n");
-            ctx.addr = mmvad.starting_vpn << 12;
-            ctx.dtb  = dtb;
-            if (!dump_memory_region(drakvuf, vmi, info, plugin, &ctx, len_bytes, "Possible shellcode detected", nullptr, false))
-            {
-                PRINT_DEBUG("[MEMDUMP] Failed to store memory dump due to an internal error\n");
-            }
-        }
-    }
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-static event_response_t free_virtual_memory_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
-{
-    // HANDLE ProcessHandle
-    uint64_t process_handle = drakvuf_get_function_argument(drakvuf, info, 1);
-    // OUT PVOID *BaseAddress
-    addr_t mem_base_address_ptr = drakvuf_get_function_argument(drakvuf, info, 2);
-
-    if (process_handle != ~0ULL)
-    {
-        PRINT_DEBUG("[MEMDUMP] Free process handle not pointing to self, ignore %lx\n", process_handle);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    auto plugin = get_trap_plugin<memdump>(info);
-
-    vmi_instance_t vmi = drakvuf_lock_and_get_vmi(drakvuf);
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = info->regs->cr3,
-        .addr = mem_base_address_ptr
-    );
-
-    addr_t mem_base_address;
-
-    if (VMI_SUCCESS != vmi_read_addr(vmi, &ctx, &mem_base_address))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to read base address in NtFreeVirtualMemory\n");
-        drakvuf_release_vmi(drakvuf);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    mmvad_info_t mmvad;
-
-    if (!drakvuf_find_mmvad(drakvuf, info->attached_proc_data.base_addr, mem_base_address, &mmvad))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to find MMVAD for memory passed to NtFreeVirtualMemory\n");
-        drakvuf_release_vmi(drakvuf);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    ctx.addr = mem_base_address;
-    uint16_t magic;
-    char* magic_c = (char*)&magic;
-
-    if (VMI_SUCCESS != vmi_read_16(vmi, &ctx, &magic))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to access memory to be used with NtFreeVirtualMemory %lx\n", ctx.addr);
-        drakvuf_release_vmi(drakvuf);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    if (magic_c[0] == 'M' && magic_c[1] == 'Z')
-    {
-        ctx.addr = mmvad.starting_vpn << 12;
-        size_t len_bytes = (mmvad.ending_vpn - mmvad.starting_vpn + 1) * VMI_PS_4KB;
-
-        if (!dump_memory_region(drakvuf, vmi, info, plugin, &ctx, len_bytes, "Possible binary detected", nullptr, false))
-        {
-            PRINT_DEBUG("[MEMDUMP] Failed to store memory dump due to an internal error\n");
-        }
-    }
-
-    page_info_t p_info = {};
-
-    if (vmi_pagetable_lookup_extended(vmi, info->regs->cr3, mem_base_address, &p_info) == VMI_SUCCESS)
-    {
-        bool pte_valid = (p_info.x86_ia32e.pte_value & (1UL << 0)) != 0;
-        bool page_writeable = (p_info.x86_ia32e.pte_value & (1UL << 1)) != 0;
-        bool page_executable = (p_info.x86_ia32e.pte_value & (1UL << 63)) == 0;
-
-        ctx.addr = mmvad.starting_vpn << 12;
-        size_t len_bytes = (mmvad.ending_vpn - mmvad.starting_vpn + 1) * VMI_PS_4KB;
-
-        if (len_bytes > 0x1000 && pte_valid && page_writeable && page_executable)
-        {
-            if (!dump_memory_region(drakvuf, vmi, info, plugin, &ctx, len_bytes, "Interesting RWX memory", nullptr, false))
-            {
-                PRINT_DEBUG("[MEMDUMP] Failed to store memory dump due to an internal error\n");
-            }
-        }
-    }
-
-    drakvuf_release_vmi(drakvuf);
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-static event_response_t protect_virtual_memory_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
-{
-    // HANDLE ProcessHandle
-    uint64_t process_handle = drakvuf_get_function_argument(drakvuf, info, 1);
-    // OUT PVOID *BaseAddress
-    addr_t mem_base_address_ptr = drakvuf_get_function_argument(drakvuf, info, 2);
-
-    if (process_handle != ~0ULL)
-    {
-        PRINT_DEBUG("[MEMDUMP] Protect process handle not pointing to self, ignore %lx\n", process_handle);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    auto plugin = get_trap_plugin<memdump>(info);
-
-    vmi_instance_t vmi = drakvuf_lock_and_get_vmi(drakvuf);
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = info->regs->cr3,
-        .addr = mem_base_address_ptr
-    );
-
-    addr_t mem_base_address;
-
-    if (VMI_SUCCESS != vmi_read_addr(vmi, &ctx, &mem_base_address))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to read base address in NtProtectVirtualMemory\n");
-        drakvuf_release_vmi(drakvuf);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    mmvad_info_t mmvad;
-
-    if (!drakvuf_find_mmvad(drakvuf, info->attached_proc_data.base_addr, mem_base_address, &mmvad))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to find MMVAD for memory passed to NtProtectVirtualMemory\n");
-        drakvuf_release_vmi(drakvuf);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    ctx.addr = mem_base_address;
-    uint16_t magic;
-    char* magic_c = (char*)&magic;
-
-    if (VMI_SUCCESS != vmi_read_16(vmi, &ctx, &magic))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to access memory to be used with NtProtectVirtualMemory %lx\n", ctx.addr);
-        drakvuf_release_vmi(drakvuf);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    if (magic_c[0] == 'M' && magic_c[1] == 'Z')
-    {
-        ctx.addr = mmvad.starting_vpn << 12;
-        size_t len_bytes = (mmvad.ending_vpn - mmvad.starting_vpn + 1) * VMI_PS_4KB;
-
-        if (!dump_memory_region(drakvuf, vmi, info, plugin, &ctx, len_bytes, "Possible binary detected", nullptr, false))
-        {
-            PRINT_DEBUG("[MEMDUMP] Failed to store memory dump due to an internal error\n");
-        }
-    }
-
-    drakvuf_release_vmi(drakvuf);
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-static event_response_t write_virtual_memory_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
-{
-    // IN HANDLE ProcessHandle
-    addr_t process_handle = drakvuf_get_function_argument(drakvuf, info, 1);
-
-    // IN PVOID BaseAddress
-    addr_t base_address = drakvuf_get_function_argument(drakvuf, info, 2);
-
-    // IN PVOID Buffer
-    addr_t buffer_ptr = drakvuf_get_function_argument(drakvuf, info, 3);
-
-    // IN ULONG NumberOfBytesToWrite
-    addr_t buffer_size = drakvuf_get_function_argument(drakvuf, info, 4);
-
-    // don't dump self-writes
-    if (process_handle == ~0ULL)
-        return VMI_EVENT_RESPONSE_NONE;
-
-    auto plugin = get_trap_plugin<memdump>(info);
-
-    vmi_instance_t vmi = drakvuf_lock_and_get_vmi(drakvuf);
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = info->regs->cr3,
-        .addr = buffer_ptr
-    );
-
-    vmi_pid_t target_pid;
-    addr_t process_addr = 0;
-    char* target_name = nullptr;
-
-    if ( drakvuf_get_pid_from_handle(drakvuf, info, process_handle, &target_pid) &&
-        drakvuf_find_process(drakvuf, target_pid, nullptr, &process_addr) )
-    {
-        target_name = drakvuf_get_process_name(drakvuf, process_addr, true);
-    }
-
-    if (!target_name)
-        target_name = g_strdup("<UNKNOWN>");
-
-    extras_t extras =
-    {
-        .type = WriteVirtualMemoryExtras,
-        .write_virtual_memory_extras =
-        {
-            .target_pid = target_pid,
-            .target_name = target_name,
-            .base_address = base_address,
-        },
-    };
-
-    if (!dump_memory_region(drakvuf, vmi, info, plugin, &ctx, buffer_size, "NtWriteVirtualMemory called", &extras, true))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to store memory dump due to an internal error\n");
-    }
-
-    g_free(target_name);
-    drakvuf_release_vmi(drakvuf);
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-static event_response_t create_remote_thread_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
-{
-    // Now check if NtCreateThreadEx syscall was invoked from CreateRemoteThread.
-    // In such case the target process should differ from the caller.
-
-    // IN HANDLE ProcessHandle
-    addr_t target_process_handle = drakvuf_get_function_argument(drakvuf, info, 4);
-    vmi_pid_t target_process_pid;
-    if (!drakvuf_get_pid_from_handle(drakvuf, info, target_process_handle, &target_process_pid))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to retrieve target process pid for handle %lx\n", target_process_handle);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    if (target_process_pid == info->proc_data.pid)
-    {
-        // NtCreateThreadEx has not been invoked from CreateRemoteThread
-        // and so it's not suspicious enought to create dump.
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    // Retrieve target_process as start_routine points inside it's address space.
-    addr_t target_process;
-    if (!drakvuf_find_process(drakvuf, target_process_pid, nullptr, &target_process))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to retrieve target_process\n");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-    // IN PVOID StartRoutine
-    addr_t start_routine = drakvuf_get_function_argument(drakvuf, info, 5);
-    auto vmi = vmi_lock_guard(drakvuf);
-    dump_if_points_to_executable_memory(drakvuf, info, vmi, target_process, start_routine, "CreateRemoteThread heuristic", nullptr);
-
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-static event_response_t set_information_thread_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
-{
-    // This hook is intended to dump malware core from 32 bit packers that rely on Process Hollowing technique.
-    // This technique uses NtSetContextThread, and SysWOW64 translates NtSetContextThread to NtSetInformationThread
-    // internally.
-    // NTSTATUS NtSetInformationThread(
-    //     HANDLE          ThreadHandle,
-    //     THREADINFOCLASS ThreadInformationClass,
-    //     PVOID           ThreadInformation,
-    //     ULONG           ThreadInformationLength
-    // );
-
-    // First check if the trap is even related to memdump plugin.
-    memdump* plugin = get_trap_plugin<memdump>(info);
-
-    // We are only interested in calls that set thread context.
-    addr_t thread_information_class = drakvuf_get_function_argument(drakvuf, info, 2);
-    if (thread_information_class != ThreadWow64Context)
-    {
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    // Get address of ethread structure from thread handle.
-    addr_t resumed_thread_handle = drakvuf_get_function_argument(drakvuf, info, 1);
-    addr_t caller_eprocess = drakvuf_get_current_process(drakvuf, info);
-    addr_t resumed_ethread;
-    if (!drakvuf_obj_ref_by_handle(drakvuf, info, caller_eprocess, resumed_thread_handle, OBJ_MANAGER_THREAD_OBJECT, &resumed_ethread))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to retrieve resumed_ethread\n");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    // We are only interested in suspicious actions when NtSetInformationThread has been invoked on remote thread.
-    addr_t resumed_eprocess;
-    auto vmi = vmi_lock_guard(drakvuf);
-    if (VMI_SUCCESS != vmi_read_addr_va(vmi, resumed_ethread + plugin->kthread_process_rva, 0, &resumed_eprocess))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to retrieve resumed process\n");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-    vmi_pid_t resumed_process_pid;
-    if (!drakvuf_get_process_pid(drakvuf, resumed_eprocess, &resumed_process_pid))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to retrieve resumed process pid\n");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-    if (resumed_process_pid == info->proc_data.pid)
-    {
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    // Now retrieve both Eip and Eax from Context structure. Eip is substituted in shellcode injection,
-    // whereas in standard process hollowing entry point is changed by modifying eax register.
-    // Both registers are passed in _WOW64_CONTEXT structure from within caller address space.
-    addr_t wow64_context = drakvuf_get_function_argument(drakvuf, info, 3);
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = info->regs->cr3,
-        .addr = wow64_context + plugin->wow64context_eax_rva
-    );
-    uint32_t wow_eax = 0;
-    if (VMI_SUCCESS != vmi_read_32(vmi, &ctx, &wow_eax))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to read eax field from wow64_context\n");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-    uint32_t wow_eip = 0;
-    ctx.addr = wow64_context + plugin->wow64context_eip_rva;
-    if (VMI_SUCCESS != vmi_read_32(vmi, &ctx, &wow_eip))
-    {
-        PRINT_DEBUG("[MEMDUMP] Failed to read eip field from wow64_context\n");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    dump_if_points_to_executable_memory(drakvuf, info, vmi, resumed_eprocess, wow_eax, "SetThreadContext heuristic", nullptr);
-    dump_if_points_to_executable_memory(drakvuf, info, vmi, resumed_eprocess, wow_eip, "SetThreadContext heuristic", nullptr);
-
-    return VMI_EVENT_RESPONSE_NONE;
 }
 
 bool dotnet_assembly_native_load_image_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info, memdump* plugin)
@@ -974,61 +489,26 @@ void memdump::setup_usermode_dotnet_hooks(const memdump_config* c)
 memdump::memdump(drakvuf_t drakvuf, const memdump_config* c, output_format_t output)
     : pluginex(drakvuf, output)
     , dumps_count()
+    , memdump_dir(c->memdump_dir)
+    , dll_base_rva(0)
+    , dll_base_wow_rva(0)
 {
-    this->memdump_dir = c->memdump_dir;
-
-    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "_LDR_DATA_TABLE_ENTRY", "DllBase", &this->dll_base_rva) ||
-        !drakvuf_get_kernel_struct_member_rva(drakvuf, "_KTHREAD", "Process", &this->kthread_process_rva))
+    auto os = drakvuf_get_os_type(drakvuf);
+    PRINT_DEBUG("[MEMDUMP] Initializing memdump, OS type: %d\n", os);
+    if (os == VMI_OS_WINDOWS)
     {
-        throw -1;
+        PRINT_DEBUG("[MEMDUMP] Creating Windows memdump\n");
+        this->wm = std::make_unique<win_memdump>(drakvuf, c, output, this);
+        // Copy RVAs for stack_util.cpp compatibility
+        this->dll_base_rva = this->wm->dll_base_rva;
+        this->dll_base_wow_rva = this->wm->dll_base_wow_rva;
     }
-
-    json_object* json_wow = drakvuf_get_json_wow(drakvuf);
-    bool const is64bit = (drakvuf_get_page_mode(drakvuf) == VMI_PM_IA32E);
-
-    if (is64bit)
+    else
     {
-        if (json_wow)
-        {
-            if (!json_get_struct_member_rva(drakvuf, json_wow, "_LDR_DATA_TABLE_ENTRY", "DllBase", &this->dll_base_wow_rva) ||
-                !json_get_struct_member_rva(drakvuf, json_wow, "_CONTEXT", "Eip", &this->wow64context_eip_rva) ||
-                !json_get_struct_member_rva(drakvuf, json_wow, "_CONTEXT", "Eax", &this->wow64context_eax_rva))
-            {
-                throw -1;
-            }
-        }
-        else
-        {
-            PRINT_DEBUG("Memdump works better when there is a JSON profile for WoW64 NTDLL (-w)\n");
-        }
+        PRINT_DEBUG("[MEMDUMP] Creating Linux memdump\n");
+        this->lm = std::make_unique<linux_memdump>(drakvuf, c, output, this);
     }
-
-    setup_usermode_dotnet_hooks(c);
-
-    breakpoint_in_system_process_searcher bp;
-    if (!c->memdump_disable_free_vm)
-        if (!register_trap(nullptr, free_virtual_memory_hook_cb,    bp.for_syscall_name("NtFreeVirtualMemory")))
-            throw -1;
-    if (!c->memdump_disable_protect_vm)
-        if (!register_trap(nullptr, protect_virtual_memory_hook_cb, bp.for_syscall_name("NtProtectVirtualMemory")))
-            throw -1;
-    if (!c->memdump_disable_terminate_proc)
-        if (!register_trap(nullptr, terminate_process_hook_cb,      bp.for_syscall_name("NtTerminateProcess")))
-            throw -1;
-    if (!c->memdump_disable_write_vm)
-        if (!register_trap(nullptr, write_virtual_memory_hook_cb,   bp.for_syscall_name("NtWriteVirtualMemory")))
-            throw -1;
-    if (!c->memdump_disable_create_thread)
-        if (!register_trap(nullptr, create_remote_thread_hook_cb,   bp.for_syscall_name("NtCreateThreadEx")))
-            throw -1;
-    if (!c->memdump_disable_set_thread && is64bit && json_wow)
-        if (!register_trap(nullptr, set_information_thread_hook_cb, bp.for_syscall_name("NtSetInformationThread")))
-            throw -1;
-    if (!c->memdump_disable_shellcode_detect)
-        if (!register_trap(nullptr, shellcode_cb, bp.for_syscall_name("NtFreeVirtualMemory")))
-            throw -1;
-
-    this->userhook_init(c, output);
+    PRINT_DEBUG("[MEMDUMP] Memdump initialization complete\n");
 }
 
 memdump::~memdump()

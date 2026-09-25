@@ -148,6 +148,8 @@ sources += fileextractor/fileextractor.h
 sources += fileextractor/private.h
 sources += fileextractor/win.cpp
 sources += fileextractor/win.h
+sources += fileextractor/linux.cpp
+sources += fileextractor/linux.h
 endif
 
 if PLUGIN_OBJMON
@@ -263,6 +265,10 @@ sources += memdump/memdump.h
 sources += memdump/private.h
 sources += memdump/stack_util.cpp
 sources += memdump/userhook.cpp
+sources += memdump/win.cpp
+sources += memdump/win.h
+sources += memdump/linux.cpp
+sources += memdump/linux.h
 endif
 
 if PLUGIN_APIMON

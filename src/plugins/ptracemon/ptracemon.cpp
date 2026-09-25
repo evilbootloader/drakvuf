@@ -159,16 +159,26 @@ event_response_t ptracemon::ptrace_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* in
 
 ptracemon::ptracemon(drakvuf_t drakvuf, output_format_t output) : pluginex(drakvuf, output)
 {
-    if (!drakvuf_get_kernel_struct_members_array_rva(drakvuf, pt_regs_offsets_name, this->offsets.size(), this->offsets.data()))
+    // Get required pt_regs offsets (GPRs used for syscall argument reading)
+    if (!drakvuf_get_kernel_struct_members_array_rva(drakvuf, pt_regs_names_required,
+            __PT_REGS_REQUIRED, this->offsets.data()))
     {
-        PRINT_DEBUG("[PTRACEMON] Failed to get offsets\n");
+        fprintf(stderr, "[PTRACEMON] Failed to get required pt_regs offsets, ptracemon disabled\n");
         return;
+    }
+
+    // Get optional pt_regs offsets (cs/ss may be in anonymous unions on kernel 6.x+)
+    if (!drakvuf_get_kernel_struct_members_array_rva(drakvuf, pt_regs_names_optional,
+            __PT_REGS_MAX - __PT_REGS_REQUIRED, this->offsets.data() + __PT_REGS_REQUIRED))
+    {
+        fprintf(stderr, "[PTRACEMON] Warning: optional pt_regs offsets unavailable (cs/ss)\n");
     }
 
     syshook = createSyscallHook("__x64_sys_ptrace", &ptracemon::ptrace_cb, "ptrace");
     if (nullptr == syshook)
     {
-        PRINT_DEBUG("[PTRACEMON] Method __x64_sys_ptrace not found\n");
+        fprintf(stderr, "[PTRACEMON] Method __x64_sys_ptrace not found\n");
         return;
     }
+    fprintf(stderr, "[PTRACEMON] Hooked __x64_sys_ptrace\n");
 }

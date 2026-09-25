@@ -249,5 +249,10 @@ void memdump::userhook_destroy()
 
 bool memdump::userhooks_stop()
 {
+    // Userhooks are Windows-only; calling drakvuf_stop_userhooks on Linux
+    // triggers the userhook singleton constructor which tries to hook
+    // Windows NT functions and throws -1.
+    if (drakvuf_get_os_type(drakvuf) != VMI_OS_WINDOWS)
+        return true;
     return drakvuf_stop_userhooks(drakvuf);
 }

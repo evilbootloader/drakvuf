@@ -772,7 +772,7 @@ bool set_os_windows(drakvuf_t drakvuf)
     }
 
     if (VMI_FAILURE == vmi_get_struct_size_from_json(drakvuf->vmi, vmi_get_kernel_json(drakvuf->vmi), "_HANDLE_TABLE_ENTRY", &drakvuf->sizes[HANDLE_TABLE_ENTRY] ) ||
-        VMI_FAILURE == vmi_get_struct_size_from_json(drakvuf->vmi, vmi_get_kernel_json(drakvuf->vmi), "_OBJECT_HEADER",      &drakvuf->sizes[OBJECT_HEADER]))
+        VMI_FAILURE == vmi_get_struct_size_from_json(drakvuf->vmi, vmi_get_kernel_json(drakvuf->vmi), "_OBJECT_HEADER", &drakvuf->sizes[OBJECT_HEADER]))
     {
         return 0;
     }
@@ -780,7 +780,7 @@ bool set_os_windows(drakvuf_t drakvuf)
     if (vmi_get_winver(drakvuf->vmi) != VMI_OS_WINDOWS_VISTA)
     {
         if (VMI_FAILURE == vmi_translate_ksym2v(drakvuf->vmi, "ObpInfoMaskToOffset", &drakvuf->ob_infomask2off) ||
-            VMI_FAILURE == vmi_translate_ksym2v(drakvuf->vmi, "ObTypeIndexTable",    &drakvuf->ob_type_table))
+            VMI_FAILURE == vmi_translate_ksym2v(drakvuf->vmi, "ObTypeIndexTable", &drakvuf->ob_type_table))
         {
             return 0;
         }

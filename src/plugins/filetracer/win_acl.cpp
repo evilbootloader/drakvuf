@@ -622,7 +622,12 @@ string read_acl(vmi_instance_t vmi, access_context_t* ctx, size_t* offsets, stri
                 break;
         }
 
-        if (0 == ace_size || ace_ptr + ace_size < ace_ptr)
+        // Signed-pointer overflow is UB the compiler folds to false (so
+        // newer clang flags this with -Wtautological-compare). Do the
+        // arithmetic in uintptr_t so the wrap-around check is defined
+        // and actually catches an adversarial ace_size from the guest.
+        if (0 == ace_size ||
+            reinterpret_cast<uintptr_t>(ace_ptr) + ace_size < reinterpret_cast<uintptr_t>(ace_ptr))
         {
             PRINT_DEBUG("WARNING! Incorrect ACE size %ld\n", ace_size);
             break;

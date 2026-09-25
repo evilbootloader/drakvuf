@@ -832,7 +832,8 @@ enum linux_pt_regs
     PT_REGS_ORIG_RAX,
 
     PT_REGS_RIP,
-    PT_REGS_CS,
+    __PT_REGS_REQUIRED, // GPRs above this point are required
+    PT_REGS_CS = __PT_REGS_REQUIRED,
     PT_REGS_EFLAGS,
     PT_REGS_RSP,
     PT_REGS_SS,
@@ -841,7 +842,8 @@ enum linux_pt_regs
 };
 
 // TODO: make global for all plugins, copy from plugin to plugin is bullshit
-static const char* linux_pt_regs_offsets_name[__PT_REGS_MAX][2] =
+// Required GPR offsets — must be resolvable from the kernel profile
+static const char* linux_pt_regs_names_required[__PT_REGS_REQUIRED][2] =
 {
     [PT_REGS_R15]      = {"pt_regs", "r15"},
     [PT_REGS_R14]      = {"pt_regs", "r14"},
@@ -863,10 +865,15 @@ static const char* linux_pt_regs_offsets_name[__PT_REGS_MAX][2] =
     [PT_REGS_ORIG_RAX] = {"pt_regs", "orig_ax"},
 
     [PT_REGS_RIP]      = {"pt_regs", "ip"},
-    [PT_REGS_CS]       = {"pt_regs", "cs"},
-    [PT_REGS_EFLAGS]   = {"pt_regs", "flags"},
-    [PT_REGS_RSP]      = {"pt_regs", "sp"},
-    [PT_REGS_SS]       = {"pt_regs", "ss"},
+};
+
+// Optional offsets — cs/ss may be inside anonymous unions on kernel 6.x+ (FRED)
+static const char* linux_pt_regs_names_optional[__PT_REGS_MAX - __PT_REGS_REQUIRED][2] =
+{
+    [PT_REGS_CS - __PT_REGS_REQUIRED]       = {"pt_regs", "cs"},
+    [PT_REGS_EFLAGS - __PT_REGS_REQUIRED]   = {"pt_regs", "flags"},
+    [PT_REGS_RSP - __PT_REGS_REQUIRED]      = {"pt_regs", "sp"},
+    [PT_REGS_SS - __PT_REGS_REQUIRED]       = {"pt_regs", "ss"},
 };
 
 }

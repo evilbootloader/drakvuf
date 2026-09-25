@@ -1372,8 +1372,8 @@ filedelete::filedelete(drakvuf_t drakvuf, const filedelete_config* c, output_for
     {
         assert(sizeof(traps)/sizeof(traps[0]) > 2);
         register_trap(drakvuf, "NtSetInformationFile", &traps[0], setinformation_cb);
-        register_trap(drakvuf, "NtWriteFile",          &traps[1], writefile_cb);
-        register_trap(drakvuf, "NtClose",              &traps[2], close_cb);
+        register_trap(drakvuf, "NtWriteFile", &traps[1], writefile_cb);
+        register_trap(drakvuf, "NtClose", &traps[2], close_cb);
         /* TODO
         register_trap(drakvuf, "NtDeleteFile",            &traps[3], deletefile_cb);
         register_trap(drakvuf, "ZwDeleteFile",            &traps[4], deletefile_cb); */
@@ -1394,11 +1394,11 @@ filedelete::filedelete(drakvuf_t drakvuf, const filedelete_config* c, output_for
 
         assert(sizeof(traps)/sizeof(traps[0]) > 3);
         register_trap(drakvuf, "NtSetInformationFile", &traps[0], setinformation_cb);
-        register_trap(drakvuf, "NtWriteFile",          &traps[1], writefile_cb);
-        register_trap(drakvuf, "NtClose",              &traps[2], close_cb);
-        register_trap(drakvuf, "ZwCreateSection",      &traps[3], createsection_cb);
-        register_trap(drakvuf, "NtCreateFile",         &traps[4], createfile_cb);
-        register_trap(drakvuf, "NtOpenFile",           &traps[5], openfile_cb);
+        register_trap(drakvuf, "NtWriteFile", &traps[1], writefile_cb);
+        register_trap(drakvuf, "NtClose", &traps[2], close_cb);
+        register_trap(drakvuf, "ZwCreateSection", &traps[3], createsection_cb);
+        register_trap(drakvuf, "NtCreateFile", &traps[4], createfile_cb);
+        register_trap(drakvuf, "NtOpenFile", &traps[5], openfile_cb);
     }
 
     if ( !drakvuf_get_kernel_struct_members_array_rva(drakvuf, offset_names, __OFFSET_MAX, this->offsets) )

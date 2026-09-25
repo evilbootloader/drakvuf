@@ -102,190 +102,165 @@
  *                                                                         *
  ***************************************************************************/
 
-#include <inttypes.h>
-#include <libvmi/libvmi.h>
-#include <assert.h>
-#include <array>
-#include <vector>
-#include <libdrakvuf/json-util.h>
+#ifndef MEMDUMP_LINUX_H
+#define MEMDUMP_LINUX_H
 
-#include "plugins/output_format.h"
+#include "plugins/plugins_ex.h"
 #include "private.h"
-#include "tlsmon.h"
 
+class memdump;
 
-static std::optional<std::string> ssl_get_master_key(
-    drakvuf_t drakvuf, drakvuf_trap_info* info, vmi_instance_t vmi, access_context_t ctx
-)
+namespace memdump_ns
 {
-    tlsmon_priv::ssl_master_secret_t master_secret;
 
-    // We first extract master key by tracing down relevant structures starting with master_key_handle.
-    addr_t ncrypt_ssl_key_addr = drakvuf_get_function_argument(drakvuf, info, 2);
-
-    // master_key_handle points to NCryptSslKey structure.
-    tlsmon_priv::ncrypt_ssl_key_t ncrypt_ssl_key;
-    ctx.addr = ncrypt_ssl_key_addr;
-    if (VMI_SUCCESS != vmi_read(vmi, &ctx, sizeof(ncrypt_ssl_key), &ncrypt_ssl_key, nullptr))
-    {
-        PRINT_DEBUG("[TLSMON] Can't read NCryptSslKey structure\n");
-        return {};
-    }
-
-    // We can validate that we indeed found NCryptSslKey by checking magic bytes value.
-    if (ncrypt_ssl_key.magic != tlsmon_priv::NCRYPT_SSL_KEY_MAGIC_BYTES)
-    {
-        PRINT_DEBUG("[TLSMON] Wrong NCryptSslKey magic\n");
-        return {};
-    }
-
-    // NCryptSslKey contains a pointer to SslMasterSecret structure.
-    ctx.addr = (addr_t) ncrypt_ssl_key.master_secret;
-    if (VMI_SUCCESS != vmi_read(vmi, &ctx, sizeof(master_secret), &master_secret, nullptr))
-    {
-        PRINT_DEBUG("[TLSMON] Can't read SslMasterSecret structure\n");
-        return {};
-    }
-
-    // Again we can validate that we found SslMasterSecret structure bychecking magic bytes.
-    if (master_secret.magic != tlsmon_priv::MASTER_SECRET_MAGIC_BYTES)
-    {
-        PRINT_DEBUG("[TLSMON] Wrong SslMasterSecret magic\n");
-        return {};
-    }
-
-    // Output retrieved master secret in hex format.
-    std::string master_key_str = tlsmon_priv::byte2str(master_secret.master_key, tlsmon_priv::MASTER_KEY_SZ);
-    return master_key_str;
-}
-
-static
-std::optional< std::vector<tlsmon_priv::ncrypt_buffer_t> > ssl_get_ncrypt_buffers(
-    drakvuf_t drakvuf, drakvuf_trap_info* info, vmi_instance_t vmi, access_context_t ctx
-)
+// Linux kernel struct offsets needed for memdump
+enum linux_memdump_offsets
 {
-    // Now retrieve client random and server random values. pParameterList points to an array of
-    // NCryptBuffer buffers which contains at least client and server random
-    // values.
-    ctx.addr = drakvuf_get_function_argument(drakvuf, info, 5);
-    tlsmon_priv::ncrypt_buffer_desc_t ncrypt_buffer_desc;
-    if (VMI_SUCCESS != vmi_read(vmi, &ctx, sizeof(ncrypt_buffer_desc), &ncrypt_buffer_desc, nullptr))
-    {
-        PRINT_DEBUG("[TLSMON] Failed to read ncrypt parameter list\n");
-        return {};
-    }
+    TASK_STRUCT_MM,
+    MM_STRUCT_MMAP,
+    MM_STRUCT_PGD,
+    VM_AREA_STRUCT_VM_START,
+    VM_AREA_STRUCT_VM_END,
+    VM_AREA_STRUCT_VM_FLAGS,
+    VM_AREA_STRUCT_VM_NEXT,
+    VM_AREA_STRUCT_VM_FILE,
+    __LINUX_MEMDUMP_OFFSET_MAX
+};
 
-    size_t ncrypt_buffers_size = ncrypt_buffer_desc.cbuffers;
-    if ( ncrypt_buffers_size != 2 )
-    {
-        PRINT_DEBUG("[TLSMON] Ncrypt parameter list has different size than 2\n");
-        return {};
-    }
-
-    std::vector<tlsmon_priv::ncrypt_buffer_t> ncrypt_buffers = std::vector<tlsmon_priv::ncrypt_buffer_t>(ncrypt_buffers_size);
-    ctx.addr = (addr_t) ncrypt_buffer_desc.buffers;
-    if (VMI_SUCCESS != vmi_read(vmi, &ctx, (ncrypt_buffers_size * sizeof(tlsmon_priv::ncrypt_buffer_t)), ncrypt_buffers.data(), nullptr))
-    {
-        PRINT_DEBUG("[TLSMON] Failed to read ncrypt parameter list buffers\n");
-        return {};
-    }
-    return ncrypt_buffers;
-}
-
-
-/**
- * Sets a trap on return from SslGenerateSessionKeys function to obtain the
- * calculated master key.
- */
-static
-event_response_t ssl_generate_session_keys_cb(drakvuf_t drakvuf, drakvuf_trap_info* info)
+static const char* linux_memdump_offset_names[__LINUX_MEMDUMP_OFFSET_MAX][2] =
 {
-    auto plugin = static_cast<tlsmon*>(drakvuf_get_extra_from_running_trap(info->trap));
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = info->regs->cr3
-    );
+    [TASK_STRUCT_MM] = {"task_struct", "mm"},
+    [MM_STRUCT_MMAP] = {"mm_struct", "mmap"},
+    [MM_STRUCT_PGD] = {"mm_struct", "pgd"},
+    [VM_AREA_STRUCT_VM_START] = {"vm_area_struct", "vm_start"},
+    [VM_AREA_STRUCT_VM_END] = {"vm_area_struct", "vm_end"},
+    [VM_AREA_STRUCT_VM_FLAGS] = {"vm_area_struct", "vm_flags"},
+    [VM_AREA_STRUCT_VM_NEXT] = {"vm_area_struct", "vm_next"},
+    [VM_AREA_STRUCT_VM_FILE] = {"vm_area_struct", "vm_file"},
+};
 
-    auto vmi = vmi_lock_guard(drakvuf);
-
-    auto master_key = ssl_get_master_key(drakvuf, info, vmi, ctx);
-    if (!master_key)
-    {
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    auto ncrypt_buffers = ssl_get_ncrypt_buffers(drakvuf, info, vmi, ctx);
-    if (!ncrypt_buffers)
-    {
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    // buffer for both ClientRandom and ServerRandom
-    std::array<char, tlsmon_priv::CLIENT_RANDOM_SZ> randoms_buffer = std::array<char, tlsmon_priv::CLIENT_RANDOM_SZ>();
-
-    for (tlsmon_priv::ncrypt_buffer_t ncrypt_buffer_iter: *ncrypt_buffers)
-    {
-        uint32_t buffer_type = ncrypt_buffer_iter.buffer_type;
-        uint32_t size = ncrypt_buffer_iter.cbbuffer;;
-        if ( size != tlsmon_priv::CLIENT_RANDOM_SZ )
-        {
-            PRINT_DEBUG("[TLSMON] Wrong ncrypt buffer size\n");
-            continue;
-        }
-
-        // read the buffer
-        ctx.addr = (addr_t) ncrypt_buffer_iter.buffer;
-        if (VMI_SUCCESS != vmi_read(vmi, &ctx, randoms_buffer.size(), randoms_buffer.data(), nullptr))
-        {
-            PRINT_DEBUG("[TLSMON] Failed to read ncrypt buffer\n");
-            continue;
-        }
-        // convert bytes to string
-        std::string client_random_str = tlsmon_priv::byte2str((unsigned char*)randoms_buffer.data(), 32);
-
-        if (buffer_type == tlsmon_priv::NCRYPTBUFFER_SSL_CLIENT_RANDOM)
-        {
-            fmt::print(plugin->m_output_format, "tlsmon", drakvuf, info,
-                keyval("client_random", fmt::Qstr(client_random_str)),
-                keyval("master_key", fmt::Qstr(*master_key))
-            );
-        }
-        else if (buffer_type != tlsmon_priv::NCRYPTBUFFER_SSL_SERVER_RANDOM)
-        {
-            PRINT_DEBUG("[TLSMON] Unknown ncrypt buffer type.\n");
-            continue;
-        }
-    }
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-
-/**
- * Sets a hook on running lsass process. In Windows, processes that want to
- * establish TLS connection with Schannel API, do so by using lsass under the
- * hood. This way, lsass will perform TLS handshake on behalf of the process
- * initiating the connection and secrets will never leave lsass's memory.
- */
-void tlsmon::hook_lsass(drakvuf_t drakvuf)
+// pt_regs offsets for reading syscall arguments
+enum linux_pt_regs
 {
-    addr_t lsass_base = 0;
-    if (!drakvuf_find_process(drakvuf, ~0, "lsass.exe", &lsass_base))
-        return;
-    drakvuf_request_userhook_on_running_process(drakvuf, lsass_base, "ncrypt.dll", "SslGenerateSessionKeys", ssl_generate_session_keys_cb, this);
-}
+    PT_REGS_R15,
+    PT_REGS_R14,
+    PT_REGS_R13,
+    PT_REGS_R12,
+    PT_REGS_RBP,
+    PT_REGS_RBX,
+    PT_REGS_R11,
+    PT_REGS_R10,
+    PT_REGS_R9,
+    PT_REGS_R8,
+    PT_REGS_RAX,
+    PT_REGS_RCX,
+    PT_REGS_RDX,
+    PT_REGS_RSI,
+    PT_REGS_RDI,
+    PT_REGS_ORIG_RAX,
+    PT_REGS_RIP,
+    __PT_REGS_REQUIRED, // GPRs above this point are required
+    PT_REGS_CS = __PT_REGS_REQUIRED,
+    PT_REGS_EFLAGS,
+    PT_REGS_RSP,
+    PT_REGS_SS,
+    __PT_REGS_MAX
+};
 
-
-tlsmon::tlsmon(drakvuf_t drakvuf, output_format_t output)
-    : pluginex(drakvuf, output)
+// Required GPR offsets — must be resolvable from the kernel profile
+static const char* linux_pt_regs_names_required[__PT_REGS_REQUIRED][2] =
 {
-    if (!drakvuf_are_userhooks_supported(drakvuf))
-    {
-        PRINT_DEBUG("[TLSMON] Usermode hooking not supported.\n");
-        return;
-    }
+    [PT_REGS_R15]      = {"pt_regs", "r15"},
+    [PT_REGS_R14]      = {"pt_regs", "r14"},
+    [PT_REGS_R13]      = {"pt_regs", "r13"},
+    [PT_REGS_R12]      = {"pt_regs", "r12"},
+    [PT_REGS_RBP]      = {"pt_regs", "bp"},
+    [PT_REGS_RBX]      = {"pt_regs", "bx"},
+    [PT_REGS_R11]      = {"pt_regs", "r11"},
+    [PT_REGS_R10]      = {"pt_regs", "r10"},
+    [PT_REGS_R9]       = {"pt_regs", "r9"},
+    [PT_REGS_R8]       = {"pt_regs", "r8"},
+    [PT_REGS_RAX]      = {"pt_regs", "ax"},
+    [PT_REGS_RCX]      = {"pt_regs", "cx"},
+    [PT_REGS_RDX]      = {"pt_regs", "dx"},
+    [PT_REGS_RSI]      = {"pt_regs", "si"},
+    [PT_REGS_RDI]      = {"pt_regs", "di"},
+    [PT_REGS_ORIG_RAX] = {"pt_regs", "orig_ax"},
+    [PT_REGS_RIP]      = {"pt_regs", "ip"},
+};
 
-    this->hook_lsass(drakvuf);
-}
+// Optional offsets — cs/ss may be inside anonymous unions on kernel 6.x+ (FRED)
+static const char* linux_pt_regs_names_optional[__PT_REGS_MAX - __PT_REGS_REQUIRED][2] =
+{
+    [PT_REGS_CS - __PT_REGS_REQUIRED]       = {"pt_regs", "cs"},
+    [PT_REGS_EFLAGS - __PT_REGS_REQUIRED]   = {"pt_regs", "flags"},
+    [PT_REGS_RSP - __PT_REGS_REQUIRED]      = {"pt_regs", "sp"},
+    [PT_REGS_SS - __PT_REGS_REQUIRED]       = {"pt_regs", "ss"},
+};
 
+// Linux x86_64 syscall numbers for memory operations
+enum linux_memory_syscalls
+{
+    __NR_mmap = 9,
+    __NR_mprotect = 10,
+    __NR_munmap = 11,
+    __NR_mremap = 25,
+    __NR_clone = 56,
+    __NR_exit_group = 231,
+    __NR_process_vm_writev = 311,
+    __NR_pkey_mprotect = 329,
+};
 
-tlsmon::~tlsmon() {}
+// VM flags from linux/mm.h (kernel internal values, not exposed in userspace headers)
+enum vm_flags
+{
+    VM_READ = 0x00000001,
+    VM_WRITE = 0x00000002,
+    VM_EXEC = 0x00000004,
+    VM_SHARED = 0x00000008,
+};
+
+} // namespace memdump_ns
+
+// Use system-defined PROT_* and CLONE_* macros
+#include <sys/mman.h>
+#include <sched.h>
+
+class linux_memdump : public pluginex
+{
+public:
+    memdump* parent;
+
+    // Config flags (mapped from Windows equivalents)
+    bool disable_free_vm;      // Disables munmap monitoring
+    bool disable_protect_vm;   // Disables mprotect monitoring
+    bool disable_write_vm;     // Disables process_vm_writev monitoring
+    bool disable_terminate_proc; // Disables exit_group monitoring
+    bool disable_create_thread;  // Disables clone monitoring
+    bool disable_shellcode_detect; // Disables RWX mmap detection
+
+    // Kernel struct offsets
+    std::array<size_t, memdump_ns::__LINUX_MEMDUMP_OFFSET_MAX> offsets;
+    std::array<size_t, memdump_ns::__PT_REGS_MAX> regs;
+
+    // Syscall hooks
+    std::unique_ptr<libhook::SyscallHook> syscall_hook;
+
+    // Return hooks for async syscall results
+    std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
+
+    // Callbacks
+    event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+
+    // Helper functions
+    bool get_pt_regs_and_nr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* pt_regs_addr, uint64_t* nr);
+    bool read_pt_regs_arg(drakvuf_t drakvuf, addr_t pt_regs_addr, int arg_index, uint64_t* value);
+    bool is_rwx_region(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t addr);
+    bool check_elf_header(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t addr);
+
+    linux_memdump(drakvuf_t drakvuf, const memdump_config* config, output_format_t output, memdump* parent);
+    linux_memdump(const linux_memdump&) = delete;
+    linux_memdump& operator=(const linux_memdump&) = delete;
+};
+
+#endif

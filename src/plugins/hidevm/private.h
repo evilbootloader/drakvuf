@@ -196,8 +196,50 @@ const uint8_t WMI_data[] = {0xD4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 #define WmiKmQueryData_Flags      0x0000002C
 #define WmiKmQueryData_DataLen    0x00000030
 
-#define STATUS_SUCCESS            0x00000000
-#define STATUS_WMI_GUID_NOT_FOUND 0xC0000295
+#define STATUS_SUCCESS                 0x00000000
+#define STATUS_WMI_GUID_NOT_FOUND      0xC0000295
+#define STATUS_OBJECT_NAME_NOT_FOUND   0xC0000034
+
+// Substring (case-insensitive) used to detect Xen Platform PCI registry keys.
+// Full path example:
+//   \REGISTRY\MACHINE\SYSTEM\CurrentControlSet\Enum\PCI\VEN_5853&DEV_0001&SUBSYS_...
+// We match on the device-class fragment so any ControlSet variant is covered.
+#define HIDEVM_XEN_PCI_KEY_FRAGMENT    "\\enum\\pci\\ven_5853"
+
+// MAP-1826: NtEnumerateKey filtering. Al-khaser doesn't open Xen/QEMU/virtio
+// device leaf keys by name — it walks the parent (\Enum\PCI, \Enum\IDE,
+// \Enum\SCSI) by index and substring-matches the returned subkey names. The
+// existing NtOpenKey hook above never fires in that path, so we install a
+// return-hook on NtEnumerateKey that mutates banned substrings in the output
+// buffer in place. See hidevm_subkey_buffer_munge() in hidevm.cpp.
+#define HIDEVM_ENUM_PCI_PATH_FRAGMENT  "\\enum\\pci"
+#define HIDEVM_ENUM_IDE_PATH_FRAGMENT  "\\enum\\ide"
+#define HIDEVM_ENUM_SCSI_PATH_FRAGMENT "\\enum\\scsi"
+
+// KEY_INFORMATION_CLASS values used during subkey enumeration. Other values
+// (KeyCachedInformation etc.) don't surface the subkey name, so we ignore them.
+#define KEY_BASIC_INFORMATION_CLASS    0
+#define KEY_NODE_INFORMATION_CLASS     1
+
+// Field offsets within KEY_BASIC_INFORMATION:
+//   LARGE_INTEGER LastWriteTime;  // 0x00 (8)
+//   ULONG         TitleIndex;     // 0x08 (4)
+//   ULONG         NameLength;     // 0x0C (4) — bytes, not WCHARs
+//   WCHAR         Name[1];        // 0x10
+#define KEY_BASIC_INFORMATION_NAME_LENGTH_OFFSET 0x0C
+#define KEY_BASIC_INFORMATION_NAME_OFFSET        0x10
+
+// Field offsets within KEY_NODE_INFORMATION:
+//   LARGE_INTEGER LastWriteTime;  // 0x00 (8)
+//   ULONG         TitleIndex;     // 0x08 (4)
+//   ULONG         ClassOffset;    // 0x0C (4)
+//   ULONG         ClassLength;    // 0x10 (4)
+//   ULONG         NameLength;     // 0x14 (4) — bytes, not WCHARs
+//   WCHAR         Name[1];        // 0x18
+#define KEY_NODE_INFORMATION_NAME_LENGTH_OFFSET  0x14
+#define KEY_NODE_INFORMATION_NAME_OFFSET         0x18
+
+#define STATUS_BUFFER_TOO_SMALL                  0xC0000023
 
 // Stages
 #define STAGE_WMI_OPEN_BLOCK             1

@@ -466,6 +466,67 @@ static bool init_injector(linux_injector_t injector)
     return true;
 }
 
+struct find_injection_target_ctx
+{
+    vmi_pid_t found_pid;
+    uint32_t found_tid;
+    bool found;
+};
+
+static void find_injection_target_visitor(drakvuf_t drakvuf, addr_t process_base, void* ctx)
+{
+    struct find_injection_target_ctx* data = (struct find_injection_target_ctx*)ctx;
+
+    if (data->found)
+        return;  // Already found a target
+
+    // Get PID first
+    vmi_pid_t pid;
+    if (!drakvuf_get_process_pid(drakvuf, process_base, &pid))
+        return;
+
+    // Skip PID 0 (swapper/idle) - but allow PID 1 (init/systemd) as it's a reliable target
+    if (pid == 0)
+        return;
+
+    // Verify process has a valid address space (not a kernel thread)
+    addr_t dtb;
+    if (!drakvuf_get_process_dtb(drakvuf, process_base, &dtb) || !dtb)
+        return;
+
+    // Get TID
+    uint32_t tid;
+    if (!drakvuf_get_process_thread_id(drakvuf, process_base, &tid))
+        return;
+
+    // Found a suitable target
+    data->found_pid = pid;
+    data->found_tid = tid;
+    data->found = true;
+
+    PRINT_DEBUG("Auto-selected injection target: PID %d, TID %d\n", pid, tid);
+}
+
+static bool find_injection_target(drakvuf_t drakvuf, vmi_pid_t* pid, uint32_t* tid)
+{
+    struct find_injection_target_ctx ctx =
+    {
+        .found_pid = 0,
+        .found_tid = 0,
+        .found = false
+    };
+
+    if (!drakvuf_enumerate_processes(drakvuf, find_injection_target_visitor, &ctx))
+        return false;
+
+    if (!ctx.found)
+        return false;
+
+    *pid = ctx.found_pid;
+    *tid = ctx.found_tid;
+    return true;
+}
+
 injector_status_t injector_start_app_on_linux(
     drakvuf_t drakvuf,
     vmi_pid_t pid,
@@ -474,11 +535,24 @@ injector_status_t injector_start_app_on_linux(
     injection_method_t method,
     output_format_t format,
     const char* binary_path,
+    bool global_search,
     int args_count,
     const char** args,
     vmi_pid_t* injected_pid
 )
 {
+    // Auto-select process if global_search is enabled and no PID specified
+    if (global_search && (pid == 0 || pid == (vmi_pid_t)-1))
+    {
+        PRINT_DEBUG("Global search enabled, auto-selecting injection target...\n");
+        if (!find_injection_target(drakvuf, &pid, &tid))
+        {
+            fprintf(stderr, "Failed to find suitable injection target process\n");
+            return INJECTOR_FAILED;
+        }
+        PRINT_DEBUG("Using auto-selected PID %d, TID %d\n", pid, tid);
+    }
+
     linux_injector_t injector = (linux_injector_t)g_malloc0(sizeof(struct linux_injector));
     base_injector_t base_injector = &injector->base_injector;
     injector->drakvuf = drakvuf;

@@ -12,9 +12,16 @@ RUN mkdir -p /log && \
 
 COPY xen /build-xen
 COPY package/configure-xen.sh /build-xen
+COPY patches /build-patches
 RUN cd /build-xen && \
     chmod +x configure-xen.sh && \
     ./configure-xen.sh && \
+    echo "Applying anti-evasion patches..." && \
+    for p in /build-patches/*.patch; do \
+        [ -f "$p" ] || continue; \
+        echo "  applying $p"; \
+        patch -p1 -t < "$p" || exit 1; \
+    done && \
     echo "Building Xen, this may take a few minutes..." && \
     make -j$(nproc) dist-xen && \
     make -j$(nproc) dist-tools && \

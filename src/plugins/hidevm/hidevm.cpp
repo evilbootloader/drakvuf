@@ -711,6 +711,379 @@ static void on_dll_hooked(drakvuf_t drakvuf, const dll_view_t* dll, const std::v
     PRINT_DEBUG("[HIDEVM] DLL hooked - done\n");
 }
 
+// ---------------------------------------------------------------------------
+// Registry hiding for the Xen Platform PCI device (vendor ID 0x5853 == "XS").
+//
+// Al-khaser probes HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_5853* to detect
+// Xen. We can't remove the PCI device itself (Xen PV drivers attach to it),
+// so we hook the Nt registry-open paths and translate any open of a key whose
+// path contains "\Enum\PCI\VEN_5853" into STATUS_OBJECT_NAME_NOT_FOUND.
+// ---------------------------------------------------------------------------
+
+static char* hidevm_get_key_path_from_attr(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
+    addr_t attr, addr_t objattr_root_off, addr_t objattr_name_off)
+{
+    if (!attr) return nullptr;
+
+    auto vmi = vmi_lock_guard(drakvuf);
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3
+    );
+
+    addr_t key_handle = 0;
+    ctx.addr = attr + objattr_root_off;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &key_handle))
+        return nullptr;
+
+    addr_t key_name_addr = 0;
+    ctx.addr = attr + objattr_name_off;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &key_name_addr))
+        return nullptr;
+
+    gchar* key_root_p = drakvuf_reg_keyhandle_path(drakvuf, info, key_handle);
+    unicode_string_t* us = drakvuf_read_unicode(drakvuf, info, key_name_addr);
+    if (!us)
+    {
+        g_free(key_root_p);
+        return nullptr;
+    }
+
+    char* key_path = g_strdup_printf("%s%s%s",
+            key_root_p ?: "",
+            key_root_p ? "\\" : "",
+            (const char*)us->contents ?: "");
+    g_free(key_root_p);
+    vmi_free_unicode_str(us);
+
+    return key_path;
+}
+
+static bool hidevm_is_xen_pci_key(const char* path)
+{
+    if (!path) return false;
+    gchar* lower = g_ascii_strdown(path, -1);
+    bool match = (g_strstr_len(lower, -1, HIDEVM_XEN_PCI_KEY_FRAGMENT) != nullptr);
+    g_free(lower);
+    return match;
+}
+
+event_response_t hidevm::HideKeyReturn_cb(drakvuf_t, drakvuf_trap_info_t* info)
+{
+    auto vmi = vmi_lock_guard(drakvuf);
+    auto params = libhook::GetTrapParams(info);
+    auto hook_ID = make_hook_id(info, params->target_rsp);
+
+    if (this->hide_key_ret_hooks.count(hook_ID))
+    {
+        if (params->verifyResultCallParams(drakvuf, info))
+        {
+            if (VMI_FAILURE == vmi_set_vcpureg(vmi, STATUS_OBJECT_NAME_NOT_FOUND, RAX, info->vcpu))
+            {
+                PRINT_DEBUG("[HIDEVM] HideKey return: failed to set RAX to STATUS_OBJECT_NAME_NOT_FOUND\n");
+            }
+        }
+        this->hide_key_ret_hooks.erase(hook_ID);
+    }
+
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+// Common entry-callback body for NtOpenKey / NtOpenKeyEx / NtCreateKey /
+// NtOpenKeyTransacted / NtOpenKeyTransactedEx — all of these take
+// POBJECT_ATTRIBUTES as their 3rd argument.
+static event_response_t hidevm_open_key_entry(hidevm* plugin, drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    addr_t objattr = drakvuf_get_function_argument(drakvuf, info, 3);
+    if (!objattr)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    char* key_path = hidevm_get_key_path_from_attr(drakvuf, info, objattr,
+            plugin->objattr_root, plugin->objattr_name);
+    if (!key_path)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    if (hidevm_is_xen_pci_key(key_path))
+    {
+        auto params = libhook::GetTrapParams(info);
+        auto hook_ID = make_hook_id(info, params->target_rsp);
+
+        // Avoid stacking duplicate return hooks on the same thread frame.
+        if (!plugin->hide_key_ret_hooks.count(hook_ID))
+        {
+            auto hook = plugin->createReturnHook(info, &hidevm::HideKeyReturn_cb);
+            if (hook)
+            {
+                plugin->hide_key_ret_hooks[hook_ID] = std::move(hook);
+                fmt::print(plugin->format, "hidevm", drakvuf, info,
+                    keyval("Reason", fmt::Qstr("Xen PCI registry key hidden")),
+                    keyval("KeyName", fmt::Qstr(key_path))
+                );
+            }
+        }
+    }
+
+    g_free(key_path);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// MAP-1826: NtEnumerateKey filtering for sandbox device-tree subkeys.
+//
+// al-khaser walks \Enum\PCI / \Enum\IDE / \Enum\SCSI by index via
+// RegEnumKeyExW (which lands at NtEnumerateKey) and substring-matches the
+// returned subkey names against VEN_5853, QEMU, virtio, Xen, etc. The
+// existing NtOpenKey hook above never sees these probes because al-khaser
+// doesn't open the leaf keys by name. Here we install an entry+return hook
+// pair on NtEnumerateKey: when the enumeration is rooted at one of the three
+// device parent paths, the return callback overwrites any banned substrings
+// in the WCHAR Name field of the output buffer with 'X' characters. The key
+// still appears (downstream callers like PnP keep working) but al-khaser's
+// case-insensitive substring search no longer matches.
+// ---------------------------------------------------------------------------
+
+static const char* HIDEVM_BANNED_SUBKEY_FRAGMENTS[] =
+{
+    "ven_5853",  // Xen Platform PCI device
+    "qemu",
+    "virtio",
+    "xen",
+    nullptr,
+};
+
+static bool hidevm_path_endswith(const char* path, const char* suffix)
+{
+    if (!path || !suffix) return false;
+    size_t plen = strlen(path);
+    size_t slen = strlen(suffix);
+    if (slen > plen) return false;
+    return g_ascii_strcasecmp(path + (plen - slen), suffix) == 0;
+}
+
+static bool hidevm_is_target_enum_parent(const char* path)
+{
+    return hidevm_path_endswith(path, HIDEVM_ENUM_PCI_PATH_FRAGMENT)
+        || hidevm_path_endswith(path, HIDEVM_ENUM_IDE_PATH_FRAGMENT)
+        || hidevm_path_endswith(path, HIDEVM_ENUM_SCSI_PATH_FRAGMENT);
+}
+
+// Munge any banned substring in the buffer's WCHAR name in place. Returns
+// the matched fragment for logging (or nullptr if nothing matched).
+static const char* hidevm_subkey_buffer_munge(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
+    addr_t name_addr, uint32_t name_length_bytes)
+{
+    if (!name_addr || name_length_bytes < 2)
+        return nullptr;
+
+    // Hard cap to keep the stack read bounded; subkey names in registry are
+    // limited to 255 chars by the registry API anyway.
+    if (name_length_bytes > 1024)
+        name_length_bytes = 1024;
+
+    auto vmi = vmi_lock_guard(drakvuf);
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3
+    );
+
+    std::vector<uint8_t> buf(name_length_bytes);
+    ctx.addr = name_addr;
+    if (VMI_FAILURE == vmi_read(vmi, &ctx, name_length_bytes, buf.data(), nullptr))
+        return nullptr;
+
+    // Decode WCHAR -> ASCII lowercase for substring matching. Non-ASCII
+    // characters become '?'; this is fine because banned tokens are ASCII.
+    size_t nchars = name_length_bytes / 2;
+    std::string ascii(nchars, '?');
+    for (size_t i = 0; i < nchars; i++)
+    {
+        uint16_t w = (uint16_t)buf[i*2] | ((uint16_t)buf[i*2 + 1] << 8);
+        if (w < 128)
+            ascii[i] = (char)g_ascii_tolower((char)w);
+    }
+
+    const char* matched = nullptr;
+    for (const char** frag = HIDEVM_BANNED_SUBKEY_FRAGMENTS; *frag; frag++)
+    {
+        const char* hit = strstr(ascii.c_str(), *frag);
+        if (!hit) continue;
+
+        size_t off_chars = (size_t)(hit - ascii.c_str());
+        size_t frag_chars = strlen(*frag);
+
+        // Overwrite each matched WCHAR with 'X' (0x0058 0x0000 LE).
+        for (size_t i = 0; i < frag_chars; i++)
+        {
+            buf[(off_chars + i) * 2]     = 'X';
+            buf[(off_chars + i) * 2 + 1] = 0x00;
+        }
+        // Keep the lowercase view in sync so a second matching fragment in
+        // the same name (rare) doesn't double-trip on the same bytes.
+        for (size_t i = 0; i < frag_chars; i++)
+            ascii[off_chars + i] = 'x';
+        matched = *frag;
+    }
+
+    if (matched)
+    {
+        ctx.addr = name_addr;
+        if (VMI_FAILURE == vmi_write(vmi, &ctx, name_length_bytes, buf.data(), nullptr))
+        {
+            PRINT_DEBUG("[HIDEVM] EnumerateKey: failed to write munged subkey name back to guest\n");
+            return nullptr;
+        }
+    }
+    return matched;
+}
+
+event_response_t hidevm::EnumerateKeyReturn_cb(drakvuf_t, drakvuf_trap_info_t* info)
+{
+    auto params = libhook::GetTrapParams<hidevm_enum_key_data>(info);
+    auto hook_ID = make_hook_id(info, params->target_rsp);
+
+    // Always clean up the per-call hook entry on the way out, regardless of
+    // syscall outcome.
+    auto cleanup = [this, &hook_ID]()
+    {
+        this->enum_key_ret_hooks.erase(hook_ID);
+    };
+
+    if (!this->enum_key_ret_hooks.count(hook_ID) || !params->verifyResultCallParams(drakvuf, info))
+    {
+        cleanup();
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    if (info->regs->rax != STATUS_SUCCESS)
+    {
+        cleanup();
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    addr_t name_offset_in_buf = 0;
+    addr_t length_field_offset_in_buf = 0;
+    if (params->info_class == KEY_BASIC_INFORMATION_CLASS)
+    {
+        length_field_offset_in_buf = KEY_BASIC_INFORMATION_NAME_LENGTH_OFFSET;
+        name_offset_in_buf         = KEY_BASIC_INFORMATION_NAME_OFFSET;
+    }
+    else if (params->info_class == KEY_NODE_INFORMATION_CLASS)
+    {
+        length_field_offset_in_buf = KEY_NODE_INFORMATION_NAME_LENGTH_OFFSET;
+        name_offset_in_buf         = KEY_NODE_INFORMATION_NAME_OFFSET;
+    }
+    else
+    {
+        // Other KEY_INFORMATION_CLASS values don't expose the subkey name.
+        cleanup();
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    uint32_t name_length_bytes = 0;
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3
+        );
+        ctx.addr = params->key_information + length_field_offset_in_buf;
+        if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &name_length_bytes))
+        {
+            cleanup();
+            return VMI_EVENT_RESPONSE_NONE;
+        }
+    }
+
+    if (name_length_bytes == 0 ||
+        name_offset_in_buf + name_length_bytes > params->length)
+    {
+        cleanup();
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    const char* matched = hidevm_subkey_buffer_munge(drakvuf, info,
+            params->key_information + name_offset_in_buf, name_length_bytes);
+
+    if (matched)
+    {
+        fmt::print(this->format, "hidevm", drakvuf, info,
+            keyval("Reason", fmt::Qstr("Enum subkey name munged")),
+            keyval("Match", fmt::Qstr(matched))
+        );
+    }
+
+    cleanup();
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+event_response_t hidevm::NtEnumerateKey_cb(drakvuf_t, drakvuf_trap_info_t* info)
+{
+    // Cheap arg checks first — NtEnumerateKey is hot, so avoid the VMI page
+    // walk in drakvuf_reg_keyhandle_path() for irrelevant enumerations.
+    uint32_t info_class      = (uint32_t)drakvuf_get_function_argument(drakvuf, info, 3);
+    if (info_class != KEY_BASIC_INFORMATION_CLASS && info_class != KEY_NODE_INFORMATION_CLASS)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    addr_t key_handle        = drakvuf_get_function_argument(drakvuf, info, 1);
+    addr_t key_information   = drakvuf_get_function_argument(drakvuf, info, 4);
+    uint32_t length          = (uint32_t)drakvuf_get_function_argument(drakvuf, info, 5);
+    if (!key_handle || !key_information)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    gchar* parent_path = drakvuf_reg_keyhandle_path(drakvuf, info, key_handle);
+    if (!parent_path)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    gchar* parent_lower = g_ascii_strdown(parent_path, -1);
+    bool is_target = hidevm_is_target_enum_parent(parent_lower);
+    g_free(parent_lower);
+    g_free(parent_path);
+
+    if (!is_target)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    auto hook = this->createReturnHook<hidevm_enum_key_data>(info, &hidevm::EnumerateKeyReturn_cb, info->trap->name);
+    if (!hook)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    auto params = libhook::GetTrapParams<hidevm_enum_key_data>(hook->trap_);
+    params->info_class      = info_class;
+    params->key_information = key_information;
+    params->length          = length;
+
+    auto hook_ID = make_hook_id(info, params->target_rsp);
+    this->enum_key_ret_hooks[hook_ID] = std::move(hook);
+
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+event_response_t hidevm::NtOpenKey_cb(drakvuf_t, drakvuf_trap_info_t* info)
+{
+    return hidevm_open_key_entry(this, this->drakvuf, info);
+}
+
+event_response_t hidevm::NtOpenKeyEx_cb(drakvuf_t, drakvuf_trap_info_t* info)
+{
+    return hidevm_open_key_entry(this, this->drakvuf, info);
+}
+
+event_response_t hidevm::NtCreateKey_cb(drakvuf_t, drakvuf_trap_info_t* info)
+{
+    return hidevm_open_key_entry(this, this->drakvuf, info);
+}
+
+event_response_t hidevm::NtOpenKeyTransacted_cb(drakvuf_t, drakvuf_trap_info_t* info)
+{
+    return hidevm_open_key_entry(this, this->drakvuf, info);
+}
+
+event_response_t hidevm::NtOpenKeyTransactedEx_cb(drakvuf_t, drakvuf_trap_info_t* info)
+{
+    return hidevm_open_key_entry(this, this->drakvuf, info);
+}
+
 hidevm::hidevm(drakvuf_t drakvuf, const hidevm_config* config, output_format_t output): pluginex(drakvuf, output), drakvuf(drakvuf), format(output)
 {
     // Advance boot time
@@ -727,7 +1100,7 @@ hidevm::hidevm(drakvuf_t drakvuf, const hidevm_config* config, output_format_t o
         {
             // Get TickCountMultiplier
             uint32_t multiplier = 0, ticks = 0;
-            if (VMI_SUCCESS != vmi_read_32_pa(vmi, pkuser + 0x04,  &multiplier) ||
+            if (VMI_SUCCESS != vmi_read_32_pa(vmi, pkuser + 0x04, &multiplier) ||
                 VMI_SUCCESS != vmi_read_32_pa(vmi, pkuser + 0x320, &ticks))
             {
                 PRINT_DEBUG("[HIDEVM] Failed to read KUSER_SHARED_DATA\n");
@@ -754,6 +1127,11 @@ hidevm::hidevm(drakvuf_t drakvuf, const hidevm_config* config, output_format_t o
         PRINT_DEBUG("[HIDEVM] Failed to get nt!_OBJECT_ATTRIBUTES.ObjectName offest\n");
         throw -1;
     }
+    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "_OBJECT_ATTRIBUTES", "RootDirectory", &this->objattr_root))
+    {
+        PRINT_DEBUG("[HIDEVM] Failed to get nt!_OBJECT_ATTRIBUTES.RootDirectory offest\n");
+        throw -1;
+    }
     if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "_IO_STATUS_BLOCK", "Information", &this->iostatusblock_information))
     {
         PRINT_DEBUG("[HIDEVM] Failed to get nt!_IO_STATUS_BLOCK.Information offest\n");
@@ -761,6 +1139,19 @@ hidevm::hidevm(drakvuf_t drakvuf, const hidevm_config* config, output_format_t o
     }
 
     this->NtDeviceIoControlFile_hook = createSyscallHook("NtDeviceIoControlFile", &hidevm::NtDeviceIoControlFile_cb);
+
+    // Hide the Xen Platform PCI device from registry-based VM detection
+    // (al-khaser HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_5853* probe).
+    this->NtOpenKey_hook              = createSyscallHook("NtOpenKey", &hidevm::NtOpenKey_cb);
+    this->NtOpenKeyEx_hook            = createSyscallHook("NtOpenKeyEx", &hidevm::NtOpenKeyEx_cb);
+    this->NtCreateKey_hook            = createSyscallHook("NtCreateKey", &hidevm::NtCreateKey_cb);
+    this->NtOpenKeyTransacted_hook    = createSyscallHook("NtOpenKeyTransacted", &hidevm::NtOpenKeyTransacted_cb);
+    this->NtOpenKeyTransactedEx_hook  = createSyscallHook("NtOpenKeyTransactedEx", &hidevm::NtOpenKeyTransactedEx_cb);
+
+    // Filter \Enum\PCI / \Enum\IDE / \Enum\SCSI subkey enumerations so banned
+    // tokens (VEN_5853, qemu, virtio, xen) don't surface to user-mode
+    // detection scanners (MAP-1826).
+    this->NtEnumerateKey_hook         = createSyscallHook("NtEnumerateKey", &hidevm::NtEnumerateKey_cb);
 
     // Usermode hooking for WQL spoofing
     if (!drakvuf_are_userhooks_supported(drakvuf))

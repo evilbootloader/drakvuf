@@ -88,7 +88,7 @@
  * otherwise) that you are offering unlimited, non-exclusive right to      *
  * reuse, modify, and relicense the code.  DRAKVUF will always be          *
  * available Open Source, but this is important because the inability to   *
- * relicense code has caused devastating problems for other Free Software  *
+* relicense code has caused devastating problems for other Free Software  *
  * projects (such as KDE and NASM).                                        *
  * To specify special license conditions of your contributions, just say   *
  * so when you send them.                                                  *
@@ -102,190 +102,113 @@
  *                                                                         *
  ***************************************************************************/
 
-#include <inttypes.h>
-#include <libvmi/libvmi.h>
-#include <assert.h>
-#include <array>
-#include <vector>
-#include <libdrakvuf/json-util.h>
+#ifndef FILEEXTRACTOR_LINUX_H
+#define FILEEXTRACTOR_LINUX_H
 
-#include "plugins/output_format.h"
+#include "plugins/plugins_ex.h"
 #include "private.h"
-#include "tlsmon.h"
 
+#include <map>
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <fstream>
 
-static std::optional<std::string> ssl_get_master_key(
-    drakvuf_t drakvuf, drakvuf_trap_info* info, vmi_instance_t vmi, access_context_t ctx
-)
+class linux_fileextractor : public pluginex
 {
-    tlsmon_priv::ssl_master_secret_t master_secret;
+public:
+    linux_fileextractor(drakvuf_t drakvuf, const fileextractor_config* config, output_format_t output);
+    linux_fileextractor(const linux_fileextractor&) = delete;
+    linux_fileextractor& operator=(const linux_fileextractor&) = delete;
+    ~linux_fileextractor() = default;
 
-    // We first extract master key by tracing down relevant structures starting with master_key_handle.
-    addr_t ncrypt_ssl_key_addr = drakvuf_get_function_argument(drakvuf, info, 2);
+    virtual bool stop_impl() override;
 
-    // master_key_handle points to NCryptSslKey structure.
-    tlsmon_priv::ncrypt_ssl_key_t ncrypt_ssl_key;
-    ctx.addr = ncrypt_ssl_key_addr;
-    if (VMI_SUCCESS != vmi_read(vmi, &ctx, sizeof(ncrypt_ssl_key), &ncrypt_ssl_key, nullptr))
+private:
+    /* Configuration */
+    const char* dump_folder;
+    uint64_t extract_size;
+
+    /* Sequence number for unique file naming */
+    int sequence_number{0};
+
+    /* pt_regs offsets for reading syscall arguments
+     * Prefixed with FE_ to avoid conflict with filetracer_ns definitions */
+    enum
     {
-        PRINT_DEBUG("[TLSMON] Can't read NCryptSslKey structure\n");
-        return {};
-    }
+        FE_PT_REGS_R15,
+        FE_PT_REGS_R14,
+        FE_PT_REGS_R13,
+        FE_PT_REGS_R12,
+        FE_PT_REGS_RBP,
+        FE_PT_REGS_RBX,
+        FE_PT_REGS_R11,
+        FE_PT_REGS_R10,
+        FE_PT_REGS_R9,
+        FE_PT_REGS_R8,
+        FE_PT_REGS_RAX,
+        FE_PT_REGS_RCX,
+        FE_PT_REGS_RDX,
+        FE_PT_REGS_RSI,
+        FE_PT_REGS_RDI,
+        FE_PT_REGS_ORIG_RAX,
+        FE_PT_REGS_RIP,
+        __FE_PT_REGS_REQUIRED, // GPRs above this point are required
+        FE_PT_REGS_CS = __FE_PT_REGS_REQUIRED,
+        FE_PT_REGS_EFLAGS,
+        FE_PT_REGS_RSP,
+        FE_PT_REGS_SS,
+        __FE_PT_REGS_MAX
+    };
 
-    // We can validate that we indeed found NCryptSslKey by checking magic bytes value.
-    if (ncrypt_ssl_key.magic != tlsmon_priv::NCRYPT_SSL_KEY_MAGIC_BYTES)
+    std::array<size_t, __FE_PT_REGS_MAX> regs;
+
+    /* Linux struct offsets for fd-to-filename resolution */
+    enum
     {
-        PRINT_DEBUG("[TLSMON] Wrong NCryptSslKey magic\n");
-        return {};
-    }
+        FE_LINUX_TASK_STRUCT_FILES,
+        FE_LINUX_FILES_STRUCT_FDT,
+        FE_LINUX_FDTABLE_FD,
+        FE_LINUX_FILE_F_PATH,
+        FE_LINUX_PATH_DENTRY,
+        __FE_LINUX_OFFSET_MAX
+    };
 
-    // NCryptSslKey contains a pointer to SslMasterSecret structure.
-    ctx.addr = (addr_t) ncrypt_ssl_key.master_secret;
-    if (VMI_SUCCESS != vmi_read(vmi, &ctx, sizeof(master_secret), &master_secret, nullptr))
+    std::array<size_t, __FE_LINUX_OFFSET_MAX> offsets;
+
+    /* Track files being written: key = (pid, fd), value = file info */
+    struct file_info_t
     {
-        PRINT_DEBUG("[TLSMON] Can't read SslMasterSecret structure\n");
-        return {};
-    }
+        std::string filename;
+        std::string dump_path;
+        uint64_t total_bytes{0};
+        int sequence_num{0};
+        bool is_new{true};
+    };
 
-    // Again we can validate that we found SslMasterSecret structure bychecking magic bytes.
-    if (master_secret.magic != tlsmon_priv::MASTER_SECRET_MAGIC_BYTES)
-    {
-        PRINT_DEBUG("[TLSMON] Wrong SslMasterSecret magic\n");
-        return {};
-    }
+    std::map<std::pair<uint64_t, int>, file_info_t> tracked_files;
 
-    // Output retrieved master secret in hex format.
-    std::string master_key_str = tlsmon_priv::byte2str(master_secret.master_key, tlsmon_priv::MASTER_KEY_SZ);
-    return master_key_str;
-}
+    /* Hooks */
+    std::unique_ptr<libhook::SyscallHook> syscall_hook;
 
-static
-std::optional< std::vector<tlsmon_priv::ncrypt_buffer_t> > ssl_get_ncrypt_buffers(
-    drakvuf_t drakvuf, drakvuf_trap_info* info, vmi_instance_t vmi, access_context_t ctx
-)
-{
-    // Now retrieve client random and server random values. pParameterList points to an array of
-    // NCryptBuffer buffers which contains at least client and server random
-    // values.
-    ctx.addr = drakvuf_get_function_argument(drakvuf, info, 5);
-    tlsmon_priv::ncrypt_buffer_desc_t ncrypt_buffer_desc;
-    if (VMI_SUCCESS != vmi_read(vmi, &ctx, sizeof(ncrypt_buffer_desc), &ncrypt_buffer_desc, nullptr))
-    {
-        PRINT_DEBUG("[TLSMON] Failed to read ncrypt parameter list\n");
-        return {};
-    }
+    /* Callbacks */
+    event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
-    size_t ncrypt_buffers_size = ncrypt_buffer_desc.cbuffers;
-    if ( ncrypt_buffers_size != 2 )
-    {
-        PRINT_DEBUG("[TLSMON] Ncrypt parameter list has different size than 2\n");
-        return {};
-    }
+    /* Syscall argument extraction */
+    bool get_pt_regs_and_nr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* pt_regs_addr, uint64_t* nr);
+    bool read_pt_regs_arg(drakvuf_t drakvuf, addr_t pt_regs_addr, int arg_index, uint64_t* value);
 
-    std::vector<tlsmon_priv::ncrypt_buffer_t> ncrypt_buffers = std::vector<tlsmon_priv::ncrypt_buffer_t>(ncrypt_buffers_size);
-    ctx.addr = (addr_t) ncrypt_buffer_desc.buffers;
-    if (VMI_SUCCESS != vmi_read(vmi, &ctx, (ncrypt_buffers_size * sizeof(tlsmon_priv::ncrypt_buffer_t)), ncrypt_buffers.data(), nullptr))
-    {
-        PRINT_DEBUG("[TLSMON] Failed to read ncrypt parameter list buffers\n");
-        return {};
-    }
-    return ncrypt_buffers;
-}
+    /* File operations */
+    std::string get_filename_from_fd(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int fd);
+    bool read_user_buffer(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t user_addr, size_t size, std::vector<uint8_t>& buffer);
+    std::string sanitize_filename(const std::string& filename);
+    std::string make_dump_filename(const std::string& original_name, int seq_num);
+    bool save_file_chunk(const std::string& dump_path, const std::vector<uint8_t>& data, bool append);
 
+    /* Output */
+    void print_extraction_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
+        const std::string& filename, uint64_t size,
+        const std::string& dump_path, const char* reason);
+};
 
-/**
- * Sets a trap on return from SslGenerateSessionKeys function to obtain the
- * calculated master key.
- */
-static
-event_response_t ssl_generate_session_keys_cb(drakvuf_t drakvuf, drakvuf_trap_info* info)
-{
-    auto plugin = static_cast<tlsmon*>(drakvuf_get_extra_from_running_trap(info->trap));
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = info->regs->cr3
-    );
-
-    auto vmi = vmi_lock_guard(drakvuf);
-
-    auto master_key = ssl_get_master_key(drakvuf, info, vmi, ctx);
-    if (!master_key)
-    {
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    auto ncrypt_buffers = ssl_get_ncrypt_buffers(drakvuf, info, vmi, ctx);
-    if (!ncrypt_buffers)
-    {
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    // buffer for both ClientRandom and ServerRandom
-    std::array<char, tlsmon_priv::CLIENT_RANDOM_SZ> randoms_buffer = std::array<char, tlsmon_priv::CLIENT_RANDOM_SZ>();
-
-    for (tlsmon_priv::ncrypt_buffer_t ncrypt_buffer_iter: *ncrypt_buffers)
-    {
-        uint32_t buffer_type = ncrypt_buffer_iter.buffer_type;
-        uint32_t size = ncrypt_buffer_iter.cbbuffer;;
-        if ( size != tlsmon_priv::CLIENT_RANDOM_SZ )
-        {
-            PRINT_DEBUG("[TLSMON] Wrong ncrypt buffer size\n");
-            continue;
-        }
-
-        // read the buffer
-        ctx.addr = (addr_t) ncrypt_buffer_iter.buffer;
-        if (VMI_SUCCESS != vmi_read(vmi, &ctx, randoms_buffer.size(), randoms_buffer.data(), nullptr))
-        {
-            PRINT_DEBUG("[TLSMON] Failed to read ncrypt buffer\n");
-            continue;
-        }
-        // convert bytes to string
-        std::string client_random_str = tlsmon_priv::byte2str((unsigned char*)randoms_buffer.data(), 32);
-
-        if (buffer_type == tlsmon_priv::NCRYPTBUFFER_SSL_CLIENT_RANDOM)
-        {
-            fmt::print(plugin->m_output_format, "tlsmon", drakvuf, info,
-                keyval("client_random", fmt::Qstr(client_random_str)),
-                keyval("master_key", fmt::Qstr(*master_key))
-            );
-        }
-        else if (buffer_type != tlsmon_priv::NCRYPTBUFFER_SSL_SERVER_RANDOM)
-        {
-            PRINT_DEBUG("[TLSMON] Unknown ncrypt buffer type.\n");
-            continue;
-        }
-    }
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-
-/**
- * Sets a hook on running lsass process. In Windows, processes that want to
- * establish TLS connection with Schannel API, do so by using lsass under the
- * hood. This way, lsass will perform TLS handshake on behalf of the process
- * initiating the connection and secrets will never leave lsass's memory.
- */
-void tlsmon::hook_lsass(drakvuf_t drakvuf)
-{
-    addr_t lsass_base = 0;
-    if (!drakvuf_find_process(drakvuf, ~0, "lsass.exe", &lsass_base))
-        return;
-    drakvuf_request_userhook_on_running_process(drakvuf, lsass_base, "ncrypt.dll", "SslGenerateSessionKeys", ssl_generate_session_keys_cb, this);
-}
-
-
-tlsmon::tlsmon(drakvuf_t drakvuf, output_format_t output)
-    : pluginex(drakvuf, output)
-{
-    if (!drakvuf_are_userhooks_supported(drakvuf))
-    {
-        PRINT_DEBUG("[TLSMON] Usermode hooking not supported.\n");
-        return;
-    }
-
-    this->hook_lsass(drakvuf);
-}
-
-
-tlsmon::~tlsmon() {}
+#endif // FILEEXTRACTOR_LINUX_H

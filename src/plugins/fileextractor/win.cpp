@@ -1872,15 +1872,51 @@ void win_fileextractor::close_cb_handle_unextracted(drakvuf_trap_info_t* info,
     vmi_lock_guard vmi(drakvuf);
 
     // extract file and close task
-    if ( task->reason == task_t::task_reason::write)
+    //
+    // Historically all 'write' reason tasks were skipped at close on the
+    // assumption that writefile_cb had already attempted extraction. In
+    // practice that misses real cases:
+    //
+    //   1. The write-time extraction was abandoned mid-state-machine
+    //      because subsequent NtWriteFile events on the same handle never
+    //      fired before close (single-shot writes by services like the
+    //      Event Log writing to *.evtx files).
+    //   2. The first write went through the cache manager / memory-mapped
+    //      I/O path and never triggered our hook, so the writer-time
+    //      extraction never even started even though FILE_OBJECT->Flags
+    //      records the modification.
+    //
+    // Use FO_FILE_MODIFIED as the gating signal: the kernel sets it
+    // whenever the file's data has been changed since open. If the flag is
+    // set and we never produced an extracted copy, retry the extraction
+    // from a clean 'pending' state at close time. The writer's handle is
+    // still valid for one more injected call chain because we are
+    // intercepting NtClose entry, not return.
+    if (task->reason == task_t::task_reason::write)
     {
+        uint64_t current_flags = task->fo_flags;
+        if (!current_flags)
+            get_file_object_flags(info, vmi, task->handle, &current_flags);
+
+        if (!(current_flags & FO_FILE_MODIFIED))
+        {
+            PRINT_DEBUG("[FILEEXTRACTOR] [%8zu] [%d:%d] [%d:%d]"
+                "Skip 'write' task on close handle (FO_FILE_MODIFIED not set)\n"
+                , info->event_uid
+                , info->attached_proc_data.pid, info->attached_proc_data.tid
+                , task->target.ret_pid, (int)task->stage()
+            );
+            return;
+        }
+
+        task->fo_flags = current_flags;
+        task->stage(task_t::stage_t::pending);
         PRINT_DEBUG("[FILEEXTRACTOR] [%8zu] [%d:%d] [%d:%d]"
-            "Skip 'write' task on close handle\n"
+            "Retry 'write' task on close handle (FO_FILE_MODIFIED set)\n"
             , info->event_uid
             , info->attached_proc_data.pid, info->attached_proc_data.tid
             , task->target.ret_pid, (int)task->stage()
         );
-        return;
     }
 
     check_stack_marker(info, vmi, task);

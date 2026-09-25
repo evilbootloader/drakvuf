@@ -123,6 +123,7 @@ endif
 if get_option('plugin-fileextractor')
     plugin_sources += 'fileextractor/fileextractor.cpp'
     plugin_sources += 'fileextractor/win.cpp'
+    plugin_sources += 'fileextractor/linux.cpp'
 
     config_h.set('ENABLE_PLUGIN_FILEEXTRACTOR', 1)
 endif
@@ -160,6 +161,8 @@ endif
 
 if get_option('plugin-memdump')
     plugin_sources += 'memdump/memdump.cpp'
+    plugin_sources += 'memdump/win.cpp'
+    plugin_sources += 'memdump/linux.cpp'
     plugin_sources += 'memdump/stack_util.cpp'
     plugin_sources += 'memdump/userhook.cpp'
 

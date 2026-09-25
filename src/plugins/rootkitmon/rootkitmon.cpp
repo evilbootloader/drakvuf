@@ -345,7 +345,7 @@ static void initialize_ci_checks(drakvuf_t drakvuf, rootkitmon* plugin, const ro
 
     if (vmi_get_win_buildnumber(vmi) <= win8_rtm_ver)
     {
-        if (VMI_SUCCESS != vmi_translate_ksym2v(vmi, "g_CiEnabled",   &plugin->ci_enabled_va) ||
+        if (VMI_SUCCESS != vmi_translate_ksym2v(vmi, "g_CiEnabled", &plugin->ci_enabled_va) ||
             VMI_SUCCESS != vmi_translate_ksym2v(vmi, "g_CiCallbacks", &plugin->ci_callbacks_va))
         {
             PRINT_DEBUG("[ROOTKITMON] Failed to initialize g_CiEnabled or g_CiCallbacks\n");

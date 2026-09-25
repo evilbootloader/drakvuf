@@ -196,9 +196,9 @@ int main(int argc, char** argv)
     act.sa_handler = close_handler;
     act.sa_flags = 0;
     sigemptyset(&act.sa_mask);
-    sigaction(SIGHUP,  &act, NULL);
+    sigaction(SIGHUP, &act, NULL);
     sigaction(SIGTERM, &act, NULL);
-    sigaction(SIGINT,  &act, NULL);
+    sigaction(SIGINT, &act, NULL);
     sigaction(SIGALRM, &act, NULL);
 
     if ( !drakvuf_add_trap(drakvuf, &trap) )

@@ -201,7 +201,7 @@ bool dump_memory_region(
     size_t len_bytes,
     const char* reason,
     extras_t* extras,
-    void (*printout_extras)(drakvuf_t drakvuf, output_format_t format, extras_t* extras));
+    bool print_extras);
 
 bool inspect_stack_ptr(
     drakvuf_t drakvuf,
