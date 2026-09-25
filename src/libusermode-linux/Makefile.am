@@ -102,7 +102,8 @@
 #                                                                         #
 #*************************************************************************#
 
-sources = dl_rendezvous.cpp dl_rendezvous.hpp dl_rendezvous_abi.hpp
+sources = dl_rendezvous.cpp dl_rendezvous.hpp dl_rendezvous_abi.hpp \
+          utils.cpp utils.hpp
 
 AM_CPPFLAGS = -I$(top_srcdir) -I$(top_srcdir)/src -I$(srcdir)
 AM_CPPFLAGS += $(CPPFLAGS)
@@ -144,4 +145,17 @@ endif
 
 noinst_LTLIBRARIES= libusermode_linux.la
 libusermode_linux_la_SOURCES= $(sources)
-libusermode_linux_la_LIBADD = ../libdrakvuf/libdrakvuf.la
+libusermode_linux_la_LIBADD = ../libdrakvuf/libdrakvuf.la ../libusermode/libusermode.la
+
+if MAKE_TESTS
+
+AM_DEFAULT_SOURCE_EXT = .cpp
+
+check_PROGRAMS = libusermode_linux_check
+libusermode_linux_check_SOURCES = check.cpp
+libusermode_linux_check_CFLAGS = $(CHECK_CFLAGS)
+libusermode_linux_check_LDADD = $(CHECK_LIBS) libusermode_linux.la
+
+TESTS = $(check_PROGRAMS)
+
+endif

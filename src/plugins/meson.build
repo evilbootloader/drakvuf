@@ -40,6 +40,12 @@ if get_option('plugin-apimon')
     config_h.set('ENABLE_PLUGIN_APIMON', 1)
 endif
 
+if get_option('plugin-libmon')
+    plugin_sources += 'libmon/libmon.cpp'
+
+    config_h.set('ENABLE_PLUGIN_LIBMON', 1)
+endif
+
 if get_option('plugin-bsodmon')
     plugin_sources += 'bsodmon/bsodmon.cpp'
     plugin_sources += 'bsodmon/bugcheck.cpp'
@@ -325,6 +331,7 @@ summary({
     'syscalls': get_option('plugin-syscalls'),
     'poolmon': get_option('plugin-poolmon'),
     'apimon': get_option('plugin-apimon'),
+    'libmon': get_option('plugin-libmon'),
     'bsodmon': get_option('plugin-bsodmon'),
     'callbackmon': get_option('plugin-callbackmon'),
     'clipboardmon': get_option('plugin-clipboardmon'),

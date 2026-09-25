@@ -10,38 +10,6 @@
 namespace
 {
 
-// register_trap()'s "init_breakpoint" functor for a permanent breakpoint at
-// an already-known virtual address, scoped to one process. There's no
-// dedicated createXxxHook() for this (only ReturnHook/SyscallHook/Cr3Hook/
-// CpuidHook/CatchAllHook/MemAccessHook exist in the RAII API), so this goes
-// through the legacy register_trap() API instead -- same idiom as
-// breakpoint_by_pid_searcher in plugins/plugins_ex.h, just for a fixed VA
-// instead of a return address derived from the current stack.
-struct breakpoint_at_va_for_pid
-{
-    breakpoint_at_va_for_pid(vmi_pid_t pid, addr_t va) : m_pid(pid), m_va(va) {}
-
-    drakvuf_trap_t* operator()(drakvuf_t drakvuf, drakvuf_trap_info_t* /*info*/, drakvuf_trap_t* trap) const
-    {
-        if (!trap)
-            return nullptr;
-
-        trap->type = BREAKPOINT;
-        trap->breakpoint.lookup_type = LOOKUP_PID;
-        trap->breakpoint.pid = m_pid;
-        trap->breakpoint.addr_type = ADDR_VA;
-        trap->breakpoint.addr = m_va;
-
-        if (!drakvuf_add_trap(drakvuf, trap))
-            return nullptr;
-
-        return trap;
-    }
-
-    vmi_pid_t m_pid;
-    addr_t m_va;
-};
-
 // linux_eprocess_sym2va() (src/libdrakvuf/linux-exports.c, reached here via
 // the public drakvuf_exportsym_to_va() wrapper) prefix-matches the mapped
 // file's basename against this string, so "ld-linux" alone matches both
@@ -76,6 +44,17 @@ dl_rendezvous::dl_rendezvous(drakvuf_t drakvuf)
         PRINT_DEBUG("[DL_RENDEZVOUS] Method do_exit not found.\n");
         throw -1;
     }
+}
+
+void dl_rendezvous::set_callbacks(so_event_cb on_discovered, so_event_cb on_removed)
+{
+    this->discovered_cb = std::move(on_discovered);
+    this->removed_cb = std::move(on_removed);
+}
+
+void dl_rendezvous::set_process_reset_callback(proc_reset_cb on_reset)
+{
+    this->reset_cb = std::move(on_reset);
 }
 
 bool dl_rendezvous::is_supported(drakvuf_t drakvuf)
@@ -163,10 +142,15 @@ event_response_t dl_rendezvous::load_elf_binary_ret_cb(drakvuf_t drakvuf, drakvu
     // exec() keeps the pid, so a process exec'ing more than once (shell
     // wrappers, interpreters re-exec'ing) lands here again for a pid we
     // already track. Drop the previous address space's trap and snapshot
-    // instead of leaking the trap and leaving a stale breakpoint behind.
+    // instead of leaking the trap and leaving a stale breakpoint behind, and
+    // tell consumers to do the same with anything they resolved back then.
     auto& state = this->procs[pid];
     if (state.rendezvous_trap)
+    {
         this->destroy_trap(state.rendezvous_trap);
+        if (this->reset_cb)
+            this->reset_cb(pid);
+    }
 
     state = {};
     state.r_debug_va = r_debug_va;
@@ -245,12 +229,32 @@ event_response_t dl_rendezvous::dl_debug_state_hook_cb(drakvuf_t drakvuf, drakvu
 
     // Diff against the previous snapshot for this process.
     for (auto& [base, path] : current_libs)
-        if (!state.known_libs.count(base))
-            PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: lib_discovered base=0x%lx path=%s\n", pid, base, path.c_str());
+    {
+        if (state.known_libs.count(base))
+            continue;
+
+        PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: lib_discovered base=0x%lx path=%s\n", pid, base, path.c_str());
+
+        if (plugin->discovered_cb)
+        {
+            so_view_t so{ pid, info->proc_data.base_addr, base, path };
+            plugin->discovered_cb(drakvuf, info, so);
+        }
+    }
 
     for (auto& [base, path] : state.known_libs)
-        if (!current_libs.count(base))
-            PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: lib_removed base=0x%lx path=%s\n", pid, base, path.c_str());
+    {
+        if (current_libs.count(base))
+            continue;
+
+        PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: lib_removed base=0x%lx path=%s\n", pid, base, path.c_str());
+
+        if (plugin->removed_cb)
+        {
+            so_view_t so{ pid, info->proc_data.base_addr, base, path };
+            plugin->removed_cb(drakvuf, info, so);
+        }
+    }
 
     state.known_libs = std::move(current_libs);
     return VMI_EVENT_RESPONSE_NONE;
@@ -262,6 +266,9 @@ event_response_t dl_rendezvous::do_exit_cb(drakvuf_t drakvuf, drakvuf_trap_info_
     auto it = this->procs.find(pid);
     if (it == this->procs.end())
         return VMI_EVENT_RESPONSE_NONE;
+
+    if (this->reset_cb)
+        this->reset_cb(pid);
 
     if (it->second.rendezvous_trap)
         this->destroy_trap(it->second.rendezvous_trap);

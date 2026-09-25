@@ -170,6 +170,7 @@ struct plugins_options
     bool memdump_disable_create_thread; // PLUGIN_MEMDUMP
     bool memdump_disable_set_thread;    // PLUGIN_MEMDUMP
     bool memdump_disable_shellcode_detect; // PLUGIN_MEMDUMP
+    const char* so_hooks_list;          // PLUGIN_LIBMON
     const char* dll_hooks_list;         // PLUGIN_MEMDUMP, PLUGIN_APIMON
     bool userhook_no_addr;              // PLUGIN_MEMDUMP, PLUGIN_APIMON
     bool userhook_injection_mode;       // PLUGIN_MEMDUMP, PLUGIN_APIMON, PLUGIN_RPCMON
@@ -260,6 +261,7 @@ typedef enum drakvuf_plugin
     PLUGIN_ETWMON,
     PLUGIN_REBOOTMON,
     PLUGIN_LINKMON,
+    PLUGIN_LIBMON,
     __DRAKVUF_PLUGIN_LIST_MAX
 } drakvuf_plugin_t;
 
@@ -309,6 +311,7 @@ static const char* drakvuf_plugin_names[] =
     [PLUGIN_ETWMON] = "etwmon",
     [PLUGIN_REBOOTMON] = "rebootmon",
     [PLUGIN_LINKMON] = "linkmon",
+    [PLUGIN_LIBMON] = "libmon",
 };
 
 static const bool drakvuf_plugin_os_support[__DRAKVUF_PLUGIN_LIST_MAX][VMI_OS_WINDOWS+1] =
@@ -357,6 +360,7 @@ static const bool drakvuf_plugin_os_support[__DRAKVUF_PLUGIN_LIST_MAX][VMI_OS_WI
     [PLUGIN_ETWMON]       = { [VMI_OS_WINDOWS] = 1, [VMI_OS_LINUX] = 0 },
     [PLUGIN_REBOOTMON]    = { [VMI_OS_WINDOWS] = 0, [VMI_OS_LINUX] = 1 },
     [PLUGIN_LINKMON]      = { [VMI_OS_WINDOWS] = 1, [VMI_OS_LINUX] = 0 },
+    [PLUGIN_LIBMON]       = { [VMI_OS_WINDOWS] = 0, [VMI_OS_LINUX] = 1 },
 };
 
 class plugin

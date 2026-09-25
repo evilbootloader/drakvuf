@@ -390,6 +390,16 @@ if test x$plugin_apimon = xyes; then
   AC_DEFINE_UNQUOTED(ENABLE_PLUGIN_APIMON, 1, "")
 fi
 
+AC_ARG_ENABLE([plugin_libmon],
+  [AS_HELP_STRING([--disable-plugin-libmon],
+    [Enable the Linux shared library call tracing plugin @<:@yes@:>@])],
+  [plugin_libmon="$enableval"],
+  [plugin_libmon="yes"])
+AM_CONDITIONAL([PLUGIN_LIBMON], [test x$plugin_libmon = xyes])
+if test x$plugin_libmon = xyes; then
+  AC_DEFINE_UNQUOTED(ENABLE_PLUGIN_LIBMON, 1, "")
+fi
+
 AC_ARG_ENABLE([plugin_procdump],
   [AS_HELP_STRING([--disable-plugin-procdump],
     [Enable the windows process dumping plugin @<:@yes@:>@])],
@@ -897,6 +907,7 @@ MEMDump:            $plugin_memdump
 ProcDump:           $plugin_procdump
 ProcDump2:          $plugin_procdump2
 APIMon:             $plugin_apimon
+LibMon:             $plugin_libmon
 RPCMon:             $plugin_rpcmon
 TLSMon:             $plugin_tlsmon
 Codemon:            $plugin_codemon

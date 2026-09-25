@@ -278,6 +278,11 @@ sources += apimon/crypto.cpp
 sources += apimon/crypto.h
 endif
 
+if PLUGIN_LIBMON
+sources += libmon/libmon.cpp
+sources += libmon/libmon.h
+endif
+
 if PLUGIN_PROCDUMP
 sources += procdump/procdump.cpp
 sources += procdump/procdump.h

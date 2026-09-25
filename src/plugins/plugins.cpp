@@ -128,6 +128,7 @@
 #include "wmimon/wmimon.h"
 #include "memdump/memdump.h"
 #include "apimon/apimon.h"
+#include "libmon/libmon.h"
 #include "procdump/procdump.h"
 #include "procdump2/procdump2.h"
 #include "rpcmon/rpcmon.h"
@@ -425,6 +426,18 @@ int drakvuf_plugins::start(const drakvuf_plugin_t plugin_id,
                         .print_no_addr = options->userhook_no_addr,
                     };
                     this->plugins[plugin_id] = std::make_unique<memdump>(this->drakvuf, &config, this->output);
+                    break;
+                }
+#endif
+#ifdef ENABLE_PLUGIN_LIBMON
+                case PLUGIN_LIBMON:
+                {
+                    libmon_config config =
+                    {
+                        .so_hooks_list = options->so_hooks_list,
+                        .print_no_addr = options->userhook_no_addr
+                    };
+                    this->plugins[plugin_id] = std::make_unique<libmon>(this->drakvuf, &config, this->output);
                     break;
                 }
 #endif

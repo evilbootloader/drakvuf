@@ -315,6 +315,10 @@ static void print_usage()
         "\t --memdump-disable-set-thread\n"
         "\t                           Disable hook on NtSetInformationThread\n"
 #endif
+#ifdef ENABLE_PLUGIN_LIBMON
+        "\t --so-hooks-list <file>\n"
+        "\t                           List of shared object functions to be hooked (Linux)\n"
+#endif
 #if defined(ENABLE_PLUGIN_MEMDUMP) || defined(ENABLE_PLUGIN_APIMON) || defined(ENABLE_PLUGIN_RPCMON)
         "\t --dll-hooks-list <file>\n"
         "\t                           List of DLL functions to be hooked (see wiki)\n"
@@ -494,6 +498,7 @@ int main(int argc, char** argv)
         opt_memdump_disable_set_thread,
         opt_memdump_disable_shellcode_detect,
         opt_dll_hooks_list,
+        opt_so_hooks_list,
         opt_fileextractor_timeout,
         opt_fileextractor_hash,
         opt_fileextractor_extract,
@@ -582,6 +587,7 @@ int main(int argc, char** argv)
         {"memdump-disable-set-thread", no_argument, NULL, opt_memdump_disable_set_thread},
         {"memdump-disable-shellcode-detect", no_argument, NULL, opt_memdump_disable_shellcode_detect},
         {"dll-hooks-list", required_argument, NULL, opt_dll_hooks_list},
+        {"so-hooks-list", required_argument, NULL, opt_so_hooks_list},
         {"fileextractor-timeout", required_argument, NULL, opt_fileextractor_timeout},
         {"fileextractor-max-size-hash", required_argument, NULL, opt_fileextractor_hash},
         {"fileextractor-max-size-extract", required_argument, NULL, opt_fileextractor_extract},
@@ -894,6 +900,9 @@ int main(int argc, char** argv)
                 break;
             case opt_dll_hooks_list:
                 options.dll_hooks_list = optarg;
+                break;
+            case opt_so_hooks_list:
+                options.so_hooks_list = optarg;
                 break;
             case opt_json_clr:
                 options.clr_profile = optarg;
