@@ -104,6 +104,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <sstream>
 #include <vector>
