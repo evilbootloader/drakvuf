@@ -69,7 +69,7 @@ void load_so_hook_config(const char* path, bool print_no_addr, wanted_so_hooks_t
     PrinterConfig printer_config{print_no_addr, PrinterConfig::NumericFormat::HEX};
 
     std::string line;
-    for (size_t lineno = 1; std::getline(file, line); lineno++)
+    while (std::getline(file, line))
     {
         if (line.empty() || line[0] == '#')
             continue;
@@ -81,7 +81,7 @@ void load_so_hook_config(const char* path, bool print_no_addr, wanted_so_hooks_t
         }
         catch (const std::exception& e)
         {
-            PRINT_DEBUG("[LIBMON] %s:%zu: skipping malformed entry (%s)\n", path, lineno, e.what());
+            PRINT_DEBUG("[LIBMON] %s: skipping malformed entry '%s' (%s)\n", path, line.c_str(), e.what());
         }
     }
 }
