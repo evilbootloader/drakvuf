@@ -92,21 +92,34 @@ private:
     struct process_state
     {
         addr_t ld_base = 0;         // AT_BASE: where the interpreter is mapped
+        addr_t dtb = 0;             // its page tables, so we can read it while another process runs
+        addr_t proc_base = 0;       // task_struct
         addr_t r_debug_va = 0;
-        drakvuf_trap_t* entry_trap = nullptr;       // one-shot, at the main executable's entry
         drakvuf_trap_t* rendezvous_trap = nullptr;  // permanent, at r_debug.r_brk
+        unsigned attempts = 0;      // arming retries spent so far
         std::map<addr_t, std::string> known_libs; // link_map base (l_addr) -> path (l_name), last known snapshot
+
+        bool armed() const
+        {
+            return rendezvous_trap != nullptr;
+        }
     };
 
-    // Registered via the legacy register_trap() API (no RAII helper exists
-    // for "breakpoint at an arbitrary already-known VA scoped to one pid"),
-    // so this must be a plain-function-pointer-compatible static, and
-    // recovers `this` via get_trap_plugin() instead of being bound directly.
-    // Stage two: fires at the main executable's entry point, by which time
-    // ld.so has finished initialising r_debug and loading the startup set.
-    static event_response_t main_entry_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    // Stage two: a tick, not a real event. At finalize_exec the process has
+    // not run yet, so nothing of it is paged in and no breakpoint can be
+    // placed in it at all; r_debug is likewise still zeroed. Retry on context
+    // switches until ld.so has initialised r_debug and we can read r_brk.
+    event_response_t cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+
+    // Returns true once the process is armed or has been given up on, i.e.
+    // when it no longer needs retrying.
+    bool try_arm(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, process_state& state);
 
     // Stage three: fires at r_debug.r_brk, on every dlopen()/dlclose().
+    // Registered via the legacy register_trap() API (no RAII helper exists
+    // for "breakpoint at an arbitrary already-known VA scoped to one pid"),
+    // so it must be a plain-function-pointer-compatible static, and recovers
+    // `this` via get_trap_plugin() instead of being bound directly.
     static event_response_t rendezvous_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
     // Snapshot the link_map and report what changed since last time.
@@ -121,6 +134,10 @@ private:
 
     std::unique_ptr<libhook::SyscallHook> exec_hook;
     std::unique_ptr<libhook::SyscallHook> exit_hook;
+
+    // Installed only while some process still needs arming: a CR3 hook fires
+    // on every context switch, so it is far too costly to leave running.
+    std::unique_ptr<libhook::Cr3Hook> cr3_hook;
     std::map<vmi_pid_t, process_state> procs;
 };
 

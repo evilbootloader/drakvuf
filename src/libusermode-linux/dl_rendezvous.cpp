@@ -7,6 +7,11 @@
 #include "dl_rendezvous.hpp"
 #include "dl_rendezvous_abi.hpp"
 
+// How many context switches to keep retrying before writing a process off.
+// ld.so reaches _dl_debug_initialize() within its first few scheduling
+// slices, so anything that has not got there by now never will.
+static constexpr unsigned ARM_MAX_ATTEMPTS = 500;
+
 dl_rendezvous::dl_rendezvous(drakvuf_t drakvuf)
     : pluginex(drakvuf, OUTPUT_DEFAULT)
 {
@@ -108,25 +113,15 @@ event_response_t dl_rendezvous::finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap
         return VMI_EVENT_RESPONSE_NONE;
     }
 
-    addr_t entry_va = drakvuf_get_auxv_value(drakvuf, eprocess_base, AT_ENTRY_TYPE);
-    if (!entry_va)
-    {
-        this->report(pid, "no AT_ENTRY in the aux vector");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
     // exec() keeps the pid, so a process exec'ing more than once (shell
     // wrappers, interpreters re-exec'ing) lands here again for a pid we
-    // already track. Drop the previous address space's traps and snapshot
-    // instead of leaking them and leaving stale breakpoints behind, and tell
+    // already track. Drop the previous address space's trap and snapshot
+    // instead of leaking it and leaving a stale breakpoint behind, and tell
     // consumers to do the same with anything they resolved back then.
     auto& state = this->procs[pid];
-    if (state.entry_trap || state.rendezvous_trap)
+    if (state.rendezvous_trap)
     {
-        if (state.entry_trap)
-            this->destroy_trap(state.entry_trap);
-        if (state.rendezvous_trap)
-            this->destroy_trap(state.rendezvous_trap);
+        this->destroy_trap(state.rendezvous_trap);
 
         if (this->reset_cb)
             this->reset_cb(pid);
@@ -134,56 +129,80 @@ event_response_t dl_rendezvous::finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap
 
     state = {};
     state.ld_base = ld_base;
+    state.dtb = info->regs->cr3;            // begin_new_exec() already installed the new mm
+    state.proc_base = eprocess_base;
 
-    // r_debug lives in ld.so's data and is still zeroed here: the kernel has
-    // only just mapped the interpreter, which has not executed an
-    // instruction yet. Wait for the main executable's entry point, by which
-    // time ld.so has initialised r_debug and mapped everything the program
-    // links against.
-    state.entry_trap = register_trap(info, &dl_rendezvous::main_entry_hook_cb,
-            breakpoint_at_va_for_pid(pid, entry_va), "main_entry", UNLIMITED_TTL);
-    if (!state.entry_trap)
+    // Nothing can be armed yet. The process has not executed an instruction,
+    // so none of its pages are faulted in -- a breakpoint anywhere in it
+    // would fail the VA->PA translation in inject_trap() -- and r_debug,
+    // which lives in ld.so's data, is still zeroed. Retry on context
+    // switches instead.
+    if (!this->cr3_hook)
+        this->cr3_hook = createCr3Hook(&dl_rendezvous::cr3_cb);
+
+    if (!this->cr3_hook)
     {
-        this->report(pid, "failed to place a breakpoint on the executable entry point");
+        this->report(pid, "failed to install the CR3 hook needed to wait for ld.so");
         this->procs.erase(pid);
         return VMI_EVENT_RESPONSE_NONE;
     }
 
-    PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: exec'd, ld_base=0x%lx entry=0x%lx, waiting for entry point\n",
-        pid, ld_base, entry_va);
+    PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: exec'd, ld_base=0x%lx dtb=0x%lx, waiting for ld.so\n",
+        pid, ld_base, state.dtb);
 
     return VMI_EVENT_RESPONSE_NONE;
 }
 
-event_response_t dl_rendezvous::main_entry_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+event_response_t dl_rendezvous::cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    auto plugin = get_trap_plugin<dl_rendezvous>(info);
-    vmi_pid_t pid = info->proc_data.pid;
+    // Deliberately not keyed off the switched-to process: at a CR3 write
+    // `current` may still be the outgoing task. Every pending process is
+    // read through its own stored dtb instead, which works no matter who is
+    // running, so this is just a periodic retry.
+    bool pending = false;
 
-    auto it = plugin->procs.find(pid);
-    if (it == plugin->procs.end())
-        return VMI_EVENT_RESPONSE_NONE;
-
-    process_state& state = it->second;
-
-    // One-shot: ld.so start-up happens once per address space.
-    if (state.entry_trap)
+    for (auto& [pid, state] : this->procs)
     {
-        plugin->destroy_trap(state.entry_trap);
-        state.entry_trap = nullptr;
+        if (state.armed())
+            continue;
+
+        if (!this->try_arm(drakvuf, info, pid, state))
+            pending = true;
     }
 
-    // Take the rendezvous function's address from r_debug.r_brk rather than
-    // resolving _dl_debug_state by name. glibc marks that symbol rtld_hidden,
-    // so it is absent from ld.so's .dynsym and cannot be looked up; r_brk is
-    // the field the protocol provides for exactly this purpose, and is what
-    // gdb uses. _r_debug itself is exported (GLIBC_2.2.5), so it resolves.
-    addr_t r_debug_va = drakvuf_exportsym_to_va_at_base(drakvuf, info->proc_data.base_addr,
-            state.ld_base, "_r_debug");
-    if (!r_debug_va || r_debug_va == (addr_t)-1)
+    // Stop paying for a hook that fires on every context switch.
+    if (!pending)
+        this->cr3_hook.reset();
+
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+bool dl_rendezvous::try_arm(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, process_state& state)
+{
+    // ld.so start-up is quick, so a process that never gets there is stuck
+    // or not what we assumed. Give up rather than hold the CR3 hook open.
+    if (++state.attempts > ARM_MAX_ATTEMPTS)
     {
-        plugin->report(pid, "could not resolve _r_debug in the interpreter");
-        return VMI_EVENT_RESPONSE_NONE;
+        this->report(pid, "ld.so did not initialise r_debug; giving up");
+        return true;
+    }
+
+    // Both of these read pages that ld.so may not have touched yet. Failure
+    // here is normal early on and simply means "try again".
+    addr_t r_debug_va = state.r_debug_va;
+    if (!r_debug_va)
+    {
+        // Take the rendezvous function's address from r_debug.r_brk rather
+        // than resolving _dl_debug_state by name: glibc marks that symbol
+        // rtld_hidden, so it is absent from ld.so's .dynsym. r_brk is the
+        // field the protocol provides for this, and is what gdb uses.
+        // _r_debug itself is exported (GLIBC_2.2.5), so it does resolve.
+        r_debug_va = drakvuf_exportsym_to_va_at_base(drakvuf, state.proc_base,
+                state.ld_base, "_r_debug");
+        if (!r_debug_va || r_debug_va == (addr_t)-1)
+            return false;
+
+        state.r_debug_va = r_debug_va;
     }
 
     addr_t r_brk = 0;
@@ -191,34 +210,27 @@ event_response_t dl_rendezvous::main_entry_hook_cb(drakvuf_t drakvuf, drakvuf_tr
         auto vmi = vmi_lock_guard(drakvuf);
         ACCESS_CONTEXT(ctx,
             .translate_mechanism = VMI_TM_PROCESS_DTB,
-            .dtb = info->regs->cr3,
+            .dtb = state.dtb,
             .addr = r_debug_va + R_DEBUG_BRK
         );
 
         if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &r_brk) || !r_brk)
-        {
-            plugin->report(pid, "r_debug.r_brk is unset at the executable entry point");
-            return VMI_EVENT_RESPONSE_NONE;
-        }
+            return false;       // not initialised yet
     }
 
-    state.r_debug_va = r_debug_va;
-    state.rendezvous_trap = plugin->register_trap(info, &dl_rendezvous::rendezvous_hook_cb,
+    state.rendezvous_trap = register_trap(info, &dl_rendezvous::rendezvous_hook_cb,
             breakpoint_at_va_for_pid(pid, r_brk), "r_brk", UNLIMITED_TTL);
     if (!state.rendezvous_trap)
-    {
-        plugin->report(pid, "failed to place the rendezvous breakpoint");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
+        return false;           // r_brk's page may not be resident yet either
 
-    PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: armed (r_debug=0x%lx r_brk=0x%lx)\n", pid, r_debug_va, r_brk);
+    PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: armed after %u attempts (r_debug=0x%lx r_brk=0x%lx)\n",
+        pid, state.attempts, r_debug_va, r_brk);
 
-    // Everything the program links against was mapped before we got here, so
+    // Whatever the program links against was mapped before we got here, so
     // report that set now instead of waiting for a dlopen() that may never
     // come.
-    plugin->diff_link_map(drakvuf, info, pid, state);
-
-    return VMI_EVENT_RESPONSE_NONE;
+    this->diff_link_map(drakvuf, info, pid, state);
+    return true;
 }
 
 event_response_t dl_rendezvous::rendezvous_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
@@ -237,7 +249,7 @@ event_response_t dl_rendezvous::rendezvous_hook_cb(drakvuf_t drakvuf, drakvuf_tr
         auto vmi = vmi_lock_guard(drakvuf);
         ACCESS_CONTEXT(ctx,
             .translate_mechanism = VMI_TM_PROCESS_DTB,
-            .dtb = info->regs->cr3,
+            .dtb = state.dtb,
             .addr = state.r_debug_va + R_DEBUG_STATE
         );
 
@@ -262,7 +274,10 @@ void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
         auto vmi = vmi_lock_guard(drakvuf);
         ACCESS_CONTEXT(ctx,
             .translate_mechanism = VMI_TM_PROCESS_DTB,
-            .dtb = info->regs->cr3,
+            // Not info->regs->cr3: diff_link_map() is also called from the
+            // CR3 retry tick, where the running process is whoever we just
+            // switched to, not the one being armed.
+            .dtb = state.dtb,
             .addr = state.r_debug_va + R_DEBUG_MAP
         );
 
@@ -312,7 +327,7 @@ void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
 
         if (this->discovered_cb)
         {
-            so_view_t so{ pid, info->proc_data.base_addr, base, path };
+            so_view_t so{ pid, state.proc_base, base, path };
             this->discovered_cb(drakvuf, info, so);
         }
     }
@@ -326,7 +341,7 @@ void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
 
         if (this->removed_cb)
         {
-            so_view_t so{ pid, info->proc_data.base_addr, base, path };
+            so_view_t so{ pid, state.proc_base, base, path };
             this->removed_cb(drakvuf, info, so);
         }
     }
@@ -343,9 +358,6 @@ event_response_t dl_rendezvous::do_exit_cb(drakvuf_t drakvuf, drakvuf_trap_info_
 
     if (this->reset_cb)
         this->reset_cb(pid);
-
-    if (it->second.entry_trap)
-        this->destroy_trap(it->second.entry_trap);
 
     if (it->second.rendezvous_trap)
         this->destroy_trap(it->second.rendezvous_trap);
