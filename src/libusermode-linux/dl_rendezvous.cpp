@@ -79,9 +79,20 @@ bool dl_rendezvous::is_supported(drakvuf_t drakvuf)
 
 event_response_t dl_rendezvous::load_elf_binary_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
+    // Logged unconditionally: if this never appears, the kernel hook is not
+    // firing at all, which is a different problem from anything downstream.
+    // At this point `current` is still the caller -- begin_new_exec() runs
+    // later, inside load_elf_binary() -- so this is the exec'ing process.
+    PRINT_DEBUG("[DL_RENDEZVOUS] load_elf_binary entered by pid %d (%s)\n",
+        info->proc_data.pid, info->proc_data.name ?: "?");
+
     auto hook = this->createReturnHook(info, &dl_rendezvous::load_elf_binary_ret_cb, info->trap->name);
     if (!hook)
+    {
+        PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: failed to create the load_elf_binary return hook\n",
+            info->proc_data.pid);
         return VMI_EVENT_RESPONSE_NONE;
+    }
 
     auto params = libhook::GetTrapParams(hook->trap_);
     auto hook_id = make_hook_id(info, params->target_rsp);
@@ -161,6 +172,9 @@ event_response_t dl_rendezvous::load_elf_binary_ret_cb(drakvuf_t drakvuf, drakvu
         this->procs.erase(pid);
         return VMI_EVENT_RESPONSE_NONE;
     }
+
+    PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: exec'd, ld_base=0x%lx entry=0x%lx, waiting for entry point\n",
+        pid, ld_base, entry_va);
 
     return VMI_EVENT_RESPONSE_NONE;
 }
