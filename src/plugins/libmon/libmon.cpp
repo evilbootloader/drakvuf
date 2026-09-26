@@ -11,6 +11,7 @@ static constexpr unsigned DEFERRED_MAX_ATTEMPTS = 1000;
 
 libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output)
     : pluginex(drakvuf, output)
+    , no_retval(c->no_retval)
 {
     load_so_hook_config(c->so_hooks_list, c->print_no_addr, this->wanted_hooks);
 
@@ -209,6 +210,16 @@ void libmon::on_process_reset(vmi_pid_t pid)
 {
     this->deferred.erase(pid);
 
+    // Drop any call still in flight: its return address belongs to an address
+    // space that no longer exists.
+    for (auto it = this->ret_hooks.begin(); it != this->ret_hooks.end(); )
+    {
+        if (static_cast<vmi_pid_t>(it->first.first >> 32) == pid)
+            it = this->ret_hooks.erase(it);
+        else
+            ++it;
+    }
+
     for (auto it = this->hooked.begin(); it != this->hooked.end(); )
     {
         if (it->second.pid != pid)
@@ -251,23 +262,79 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
     // condition page-fault injection needs.
     plugin->flush_deferred(drakvuf, info, info->proc_data.pid);
 
-    const auto& printers = target.config->argument_printers;
+    // Read the arguments here, at entry: by the time the function returns its
+    // stack frame is gone and the argument registers have been reused.
+    const auto& config = *target.config;
 
-    std::vector<fmt::Rstr<std::string>> fmt_args;
-    fmt_args.reserve(printers.size());
+    std::vector<uint64_t> arguments;
+    arguments.reserve(config.argument_printers.size());
+    for (size_t i = 1; i <= config.argument_printers.size(); i++)
+        arguments.push_back(drakvuf_get_function_argument(drakvuf, info, i));
 
-    for (size_t i = 0; i < printers.size(); i++)
+    if (plugin->no_retval || config.no_retval)
     {
-        uint64_t arg = drakvuf_get_function_argument(drakvuf, info, i + 1);
-        fmt_args.push_back(fmt::Rstr(printers[i]->print(drakvuf, info, arg)));
+        plugin->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
+        return VMI_EVENT_RESPONSE_NONE;
     }
 
-    fmt::print(plugin->m_output_format, "libmon", drakvuf, info,
-        keyval("Event", fmt::Rstr("api_called")),
-        keyval("Library", fmt::Qstr(target.so_path)),
-        keyval("CalledFrom", fmt::Xval(info->regs->rip)),
-        keyval("Arguments", fmt_args)
-    );
+    auto hook = plugin->createReturnHook<return_data>(info, &libmon::function_return_hook_cb,
+            info->trap->name, drakvuf_get_limited_traps_ttl(drakvuf));
+    if (!hook)
+    {
+        // Report the call anyway; losing the return value beats losing it.
+        plugin->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    auto params = libhook::GetTrapParams<return_data>(hook->trap_);
+    params->arguments = std::move(arguments);
+    params->config = &config;
+    params->so_path = target.so_path;
+
+    plugin->ret_hooks[make_hook_id(info, params->target_rsp)] = std::move(hook);
 
     return VMI_EVENT_RESPONSE_NONE;
+}
+
+event_response_t libmon::function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    auto plugin = get_trap_plugin<libmon>(info);
+    auto params = libhook::GetTrapParams<return_data>(info);
+
+    // The return address is shared by every call that reaches it, so check
+    // this is the call instance we armed for rather than a recursive or
+    // concurrent one.
+    if (!params->verifyResultCallParams(drakvuf, info))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    plugin->print_call(drakvuf, info, *params->config, params->so_path,
+        params->arguments, info->regs->rax);
+
+    plugin->ret_hooks.erase(make_hook_id(info, params->target_rsp));
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
+    const plugin_target_config_entry_t& config, const std::string& so_path,
+    const std::vector<uint64_t>& arguments, std::optional<uint64_t> retval)
+{
+    const auto& printers = config.argument_printers;
+
+    std::vector<fmt::Rstr<std::string>> fmt_args;
+    fmt_args.reserve(arguments.size());
+
+    for (size_t i = 0; i < arguments.size() && i < printers.size(); i++)
+        fmt_args.push_back(fmt::Rstr(printers[i]->print(drakvuf, info, arguments[i])));
+
+    std::optional<fmt::Xval<uint64_t>> fmt_retval;
+    if (retval)
+        fmt_retval = fmt::Xval(*retval);
+
+    fmt::print(m_output_format, "libmon", drakvuf, info,
+        keyval("Event", fmt::Rstr("api_called")),
+        keyval("Library", fmt::Qstr(so_path)),
+        keyval("Function", fmt::Qstr(config.function_name)),
+        keyval("ReturnValue", fmt_retval),
+        keyval("Arguments", fmt_args)
+    );
 }

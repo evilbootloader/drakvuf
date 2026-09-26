@@ -3,6 +3,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -16,6 +17,11 @@ struct libmon_config
 {
     const char* so_hooks_list;
     bool print_no_addr;
+
+    // Skip return hooks entirely. Each one is a second breakpoint per call,
+    // placed and torn down as the call runs, so on a hot function the cost is
+    // noticeable; without it ReturnValue is simply not reported.
+    bool no_retval;
 };
 
 // Linux counterpart to apimon: logs calls to configured exported functions in
@@ -52,8 +58,23 @@ private:
         unsigned attempts;
     };
 
+    // Carries the call's arguments from the function's entry, where they are
+    // readable, to its return, where the result is.
+    struct return_data : public PluginResult
+    {
+        std::vector<uint64_t> arguments;
+        const plugin_target_config_entry_t* config;
+        std::string so_path;
+    };
+
     void on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so);
     void on_process_reset(vmi_pid_t pid);
+
+    void print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
+        const plugin_target_config_entry_t& config, const std::string& so_path,
+        const std::vector<uint64_t>& arguments, std::optional<uint64_t> retval);
+
+    static event_response_t function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
     // Returns false if the page is not resident, in which case the caller
     // should defer the hook rather than treat it as failed.
@@ -84,6 +105,12 @@ private:
     std::set<std::pair<vmi_pid_t, addr_t>> hooked_keys;
 
     std::map<vmi_pid_t, std::vector<deferred_hook>> deferred;
+
+    // Calls currently in flight, keyed by (pid, tid, rsp) so that recursive
+    // or concurrent calls to the same function do not collide.
+    std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
+
+    bool no_retval;
 
     // Held only while something is deferred; a CR3 hook fires on every
     // context switch.

@@ -171,6 +171,7 @@ struct plugins_options
     bool memdump_disable_set_thread;    // PLUGIN_MEMDUMP
     bool memdump_disable_shellcode_detect; // PLUGIN_MEMDUMP
     const char* so_hooks_list;          // PLUGIN_LIBMON
+    bool libmon_no_retval;              // PLUGIN_LIBMON
     const char* dll_hooks_list;         // PLUGIN_MEMDUMP, PLUGIN_APIMON
     bool userhook_no_addr;              // PLUGIN_MEMDUMP, PLUGIN_APIMON
     bool userhook_injection_mode;       // PLUGIN_MEMDUMP, PLUGIN_APIMON, PLUGIN_RPCMON
