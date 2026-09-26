@@ -383,7 +383,7 @@ drakvuf_plugins = static_library('drakvuf_plugins',
     sources : plugin_sources,
     include_directories : incdir,
     dependencies : deps,
-    link_with : [libdrakvuf, libhook, libusermode],
+    link_with : [libdrakvuf, libhook, libusermode, libusermode_linux],
     link_args : hardened_link_args
 )
 
