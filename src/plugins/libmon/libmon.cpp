@@ -4,9 +4,10 @@
 #include "plugins/output_format.h"
 #include "libusermode/printers/printers.hpp"
 
-// How many times to fault in a cold page before writing the hook off. Each
-// attempt needs the process to run again, so this is generous.
-static constexpr unsigned DEFERRED_MAX_ATTEMPTS = 20;
+// How many times to retry a hook whose page was cold before writing it off.
+// An attempt is just a failed trap insertion, so this can be generous; it
+// exists to bound the list rather than to ration anything expensive.
+static constexpr unsigned DEFERRED_MAX_ATTEMPTS = 1000;
 
 libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output)
     : pluginex(drakvuf, output)
@@ -149,28 +150,19 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
             continue;
         }
 
-        {
-            auto vmi = vmi_lock_guard(drakvuf);
-
-            page_info_t pinfo;
-            if (VMI_SUCCESS == vmi_pagetable_lookup_extended(vmi, info->regs->cr3, target->va, &pinfo))
-            {
-                // Resident now, but the trap still would not go in; leave it
-                // for the next round rather than faulting a page that is
-                // already present.
-                ++target;
-                continue;
-            }
-
-            // Ask the guest to fault the page in and come back for it next
-            // time. One injection per call: a vCPU carries a single pending
-            // fault, and the guest has to run for it to be taken.
-            if (VMI_SUCCESS != vmi_request_page_fault(vmi, info->vcpu, target->va, 0))
-                PRINT_DEBUG("[LIBMON] pid %d: could not request a page fault for 0x%lx\n",
-                    pid, target->va);
-        }
-
-        return;
+        // No vmi_request_page_fault() here, deliberately. Injecting one does
+        // fault the page in and the hook then places -- but it kills the
+        // guest process. Every caller of this function is a breakpoint
+        // callback, and DRAKVUF resumes from a breakpoint by switching altp2m
+        // view and single-stepping the original instruction; taking an
+        // injected fault instead derails that and execution returns to the
+        // int3. libusermode carries injection-in-progress tracking and an
+        // exception-suppression hook for exactly this, and a Linux equivalent
+        // has to exist before injection can be done safely.
+        //
+        // So just retry: a cold page often becomes resident on its own,
+        // because a neighbouring function in it gets called.
+        ++target;
     }
 
     if (targets.empty())
