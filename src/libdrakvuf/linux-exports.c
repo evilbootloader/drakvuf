@@ -122,6 +122,11 @@
 #define ELF_HEADER	        0x464c457f
 #define PAGE_SHIFT          	12
 #define AT_NULL_TYPE            0
+// DT_VERSYM: .gnu.version, one 16-bit version index per .dynsym entry. Bit 15
+// marks a symbol as hidden, i.e. a compat version that a fresh link would not
+// bind to; the default version of a name has it clear.
+#define DT_VERSYM_TAG           0x6ffffff0
+#define VERSYM_HIDDEN           0x8000
 // struct mm_struct's saved_auxv is AT_VECTOR_SIZE longs, i.e. half that many
 // (type, value) pairs; cap the scan well above that rather than trusting the
 // AT_NULL terminator to be present in memory we may be reading mid-exec.
@@ -301,7 +306,7 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
 
     // Exracting address of dynsym and dynstr sections from Dynamic section table entries
 
-    addr_t dynsym_offset = 0, dynstr_offset = 0;
+    addr_t dynsym_offset = 0, dynstr_offset = 0, versym_offset = 0;
     addr_t dynsym_entry_size = 0x18, dynstr_size = 0;
     // addr_t rela_section_offset =0, rela_section_size=0, rela_section_entry=0x18; // set defaults incase not defined
 
@@ -336,6 +341,8 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
             dynstr_size = ptr;
         if (word == 0xb) // size of an entry in .symtab section
             dynsym_entry_size = ptr;
+        if (word == DT_VERSYM_TAG)
+            versym_offset = ptr;
     } while (word != 0x0 && ptr != 0x0);
 
     // TODO
@@ -383,6 +390,7 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
      * symbol -- open, fork, execve, connect, mprotect and plenty more in
      * glibc -- was unresolvable.
      */
+    addr_t fallback = 0;
     size_t max_symbols = 65536;
     if (dynstr_offset > dynsym_offset && dynsym_entry_size)
     {
@@ -425,10 +433,32 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
         if (!value)
             continue;
 
+        /*
+         * glibc carries several versions of plenty of names -- memcpy,
+         * pthread_cond_wait and so on -- as separate .dynsym entries sharing
+         * one string. Returning whichever comes first can land on a compat
+         * version that nothing links against any more. .gnu.version marks the
+         * older ones hidden, so prefer an entry without that bit, which is
+         * what a fresh link would bind to, and fall back to a hidden one only
+         * if that is all there is.
+         */
+        if (versym_offset)
+        {
+            uint16_t versym;
+            ctx.addr = versym_offset + i * sizeof(uint16_t);
+
+            if (VMI_SUCCESS == vmi_read_16(vmi, &ctx, &versym) && (versym & VERSYM_HIDDEN))
+            {
+                if (!fallback)
+                    fallback = text_segment_address + value;
+                continue;
+            }
+        }
+
         return text_segment_address + value;
     }
 
-    return -1;
+    return fallback ? fallback : -1;
 }
 
 addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib)
