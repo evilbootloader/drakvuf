@@ -12,6 +12,7 @@
 #include "plugins/plugins_ex.h"
 #include "libusermode-linux/dl_rendezvous.hpp"
 #include "libusermode-linux/utils.hpp"
+#include "module_map.hpp"
 
 struct libmon_config
 {
@@ -50,12 +51,13 @@ private:
         drakvuf_trap_t* trap;
     };
 
-    // A library mapped in a process, as libmon needs it: where it starts and
-    // where it ends, so an address can be attributed to it or to nothing.
-    struct loaded_so
+    // What is mapped in one process, and enough context to read it while a
+    // different process is on the vCPU.
+    struct process_libs
     {
-        std::string path;
-        addr_t end;     // first address past the image; 0 if unknown
+        addr_t proc_base = 0;   // task_struct
+        addr_t dtb = 0;         // its page tables
+        so_map_t loaded;        // load address -> library
     };
 
     // A hook that could not be completed yet, either because the symbol was
@@ -106,10 +108,23 @@ private:
     event_response_t function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
     // Returns false if the page is not resident, in which case the caller
-    // should defer the hook rather than treat it as failed.
+    // should defer the hook rather than treat it as failed. Pass a physical
+    // address to breakpoint that frame directly, for a page the target itself
+    // has not faulted in; the VA is still recorded, being where the target
+    // will execute it and what the callback compares against.
     bool place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
         const plugin_target_config_entry_t& entry, const std::string& so_path,
-        addr_t so_base, addr_t va);
+        addr_t so_base, addr_t va, std::optional<addr_t> pa = std::nullopt);
+
+    // Find the physical frame backing a library page through some other
+    // process that has it resident. Library text is file-backed and shared,
+    // so any process mapping the same library maps the same frames, even
+    // though each faults them in separately.
+    //
+    // Returns nothing if no other process has that page, which is the case a
+    // hook on a genuinely untouched library still cannot be placed in.
+    std::optional<addr_t> find_shared_pa(drakvuf_t drakvuf, vmi_pid_t pid,
+        const deferred_hook& target) const;
 
     // Remove one hook and forget it. Returns the iterator past it, so callers
     // sweeping `hooked` can erase as they go.
@@ -141,9 +156,10 @@ private:
 
     std::map<vmi_pid_t, std::vector<deferred_hook>> deferred;
 
-    // Load address -> library for everything currently mapped in a process,
-    // so an address can be attributed back to the library it lies in.
-    std::map<vmi_pid_t, std::map<addr_t, loaded_so>> libs;
+    // What every tracked process has mapped, so an address can be attributed
+    // back to the library it lies in, and so a library's pages can be reached
+    // through a process that has them resident.
+    std::map<vmi_pid_t, process_libs> libs;
 
     // Calls currently in flight, keyed by (pid, tid, rsp) so that recursive
     // or concurrent calls to the same function do not collide.

@@ -76,7 +76,10 @@ Several points are less obvious than they look:
   absent from ld.so's `.dynsym`; `r_brk` is the supported way to find it.
 - A breakpoint needs its page resident. At exec nothing is, and a function the
   process has never called never becomes so, which is why hooks are deferred
-  and retried rather than failing.
+  and retried rather than failing. A page the target has not touched can still
+  be reached if any other process has: library text is file-backed and shared,
+  so the frame is found through that process and breakpointed by physical
+  address.
 - The breakpoint is in a page shared by every process mapping the library, so
   it fires for processes that were never hooked. Events are filtered by pid.
 
@@ -88,8 +91,9 @@ Several points are less obvious than they look:
   to observe.
 - Hooks land a few milliseconds after `exec`. A process that does its work and
   exits inside that window is missed.
-- A hook on a function whose page stays cold may never be placed. Faulting
-  those pages in deliberately is possible but currently kills the monitored
-  process, since the injection derails DRAKVUF's breakpoint resume.
+- A hook on a function whose page is cold in the target and in every other
+  process is not placed until something touches it. Faulting it in deliberately
+  would work, but kills the monitored process: the injection derails DRAKVUF's
+  breakpoint resume.
 - When a name has several versions, the default one is chosen via
   `.gnu.version`. Symbols reached only through a relocation are not resolved.

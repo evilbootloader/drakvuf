@@ -281,6 +281,7 @@ endif
 if PLUGIN_LIBMON
 sources += libmon/libmon.cpp
 sources += libmon/libmon.h
+sources += libmon/module_map.hpp
 endif
 
 if PLUGIN_PROCDUMP
@@ -515,6 +516,14 @@ check_PROGRAMS += procmon/check
 procmon_check_SOURCES = procmon/check.cpp
 procmon_check_CFLAGS = $(CHECK_CFLAGS)
 procmon_check_LDADD = $(CHECK_LIBS) procmon/linux_utils.lo procmon/winnt.lo
+endif
+
+if PLUGIN_LIBMON
+# module_map.hpp is header-only, so nothing to link against.
+check_PROGRAMS += libmon/check
+libmon_check_SOURCES = libmon/check.cpp
+libmon_check_CFLAGS = $(CHECK_CFLAGS)
+libmon_check_LDADD = $(CHECK_LIBS)
 endif
 
 # Unit tests for output format

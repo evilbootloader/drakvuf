@@ -66,6 +66,39 @@ struct breakpoint_at_va_for_pid
     addr_t m_va;
 };
 
+// The same, for a physical address the caller has already resolved. Needed
+// when the page is not resident in the process being hooked: a breakpoint
+// scoped by pid and VA cannot be placed at all in that case, because there is
+// no page table entry to translate. Library text is shared through the page
+// cache, so the frame can be found through any other process that has faulted
+// it in, and a trap placed on it covers the target once it gets there.
+//
+// Not a loss of scoping: DRAKVUF breakpoints are physical whichever way they
+// are expressed, so a hook in libc already fires for every process mapping
+// libc and callbacks already filter on pid.
+struct breakpoint_at_pa
+{
+    explicit breakpoint_at_pa(addr_t pa) : m_pa(pa) {}
+
+    drakvuf_trap_t* operator()(drakvuf_t drakvuf, drakvuf_trap_info_t* /*info*/, drakvuf_trap_t* trap) const
+    {
+        if (!trap)
+            return nullptr;
+
+        trap->type = BREAKPOINT;
+        trap->breakpoint.lookup_type = LOOKUP_NONE;
+        trap->breakpoint.addr_type = ADDR_PA;
+        trap->breakpoint.addr = m_pa;
+
+        if (!drakvuf_add_trap(drakvuf, trap))
+            return nullptr;
+
+        return trap;
+    }
+
+    addr_t m_pa;
+};
+
 // Linux equivalent of libusermode's DLL-load detection, but for shared
 // objects: bootstraps ld.so's rendezvous protocol per-process (the same
 // _dl_debug_state()/r_debug/link_map technique gdb/lldb use) so that both

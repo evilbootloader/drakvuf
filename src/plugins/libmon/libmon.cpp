@@ -53,32 +53,13 @@ libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output
     });
 }
 
-// Fallback extent for a library whose program headers could not be read: no
-// library is this large, so an address further than this past a load address
-// belongs to something else entirely.
-static constexpr addr_t MODULE_SPAN_CAP = 0x10000000;
-
 std::optional<std::string> libmon::resolve_module(vmi_pid_t pid, addr_t addr) const
 {
     auto proc = this->libs.find(pid);
     if (proc == this->libs.end())
         return std::nullopt;
 
-    const auto& loaded = proc->second;
-
-    // First library loaded above addr; the one before it is the candidate.
-    auto above = loaded.upper_bound(addr);
-    if (above == loaded.begin())
-        return std::nullopt;
-
-    auto candidate = std::prev(above);
-    addr_t end = candidate->second.end ? candidate->second.end
-        : candidate->first + MODULE_SPAN_CAP;
-
-    if (addr >= end)
-        return std::nullopt;
-
-    return candidate->second.path;
+    return resolve_module_in(proc->second.loaded, addr);
 }
 
 void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so)
@@ -88,7 +69,10 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
     // failure is not fatal -- resolve_module() falls back to a size cap.
     addr_t span = drakvuf_get_module_span(drakvuf, so.proc_base, so.base);
 
-    this->libs[so.pid][so.base] = loaded_so{ so.path, span ? so.base + span : 0 };
+    auto& proc = this->libs[so.pid];
+    proc.proc_base = so.proc_base;
+    proc.dtb = so.dtb;
+    proc.loaded[so.base] = loaded_so{ so.path, span ? so.base + span : 0 };
 
     this->wanted_hooks.visit_hooks_for(so.path, [&](const plugin_target_config_entry_t& entry)
     {
@@ -160,13 +144,16 @@ event_response_t libmon::cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
 bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
     const plugin_target_config_entry_t& entry, const std::string& so_path,
-    addr_t so_base, addr_t va)
+    addr_t so_base, addr_t va, std::optional<addr_t> pa)
 {
     auto key = std::make_pair(pid, va);
     if (this->hooked_keys.count(key))
         return true;
 
-    auto trap = register_trap(info, &libmon::function_hook_cb,
+    drakvuf_trap_t* trap = pa
+        ? register_trap(info, &libmon::function_hook_cb,
+            breakpoint_at_pa(*pa), entry.function_name.c_str(), UNLIMITED_TTL)
+        : register_trap(info, &libmon::function_hook_cb,
             breakpoint_at_va_for_pid(pid, va), entry.function_name.c_str(), UNLIMITED_TTL);
     if (!trap)
         return false;
@@ -186,6 +173,54 @@ bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
     );
 
     return true;
+}
+
+std::optional<addr_t> libmon::find_shared_pa(drakvuf_t drakvuf, vmi_pid_t pid,
+    const deferred_hook& target) const
+{
+    if (!target.va)
+        return std::nullopt;
+
+    const addr_t offset = target.va - target.so_base;
+
+    for (const auto& [other_pid, other] : this->libs)
+    {
+        if (other_pid == pid)
+            continue;
+
+        for (const auto& [other_base, lib] : other.loaded)
+        {
+            if (lib.path != target.so_path)
+                continue;
+
+            // Same path, but not necessarily the same file: a library can be
+            // replaced on disk while the old inode stays mapped, and then the
+            // same offset is a different function. Resolving the symbol in
+            // the donor and requiring the same offset settles it. An offset
+            // hook has no name to check, and is taken on trust.
+            if (target.config->type != HOOK_BY_OFFSET)
+            {
+                addr_t donor_va = drakvuf_exportsym_to_va_at_base(drakvuf, other.proc_base,
+                        other_base, target.config->function_name.c_str());
+                if (!donor_va || donor_va == (addr_t)-1 || donor_va - other_base != offset)
+                    continue;
+            }
+
+            addr_t pa = 0;
+            {
+                auto vmi = vmi_lock_guard(drakvuf);
+                if (VMI_SUCCESS != vmi_pagetable_lookup(vmi, other.dtb, other_base + offset, &pa))
+                    continue;
+            }
+
+            PRINT_DEBUG("[LIBMON] pid %d: %s at 0x%lx is cold, reached via pid %d -> pa 0x%lx\n",
+                pid, target.config->function_name.c_str(), target.va, other_pid, pa);
+
+            return pa;
+        }
+    }
+
+    return std::nullopt;
 }
 
 // Safe from anywhere: resolution and trap insertion both go through the
@@ -229,6 +264,23 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
             continue;
         }
 
+        // Not resident in this process. The page may still exist, faulted in
+        // by someone else mapping the same library, in which case breakpoint
+        // the frame directly rather than waiting for this process to touch a
+        // function it may never call.
+        if (!resident)
+        {
+            if (auto pa = this->find_shared_pa(drakvuf, pid, *target))
+            {
+                if (this->place_hook(drakvuf, info, pid, *target->config,
+                        target->so_path, target->so_base, target->va, pa))
+                {
+                    target = targets.erase(target);
+                    continue;
+                }
+            }
+        }
+
         if (++target->attempts > DEFERRED_MAX_ATTEMPTS)
         {
             PRINT_DEBUG("[LIBMON] pid %d: giving up on %s at 0x%lx\n", pid,
@@ -248,8 +300,10 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
         // tracking and an exception-suppression hook for its own version of
         // this; faulting pages in deliberately needs an equivalent here first.
         //
-        // So just retry. A cold page often becomes resident anyway, once some
-        // neighbouring function in it is called.
+        // So just retry, having already tried to reach the page through
+        // another process above. What is left here is a library no other
+        // process has touched at this offset either, which usually means a
+        // dlopen()ed private .so rather than anything in libc.
         ++target;
     }
 
@@ -276,8 +330,8 @@ void libmon::on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const s
     auto proc = this->libs.find(so.pid);
     if (proc != this->libs.end())
     {
-        proc->second.erase(so.base);
-        if (proc->second.empty())
+        proc->second.loaded.erase(so.base);
+        if (proc->second.loaded.empty())
             this->libs.erase(proc);
     }
 
@@ -300,7 +354,7 @@ void libmon::on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const s
     // mapped, so they can still complete -- and a dlclose from inside a
     // hooked function is exactly the case that would lose an event here.
 
-    unsigned dropped = 0;
+    [[maybe_unused]] unsigned dropped = 0;
     for (auto it = this->hooked.begin(); it != this->hooked.end(); )
     {
         if (it->second.pid != so.pid || it->second.so_base != so.base)

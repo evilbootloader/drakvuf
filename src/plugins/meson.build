@@ -423,5 +423,17 @@ if check.found()
             )
             test('procmon_check', procmon_check)
         endif
+
+        if get_option('plugin-libmon')
+            # module_map.hpp is header-only, so nothing to link against.
+            libmon_check = executable('libmon_check',
+                sources : 'libmon/check.cpp',
+                include_directories : incdir,
+                dependencies : [deps, check],
+                link_with : libdrakvuf,
+                install : false
+            )
+            test('libmon_check', libmon_check)
+        endif
     endif
 endif
