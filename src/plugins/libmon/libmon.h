@@ -40,9 +40,22 @@ private:
         // and only read afterwards, so the entry never moves.
         const plugin_target_config_entry_t* config;
         std::string so_path;
+        // The library's load address, not the hook's. Identifies which
+        // library to tear down on dlclose, where the path cannot: a library
+        // can be unloaded and another mapped at a different base under the
+        // same path before we observe either.
+        addr_t so_base;
         vmi_pid_t pid;
         addr_t va;
         drakvuf_trap_t* trap;
+    };
+
+    // A library mapped in a process, as libmon needs it: where it starts and
+    // where it ends, so an address can be attributed to it or to nothing.
+    struct loaded_so
+    {
+        std::string path;
+        addr_t end;     // first address past the image; 0 if unknown
     };
 
     // A hook that could not be completed yet, either because the symbol was
@@ -69,15 +82,21 @@ private:
     };
 
     void on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so);
+
+    // dlclose. The addresses resolved in this library are about to stop
+    // meaning anything, and the range may be reused by a later mapping, so
+    // the breakpoints have to come out with it.
+    void on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so);
+
     void on_process_reset(vmi_pid_t pid);
 
     void print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
         const plugin_target_config_entry_t& config, const std::string& so_path,
         const std::vector<uint64_t>& arguments, std::optional<uint64_t> return_value);
 
-    // Which library an address lies in, by the nearest load address at or
-    // below it. link_map gives no extents, so this is bounded by the next
-    // library up and by a sanity cap rather than known section sizes.
+    // Which library an address lies in, or nothing if it lies in none. Tested
+    // against each library's PT_LOAD extent, so an address in the heap or in
+    // an anonymous mapping above the last library is not claimed by it.
     std::optional<std::string> resolve_module(vmi_pid_t pid, addr_t addr) const;
 
     // Not static, unlike function_hook_cb: this goes through the RAII hook
@@ -89,7 +108,13 @@ private:
     // Returns false if the page is not resident, in which case the caller
     // should defer the hook rather than treat it as failed.
     bool place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
-        const plugin_target_config_entry_t& entry, const std::string& so_path, addr_t va);
+        const plugin_target_config_entry_t& entry, const std::string& so_path,
+        addr_t so_base, addr_t va);
+
+    // Remove one hook and forget it. Returns the iterator past it, so callers
+    // sweeping `hooked` can erase as they go.
+    std::map<const drakvuf_trap_t*, hooked_function>::iterator
+    drop_hook(std::map<const drakvuf_trap_t*, hooked_function>::iterator it);
 
     // Retry whatever could not be completed earlier. Resolution and trap
     // insertion both go through the target's own page tables, so this does
@@ -116,9 +141,9 @@ private:
 
     std::map<vmi_pid_t, std::vector<deferred_hook>> deferred;
 
-    // Load address -> path for every library seen in a process, so an address
-    // can be attributed back to the library it lies in.
-    std::map<vmi_pid_t, std::map<addr_t, std::string>> libs;
+    // Load address -> library for everything currently mapped in a process,
+    // so an address can be attributed back to the library it lies in.
+    std::map<vmi_pid_t, std::map<addr_t, loaded_so>> libs;
 
     // Calls currently in flight, keyed by (pid, tid, rsp) so that recursive
     // or concurrent calls to the same function do not collide.

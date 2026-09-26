@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include <libdrakvuf/libdrakvuf.h>
 
 #include "libmon.h"
@@ -28,7 +30,10 @@ libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output
     {
         this->on_so_discovered(d, i, so);
     },
-        nullptr);
+        [this](drakvuf_t d, drakvuf_trap_info_t* i, const so_view_t& so)
+    {
+        this->on_so_removed(d, i, so);
+    });
 
     this->rendezvous->set_process_reset_callback([this](vmi_pid_t pid)
     {
@@ -48,9 +53,9 @@ libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output
     });
 }
 
-// No library is this large, so an address further than this past a load
-// address belongs to something else entirely -- a heap or a stack that
-// happens to sit above the last library we know about.
+// Fallback extent for a library whose program headers could not be read: no
+// library is this large, so an address further than this past a load address
+// belongs to something else entirely.
 static constexpr addr_t MODULE_SPAN_CAP = 0x10000000;
 
 std::optional<std::string> libmon::resolve_module(vmi_pid_t pid, addr_t addr) const
@@ -67,15 +72,23 @@ std::optional<std::string> libmon::resolve_module(vmi_pid_t pid, addr_t addr) co
         return std::nullopt;
 
     auto candidate = std::prev(above);
-    if (addr - candidate->first > MODULE_SPAN_CAP)
+    addr_t end = candidate->second.end ? candidate->second.end
+        : candidate->first + MODULE_SPAN_CAP;
+
+    if (addr >= end)
         return std::nullopt;
 
-    return candidate->second;
+    return candidate->second.path;
 }
 
 void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so)
 {
-    this->libs[so.pid][so.base] = so.path;
+    // Read once, here: the program headers sit in the first mapped page, which
+    // ld.so has just read itself, so this is the cheapest moment to ask. A
+    // failure is not fatal -- resolve_module() falls back to a size cap.
+    addr_t span = drakvuf_get_module_span(drakvuf, so.proc_base, so.base);
+
+    this->libs[so.pid][so.base] = loaded_so{ so.path, span ? so.base + span : 0 };
 
     this->wanted_hooks.visit_hooks_for(so.path, [&](const plugin_target_config_entry_t& entry)
     {
@@ -107,7 +120,7 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
             }
         }
 
-        if (this->place_hook(drakvuf, info, so.pid, entry, so.path, va))
+        if (this->place_hook(drakvuf, info, so.pid, entry, so.path, so.base, va))
             return;
 
         // A breakpoint can only be placed on a resident page, and this
@@ -146,7 +159,8 @@ event_response_t libmon::cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 }
 
 bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
-    const plugin_target_config_entry_t& entry, const std::string& so_path, addr_t va)
+    const plugin_target_config_entry_t& entry, const std::string& so_path,
+    addr_t so_base, addr_t va)
 {
     auto key = std::make_pair(pid, va);
     if (this->hooked_keys.count(key))
@@ -157,7 +171,7 @@ bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
     if (!trap)
         return false;
 
-    this->hooked.emplace(trap, hooked_function{ &entry, so_path, pid, va, trap });
+    this->hooked.emplace(trap, hooked_function{ &entry, so_path, so_base, pid, va, trap });
     this->hooked_keys.insert(key);
 
     // Not attributed to `info`: this can run off the CR3 tick, where the
@@ -209,7 +223,7 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
         }
 
         if (resident && this->place_hook(drakvuf, info, pid, *target->config,
-                target->so_path, target->va))
+                target->so_path, target->so_base, target->va))
         {
             target = targets.erase(target);
             continue;
@@ -243,6 +257,66 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
         this->deferred.erase(it);
 }
 
+std::map<const drakvuf_trap_t*, libmon::hooked_function>::iterator
+libmon::drop_hook(std::map<const drakvuf_trap_t*, hooked_function>::iterator it)
+{
+    this->hooked_keys.erase(std::make_pair(it->second.pid, it->second.va));
+    this->destroy_trap(it->second.trap);
+    return this->hooked.erase(it);
+}
+
+// dlclose. The same reasoning as on_process_reset(), for one library rather
+// than the whole address space: the range is unmapped and a later dlopen may
+// reuse it, so a breakpoint left behind would sit over unrelated code.
+void libmon::on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so)
+{
+    UNUSED(drakvuf);
+    UNUSED(info);
+
+    auto proc = this->libs.find(so.pid);
+    if (proc != this->libs.end())
+    {
+        proc->second.erase(so.base);
+        if (proc->second.empty())
+            this->libs.erase(proc);
+    }
+
+    auto deferred_it = this->deferred.find(so.pid);
+    if (deferred_it != this->deferred.end())
+    {
+        auto& targets = deferred_it->second;
+        targets.erase(std::remove_if(targets.begin(), targets.end(),
+                [&](const deferred_hook& target)
+        {
+            return target.so_base == so.base;
+        }), targets.end());
+
+        if (targets.empty())
+            this->deferred.erase(deferred_it);
+    }
+
+    // Calls still in flight are deliberately left alone. Their return
+    // addresses are in whoever called into this library, which is still
+    // mapped, so they can still complete -- and a dlclose from inside a
+    // hooked function is exactly the case that would lose an event here.
+
+    unsigned dropped = 0;
+    for (auto it = this->hooked.begin(); it != this->hooked.end(); )
+    {
+        if (it->second.pid != so.pid || it->second.so_base != so.base)
+        {
+            ++it;
+            continue;
+        }
+
+        it = this->drop_hook(it);
+        dropped++;
+    }
+
+    PRINT_DEBUG("[LIBMON] pid %d: %s unloaded, dropped %u hook(s)\n",
+        so.pid, so.path.c_str(), dropped);
+}
+
 // The pid's address space is gone (exit, or a further exec), so every VA we
 // resolved in it is now meaningless: remove the breakpoints rather than
 // leaving them armed over whatever gets mapped there next.
@@ -269,9 +343,7 @@ void libmon::on_process_reset(vmi_pid_t pid)
             continue;
         }
 
-        this->hooked_keys.erase(std::make_pair(it->second.pid, it->second.va));
-        this->destroy_trap(it->second.trap);
-        it = this->hooked.erase(it);
+        it = this->drop_hook(it);
     }
 }
 

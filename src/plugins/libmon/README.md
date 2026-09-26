@@ -60,6 +60,11 @@ observed, and walks `link_map` to enumerate what is already loaded. Symbols
 are resolved in each library's own `.dynsym` at the load address the linker
 reported, and a breakpoint goes on the resolved address.
 
+A library's extent comes from its `PT_LOAD` headers, which is what `FromModule`
+is matched against — `link_map` reports where each library starts but not where
+it ends. When a library is unloaded its breakpoints come out with it, since a
+later `dlopen` may map something else over the same addresses.
+
 Several points are less obvious than they look:
 
 - `load_elf_binary` cannot be hooked. It is static in `fs/binfmt_elf.c` and
