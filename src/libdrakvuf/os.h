@@ -215,6 +215,9 @@ typedef struct os_interface
     addr_t (*get_auxv_value)
     (drakvuf_t drakvuf, addr_t process_addr, uint64_t type);
 
+    addr_t (*module_span)
+    (drakvuf_t drakvuf, addr_t process_addr, addr_t module_base);
+
     bool (*get_process_ppid)
     (drakvuf_t drakvuf, addr_t process_base, vmi_pid_t* ppid);
 

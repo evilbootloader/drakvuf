@@ -764,6 +764,20 @@ addr_t drakvuf_get_auxv_value(drakvuf_t drakvuf, addr_t process_addr, uint64_t t
     return ret;
 }
 
+addr_t drakvuf_get_module_span(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base)
+{
+    addr_t ret = 0;
+
+    if ( drakvuf->osi.module_span )
+    {
+        drakvuf_lock_and_get_vmi(drakvuf);
+        ret = drakvuf->osi.module_span(drakvuf, process_addr, module_base);
+        drakvuf_release_vmi(drakvuf);
+    }
+
+    return ret;
+}
+
 bool drakvuf_get_process_ppid(drakvuf_t drakvuf, addr_t process_base, vmi_pid_t* ppid)
 {
     bool ret = false;

@@ -635,11 +635,19 @@ addr_t drakvuf_export_lib_address(drakvuf_t drakvuf, addr_t process_addr, const 
  * drakvuf_get_auxv_value reads one entry from the process's aux vector, held
  * in mm_struct.saved_auxv. AT_BASE (7) gives the dynamic linker's load
  * address without consulting the VMA list at all.
+ *
+ * drakvuf_get_module_span returns how far a module reaches past its load
+ * address, from its PT_LOAD program headers, so that an address can be tested
+ * against a real range. The dynamic linker reports each library's base but no
+ * extent, and guessing one from the next library up claims every anonymous
+ * mapping between them.
  */
 addr_t drakvuf_exportsym_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr,
     addr_t module_base, const char* sym) NOEXCEPT;
 
 addr_t drakvuf_get_auxv_value(drakvuf_t drakvuf, addr_t process_addr, uint64_t type) NOEXCEPT;
+
+addr_t drakvuf_get_module_span(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base) NOEXCEPT;
 
 // Microsoft PreviousMode KTHREAD explanation:
 // https://msdn.microsoft.com/en-us/library/windows/hardware/ff559860(v=vs.85).aspx

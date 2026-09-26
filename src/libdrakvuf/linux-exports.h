@@ -111,6 +111,8 @@ addr_t linux_eprocess_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, const char
 
 addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base, const char* sym);
 
+addr_t linux_module_span(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base);
+
 addr_t linux_get_auxv_value(drakvuf_t drakvuf, addr_t eprocess_base, uint64_t type);
 
 addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib);

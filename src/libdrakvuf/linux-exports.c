@@ -127,6 +127,9 @@
 // bind to; the default version of a name has it clear.
 #define DT_VERSYM_TAG           0x6ffffff0
 #define VERSYM_HIDDEN           0x8000
+// PT_LOAD: a segment the loader maps. The union of these is the module's
+// footprint in memory; PT_DYNAMIC (2) is already matched by literal below.
+#define PT_LOAD_TAG             1
 // struct mm_struct's saved_auxv is AT_VECTOR_SIZE longs, i.e. half that many
 // (type, value) pairs; cap the scan well above that rather than trusting the
 // AT_NULL terminator to be present in memory we may be reading mid-exec.
@@ -233,6 +236,87 @@ next:
         return -1;
 
     return linux_module_sym2va(drakvuf, eprocess_base, text_segment_address, sym);
+}
+
+/*
+ * How far a module reaches past its load address: the highest end of any
+ * PT_LOAD segment, which is what the loader actually maps. The dynamic
+ * linker's link_map reports each library's base but no extent, so without
+ * this the only way to tell whether an address belongs to a library is to
+ * assume it does whenever no later library starts below it -- which silently
+ * claims every anonymous mapping and heap block sitting above the last one.
+ *
+ * Returns 0 if the base does not look like an ELF image or the headers cannot
+ * be read.
+ */
+addr_t linux_module_span(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base)
+{
+    vmi_instance_t vmi = drakvuf->vmi;
+
+    if (!drakvuf->offsets[ELF64PHDR_MEMSZ])
+        return 0;
+
+    vmi_pid_t pid;
+    if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
+        return 0;
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_PID,
+        .addr = module_base,
+        .pid = pid
+    );
+
+    uint32_t elf_header;
+    if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &elf_header) || elf_header != ELF_HEADER)
+        return 0;
+
+    addr_t program_header_offset;
+    ctx.addr = module_base + drakvuf->offsets[ELF64HDR_PHOFF];
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &program_header_offset))
+        return 0;
+
+    uint16_t num_of_program_headers;
+    ctx.addr = module_base + drakvuf->offsets[ELF64HDR_PHNUM];
+    if (VMI_FAILURE == vmi_read_16(vmi, &ctx, &num_of_program_headers))
+        return 0;
+
+    uint16_t size_of_program_headers;
+    ctx.addr = module_base + drakvuf->offsets[ELF64HDR_PHENTSIZE];
+    if (VMI_FAILURE == vmi_read_16(vmi, &ctx, &size_of_program_headers))
+        return 0;
+
+    addr_t offset = 0, span = 0;
+    for (uint16_t i = 0; i < num_of_program_headers; i++, offset += size_of_program_headers)
+    {
+        uint32_t ph_type;
+        ctx.addr = module_base + program_header_offset + offset + drakvuf->offsets[ELF64PHDR_TYPE];
+        if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &ph_type))
+            return 0;
+
+        if (ph_type != PT_LOAD_TAG)
+            continue;
+
+        addr_t ph_vaddr, ph_memsz;
+        ctx.addr = module_base + program_header_offset + offset + drakvuf->offsets[ELF64PHDR_VADDR];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &ph_vaddr))
+            return 0;
+
+        ctx.addr = module_base + program_header_offset + offset + drakvuf->offsets[ELF64PHDR_MEMSZ];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &ph_memsz))
+            return 0;
+
+        /* p_vaddr is a link-time address, relative to the image, so the span
+         * is measured from the image rather than from the load address. */
+        if (ph_vaddr + ph_memsz > span)
+            span = ph_vaddr + ph_memsz;
+    }
+
+    /* The loader maps whole pages, so the last segment reaches to the end of
+     * the page its last byte falls in. */
+    if (span)
+        span = (span + VMI_PS_4KB - 1) & ~(addr_t)(VMI_PS_4KB - 1);
+
+    return span;
 }
 
 /*
