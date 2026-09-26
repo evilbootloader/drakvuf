@@ -359,7 +359,19 @@ event_response_t libmon::function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap
     // this is the call instance we armed for rather than a recursive or
     // concurrent one.
     if (!params->verifyResultCallParams(drakvuf, info))
+    {
+        // Logged because a rejected return is indistinguishable in the output
+        // from one that never fired, and the two mean very different things.
+        PRINT_DEBUG("[LIBMON] return rejected: pid %d/%d tid %d/%d rip 0x%lx/0x%lx\n",
+            info->proc_data.pid, params->target_pid,
+            info->proc_data.tid, params->target_tid,
+            info->regs->rip, params->target_rsp);
+
         return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    PRINT_DEBUG("[LIBMON] return hit: pid %d %s -> 0x%lx\n",
+        info->proc_data.pid, params->config->function_name.c_str(), info->regs->rax);
 
     this->print_call(drakvuf, info, *params->config, params->so_path,
         params->arguments, info->regs->rax);
