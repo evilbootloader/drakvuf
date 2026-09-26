@@ -50,7 +50,7 @@ enum link_map_offset
 
 // Elf64_Dyn tags relevant to locating r_debug from a PT_DYNAMIC segment.
 // Not yet used by dl_rendezvous.cpp -- v1 resolves r_debug via ld.so's own
-// _r_debug export as a shortcut (see the TODO in load_elf_binary_ret_cb).
+// _r_debug export as a shortcut (see dl_rendezvous::try_arm).
 // Kept here for the planned v2 switch to reading DT_DEBUG out of the main
 // executable's own dynamic section, which is more portable across libc/
 // linker vendors than depending on a named export.

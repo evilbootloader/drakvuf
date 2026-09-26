@@ -60,3 +60,9 @@ src/librepl/libdrakvuf.py
 # meson
 build/*
 clang_output*
+build-meson/
+
+.devcontainer
+
+# autotools
+test-driver
