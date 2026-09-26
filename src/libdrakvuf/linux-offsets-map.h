@@ -142,6 +142,7 @@ static const char* linux_offset_names[__LINUX_OFFSETS_MAX][2] =
     [MM_STRUCT_ENV_START] = {"mm_struct", "env_start"},
     [MM_STRUCT_ENV_END] = {"mm_struct", "env_end"},
     [MM_STRUCT_EXE_FILE] = {"mm_struct", "exe_file"},
+    [MM_STRUCT_SAVED_AUXV] = {"mm_struct", "saved_auxv"},
     [VM_AREA_STRUCT_FILE] = {"vm_area_struct", "vm_file"},
     [VM_AREA_STRUCT_START] = {"vm_area_struct", "vm_start"},
     [VM_AREA_STRUCT_END] = {"vm_area_struct", "vm_end"},

@@ -14,7 +14,7 @@
 struct so_view_t
 {
     vmi_pid_t pid;
-    addr_t proc_base;   // task_struct, for drakvuf_exportsym_to_va()
+    addr_t proc_base;   // task_struct, for drakvuf_exportsym_to_va_at_base()
     addr_t base;        // link_map.l_addr
     std::string path;   // link_map.l_name
 };

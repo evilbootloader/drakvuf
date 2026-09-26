@@ -7,18 +7,6 @@
 #include "dl_rendezvous.hpp"
 #include "dl_rendezvous_abi.hpp"
 
-namespace
-{
-
-// linux_eprocess_sym2va() (src/libdrakvuf/linux-exports.c, reached here via
-// the public drakvuf_exportsym_to_va() wrapper) prefix-matches the mapped
-// file's basename against this string, so "ld-linux" alone matches both
-// ld-linux-x86-64.so.2 (x86-64) and ld-linux.so.2 (i386 compat). musl's
-// ld-musl-*.so.* is intentionally not matched (out of scope for v1).
-const char* INTERP_NAME_PREFIX = "ld-linux";
-
-} // namespace
-
 dl_rendezvous::dl_rendezvous(drakvuf_t drakvuf)
     : pluginex(drakvuf, OUTPUT_DEFAULT)
 {
@@ -102,13 +90,23 @@ event_response_t dl_rendezvous::load_elf_binary_ret_cb(drakvuf_t drakvuf, drakvu
     vmi_pid_t pid = info->proc_data.pid;
     addr_t eprocess_base = info->proc_data.base_addr;
 
-    addr_t dl_debug_state_va = drakvuf_exportsym_to_va(drakvuf, eprocess_base, INTERP_NAME_PREFIX, "_dl_debug_state");
-    if (dl_debug_state_va == (addr_t)-1)
+    // AT_BASE is the interpreter's load address. Reading it from the aux
+    // vector avoids searching the VMA list, whose mm_struct.mmap /
+    // vm_area_struct.vm_next layout Linux 6.1 replaced with a maple tree --
+    // a name-based lookup silently finds nothing on any newer kernel.
+    addr_t ld_base = drakvuf_get_auxv_value(drakvuf, eprocess_base, AT_BASE_TYPE);
+    if (!ld_base)
     {
-        // No interpreter found (or no _dl_debug_state in it) -- most likely
-        // a statically-linked binary, which is out of scope for v1: there's
-        // no link_map for a rendezvous breakpoint to observe.
-        PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: no interpreter/_dl_debug_state found (static binary?)\n", pid);
+        // Statically linked binaries have no interpreter, and so no link_map
+        // for a rendezvous breakpoint to observe.
+        PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: no AT_BASE, no interpreter (static binary?)\n", pid);
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    addr_t dl_debug_state_va = drakvuf_exportsym_to_va_at_base(drakvuf, eprocess_base, ld_base, "_dl_debug_state");
+    if (!dl_debug_state_va || dl_debug_state_va == (addr_t)-1)
+    {
+        PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: no _dl_debug_state in interpreter at 0x%lx\n", pid, ld_base);
         return VMI_EVENT_RESPONSE_NONE;
     }
 
@@ -120,8 +118,8 @@ event_response_t dl_rendezvous::load_elf_binary_ret_cb(drakvuf_t drakvuf, drakvu
     // helper, at the cost of depending on glibc exporting _r_debug (which it
     // does, but this is a secondary source of truth rather than the
     // universal one).
-    addr_t r_debug_va = drakvuf_exportsym_to_va(drakvuf, eprocess_base, INTERP_NAME_PREFIX, "_r_debug");
-    if (r_debug_va == (addr_t)-1)
+    addr_t r_debug_va = drakvuf_exportsym_to_va_at_base(drakvuf, eprocess_base, ld_base, "_r_debug");
+    if (!r_debug_va || r_debug_va == (addr_t)-1)
     {
         PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: found _dl_debug_state but not _r_debug\n", pid);
         return VMI_EVENT_RESPONSE_NONE;

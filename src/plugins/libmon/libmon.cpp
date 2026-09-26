@@ -42,12 +42,13 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
         }
         else
         {
-            // Resolve against this .so's own .dynsym. entry.dll_name is the
-            // configured pattern, which is what the resolver prefix-matches
-            // the mapped file's name against.
-            va = drakvuf_exportsym_to_va(drakvuf, so.proc_base, entry.dll_name.c_str(),
+            // Resolve against this .so's own .dynsym, using the load address
+            // the dynamic linker reported in link_map.l_addr. Looking the
+            // library up by name instead would go through the VMA list, which
+            // no longer exists in its old form on Linux 6.1 and newer.
+            va = drakvuf_exportsym_to_va_at_base(drakvuf, so.proc_base, so.base,
                     entry.function_name.c_str());
-            if (va == (addr_t)-1)
+            if (!va || va == (addr_t)-1)
             {
                 PRINT_DEBUG("[LIBMON] pid %d: failed to resolve %s!%s\n", so.pid,
                     entry.dll_name.c_str(), entry.function_name.c_str());

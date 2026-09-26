@@ -121,6 +121,11 @@
 
 #define ELF_HEADER	        0x464c457f
 #define PAGE_SHIFT          	12
+#define AT_NULL_TYPE            0
+// struct mm_struct's saved_auxv is AT_VECTOR_SIZE longs, i.e. half that many
+// (type, value) pairs; cap the scan well above that rather than trusting the
+// AT_NULL terminator to be present in memory we may be reading mid-exec.
+#define AUXV_MAX_ENTRIES        32
 #define VM_READ		        0x00000001
 #define VM_WRITE	        0x00000002
 #define VM_EXEC		        0x00000004
@@ -221,6 +226,37 @@ next:
 
     if (text_segment_address == 0)
         return -1;
+
+    return linux_module_sym2va(drakvuf, eprocess_base, text_segment_address, sym);
+}
+
+/*
+ * Resolve a symbol in a shared object whose load address is already known,
+ * skipping the VMA search that linux_eprocess_sym2va() has to do. Callers that
+ * learned the base another way (the dynamic linker's link_map, or AT_BASE from
+ * the aux vector) must use this: the VMA walk relies on mm_struct.mmap and
+ * vm_area_struct.vm_next, which Linux 6.1 removed in favour of a maple tree.
+ */
+addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base, const char* sym)
+{
+    vmi_instance_t vmi = drakvuf->vmi;
+
+    vmi_pid_t pid;
+    if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
+        return -1;
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_PID,
+        .addr = module_base,
+        .pid = pid
+    );
+
+    // Sanity check the caller's base before trusting anything we read past it.
+    uint32_t elf_header;
+    if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &elf_header) || elf_header != ELF_HEADER)
+        return -1;
+
+    addr_t text_segment_address = module_base;
 
     // Parsing ELF header
 
@@ -455,4 +491,66 @@ next:
     } while (vm_next != nullp);
 
     return -1;
+}
+
+/*
+ * Read one entry out of the process's aux vector, which the kernel keeps in
+ * mm_struct.saved_auxv (the same data /proc/<pid>/auxv exposes). This is how
+ * the dynamic linker's load address (AT_BASE) can be found without touching
+ * the VMA list, whose layout changed incompatibly in Linux 6.1.
+ *
+ * Returns 0 if the entry is absent or unreadable.
+ */
+addr_t linux_get_auxv_value(drakvuf_t drakvuf, addr_t eprocess_base, uint64_t type)
+{
+    vmi_instance_t vmi = drakvuf->vmi;
+
+    // A profile without saved_auxv leaves the offset zeroed, which would make
+    // us read from the head of mm_struct instead.
+    if (!drakvuf->offsets[MM_STRUCT_SAVED_AUXV])
+        return 0;
+
+    vmi_pid_t pid;
+    if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
+        return 0;
+
+    addr_t mm_struct_address;
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_PID,
+        .addr = eprocess_base + drakvuf->offsets[TASK_STRUCT_MMSTRUCT],
+        .pid = pid
+    );
+
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mm_struct_address) || !mm_struct_address)
+    {
+        ctx.addr = eprocess_base + drakvuf->offsets[TASK_STRUCT_ACTIVE_MMSTRUCT];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mm_struct_address) || !mm_struct_address)
+            return 0;
+    }
+
+    // saved_auxv is a flat array of (type, value) pairs terminated by AT_NULL.
+    addr_t entry = mm_struct_address + drakvuf->offsets[MM_STRUCT_SAVED_AUXV];
+
+    for (size_t i = 0; i < AUXV_MAX_ENTRIES; i++, entry += 2 * sizeof(addr_t))
+    {
+        addr_t at_type;
+        ctx.addr = entry;
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &at_type))
+            return 0;
+
+        if (at_type == AT_NULL_TYPE)
+            return 0;
+
+        if (at_type != type)
+            continue;
+
+        addr_t at_value;
+        ctx.addr = entry + sizeof(addr_t);
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &at_value))
+            return 0;
+
+        return at_value;
+    }
+
+    return 0;
 }

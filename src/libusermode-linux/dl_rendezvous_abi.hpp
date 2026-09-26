@@ -54,6 +54,13 @@ enum link_map_offset
 // Kept here for the planned v2 switch to reading DT_DEBUG out of the main
 // executable's own dynamic section, which is more portable across libc/
 // linker vendors than depending on a named export.
+// Aux vector entry types (elf.h). AT_BASE holds the load address of the
+// program interpreter, i.e. ld.so.
+enum auxv_type
+{
+    AT_BASE_TYPE = 7,
+};
+
 enum dt_tag
 {
     DT_DEBUG_TAG  = 0x15,

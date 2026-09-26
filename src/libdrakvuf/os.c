@@ -735,6 +735,35 @@ addr_t drakvuf_exportsym_to_va(drakvuf_t drakvuf, addr_t process_addr,
     return ret;
 }
 
+addr_t drakvuf_exportsym_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr,
+    addr_t module_base, const char* sym)
+{
+    addr_t ret = 0;
+
+    if ( drakvuf->osi.exportsym_to_va_at_base )
+    {
+        drakvuf_lock_and_get_vmi(drakvuf);
+        ret = drakvuf->osi.exportsym_to_va_at_base(drakvuf, process_addr, module_base, sym);
+        drakvuf_release_vmi(drakvuf);
+    }
+
+    return ret;
+}
+
+addr_t drakvuf_get_auxv_value(drakvuf_t drakvuf, addr_t process_addr, uint64_t type)
+{
+    addr_t ret = 0;
+
+    if ( drakvuf->osi.get_auxv_value )
+    {
+        drakvuf_lock_and_get_vmi(drakvuf);
+        ret = drakvuf->osi.get_auxv_value(drakvuf, process_addr, type);
+        drakvuf_release_vmi(drakvuf);
+    }
+
+    return ret;
+}
+
 bool drakvuf_get_process_ppid(drakvuf_t drakvuf, addr_t process_base, vmi_pid_t* ppid)
 {
     bool ret = false;

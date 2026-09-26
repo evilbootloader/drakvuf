@@ -207,6 +207,14 @@ typedef struct os_interface
     addr_t (*exportsym_to_va)
     (drakvuf_t drakvuf, addr_t process_addr, const char* module, const char* sym);
 
+    /* Linux only: resolve a symbol in a module whose base is already known,
+     * and read an entry from the process's aux vector. Left NULL on Windows. */
+    addr_t (*exportsym_to_va_at_base)
+    (drakvuf_t drakvuf, addr_t process_addr, addr_t module_base, const char* sym);
+
+    addr_t (*get_auxv_value)
+    (drakvuf_t drakvuf, addr_t process_addr, uint64_t type);
+
     bool (*get_process_ppid)
     (drakvuf_t drakvuf, addr_t process_base, vmi_pid_t* ppid);
 

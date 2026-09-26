@@ -624,6 +624,23 @@ addr_t drakvuf_exportsym_to_va(drakvuf_t drakvuf, addr_t process_addr,
 
 addr_t drakvuf_export_lib_address(drakvuf_t drakvuf, addr_t process_addr, const char* lib) NOEXCEPT;
 
+/* Linux only; return 0 on Windows or on failure.
+ *
+ * drakvuf_exportsym_to_va_at_base resolves a symbol in a module whose load
+ * address the caller already knows, avoiding the VMA search that
+ * drakvuf_exportsym_to_va performs. Prefer it: that search relies on
+ * mm_struct.mmap and vm_area_struct.vm_next, which Linux 6.1 replaced with a
+ * maple tree, so it cannot work on newer kernels.
+ *
+ * drakvuf_get_auxv_value reads one entry from the process's aux vector, held
+ * in mm_struct.saved_auxv. AT_BASE (7) gives the dynamic linker's load
+ * address without consulting the VMA list at all.
+ */
+addr_t drakvuf_exportsym_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr,
+    addr_t module_base, const char* sym) NOEXCEPT;
+
+addr_t drakvuf_get_auxv_value(drakvuf_t drakvuf, addr_t process_addr, uint64_t type) NOEXCEPT;
+
 // Microsoft PreviousMode KTHREAD explanation:
 // https://msdn.microsoft.com/en-us/library/windows/hardware/ff559860(v=vs.85).aspx
 bool drakvuf_get_current_thread_previous_mode(drakvuf_t drakvuf,
