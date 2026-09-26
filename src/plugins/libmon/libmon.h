@@ -92,11 +92,9 @@ private:
         const plugin_target_config_entry_t& entry, const std::string& so_path, addr_t va);
 
     // Retry whatever could not be completed earlier. Resolution and trap
-    // insertion both go through the target's own page tables, so they do not
-    // need that process to be running; in_context says whether it is, which
-    // gates faulting a cold page in, since that acts on the current vCPU.
-    void flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
-        bool in_context);
+    // insertion both go through the target's own page tables, so this does
+    // not require that process to be the one running.
+    void flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid);
 
     // Drives the retries: without it a process whose every symbol failed
     // would never hook anything, having no hook left to fire.
