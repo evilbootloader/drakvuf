@@ -94,9 +94,9 @@ Several points are less obvious than they look:
   bootstrapped from the `exec` path.
 - Hooks land a few milliseconds after `exec`. A process that does its work and
   exits inside that window is missed.
-- A hook on a function whose page is cold in the target and in every other
-  process is not placed until something touches it. Faulting it in deliberately
-  would work, but kills the monitored process: the injection derails DRAKVUF's
-  breakpoint resume.
+- A hook on a function whose page no *monitored* process has touched is not
+  placed until one does; it then lands in all of them at once. Faulting the
+  page in deliberately would work, but kills the monitored process: the
+  injection derails DRAKVUF's breakpoint resume.
 - When a name has several versions, the default one is chosen via
   `.gnu.version`. Symbols reached only through a relocation are not resolved.
