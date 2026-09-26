@@ -89,6 +89,9 @@ Several points are less obvious than they look:
   and `link_map` layouts differ.
 - Statically linked binaries are invisible: no interpreter, so no `link_map`
   to observe.
+- Only processes that `exec` while libmon is running are monitored. Anything
+  already running when it starts is invisible, since the rendezvous is
+  bootstrapped from the `exec` path.
 - Hooks land a few milliseconds after `exec`. A process that does its work and
   exits inside that window is missed.
 - A hook on a function whose page is cold in the target and in every other
