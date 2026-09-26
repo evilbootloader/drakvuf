@@ -3,8 +3,10 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "plugins/plugins_ex.h"
 #include "libusermode-linux/dl_rendezvous.hpp"
@@ -32,6 +34,8 @@ private:
         // and only read afterwards, so the entry never moves.
         const plugin_target_config_entry_t* config;
         std::string so_path;
+        vmi_pid_t pid;
+        addr_t va;
         drakvuf_trap_t* trap;
     };
 
@@ -62,9 +66,15 @@ private:
     wanted_so_hooks_t wanted_hooks;
     std::unique_ptr<dl_rendezvous> rendezvous;
 
-    // Keyed by (pid, entry VA). The breakpoint callback looks itself up by
-    // info->regs->rip, which is the address the breakpoint was placed at.
-    std::map<std::pair<vmi_pid_t, addr_t>, hooked_function> hooked;
+    // Keyed by the trap itself, which info->trap identifies exactly. Keying
+    // on (pid, info->regs->rip) instead would depend on rip being the
+    // breakpoint address rather than the instruction after it.
+    std::map<const drakvuf_trap_t*, hooked_function> hooked;
+
+    // Which (pid, va) pairs are already hooked, to avoid placing a second
+    // breakpoint on one and to find a process's hooks when it goes away.
+    std::set<std::pair<vmi_pid_t, addr_t>> hooked_keys;
+
     std::map<vmi_pid_t, std::vector<deferred_hook>> deferred;
 };
 

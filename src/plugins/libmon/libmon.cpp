@@ -93,7 +93,7 @@ bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
     const plugin_target_config_entry_t& entry, const std::string& so_path, addr_t va)
 {
     auto key = std::make_pair(pid, va);
-    if (this->hooked.find(key) != this->hooked.end())
+    if (this->hooked_keys.count(key))
         return true;
 
     auto trap = register_trap(info, &libmon::function_hook_cb,
@@ -101,7 +101,8 @@ bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
     if (!trap)
         return false;
 
-    this->hooked.emplace(key, hooked_function{ &entry, so_path, trap });
+    this->hooked.emplace(trap, hooked_function{ &entry, so_path, pid, va, trap });
+    this->hooked_keys.insert(key);
 
     // Not attributed to `info`: this can run off the CR3 tick, where the
     // process executing is unrelated to the one being hooked. Pass no trap
@@ -181,12 +182,13 @@ void libmon::on_process_reset(vmi_pid_t pid)
 
     for (auto it = this->hooked.begin(); it != this->hooked.end(); )
     {
-        if (it->first.first != pid)
+        if (it->second.pid != pid)
         {
             ++it;
             continue;
         }
 
+        this->hooked_keys.erase(std::make_pair(it->second.pid, it->second.va));
         this->destroy_trap(it->second.trap);
         it = this->hooked.erase(it);
     }
@@ -196,9 +198,18 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
 {
     auto plugin = get_trap_plugin<libmon>(info);
 
-    auto it = plugin->hooked.find(std::make_pair(info->proc_data.pid, info->regs->rip));
+    // Logged unconditionally: a hook that fires but is not recognised looks
+    // exactly like one that never fired, and the difference matters.
+    PRINT_DEBUG("[LIBMON] hook hit: pid %d rip=0x%lx trap=%p (%s)\n",
+        info->proc_data.pid, info->regs->rip, (void*)info->trap,
+        info->trap && info->trap->name ? info->trap->name : "?");
+
+    auto it = plugin->hooked.find(info->trap);
     if (it == plugin->hooked.end())
+    {
+        PRINT_DEBUG("[LIBMON] hook hit for an unknown trap, ignoring\n");
         return VMI_EVENT_RESPONSE_NONE;
+    }
 
     // A hook firing is proof this process is on the vCPU, which is the one
     // condition page-fault injection needs.
