@@ -85,8 +85,12 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
             entry.dll_name.c_str(), entry.function_name.c_str(), va);
     });
 
-    if (so.in_context)
-        this->flush_deferred(drakvuf, info, so.pid);
+    // Deliberately no flush here. This runs once per newly discovered
+    // library, so a process loading a dozen of them would spend a dozen
+    // retries on the same address without the guest running in between --
+    // and a page fault needs the guest to run to be taken. Retries happen
+    // when one of this process's hooks fires instead, which is both properly
+    // spaced and guaranteed to be in its own context.
 }
 
 bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
@@ -198,12 +202,6 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
 {
     auto plugin = get_trap_plugin<libmon>(info);
 
-    // Logged unconditionally: a hook that fires but is not recognised looks
-    // exactly like one that never fired, and the difference matters.
-    PRINT_DEBUG("[LIBMON] hook hit: pid %d rip=0x%lx trap=%p (%s)\n",
-        info->proc_data.pid, info->regs->rip, (void*)info->trap,
-        info->trap && info->trap->name ? info->trap->name : "?");
-
     auto it = plugin->hooked.find(info->trap);
     if (it == plugin->hooked.end())
     {
@@ -211,11 +209,23 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
         return VMI_EVENT_RESPONSE_NONE;
     }
 
+    const auto& target = it->second;
+
+    // The breakpoint lives in a physical page of libc, which every process
+    // mapping the library shares, so this fires for processes we never hooked
+    // -- and would fire once per hooked process if several share the page.
+    // Report only for the process this hook was placed for.
+    if (info->proc_data.pid != target.pid)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    PRINT_DEBUG("[LIBMON] hook hit: pid %d rip=0x%lx (%s)\n",
+        info->proc_data.pid, info->regs->rip,
+        info->trap && info->trap->name ? info->trap->name : "?");
+
     // A hook firing is proof this process is on the vCPU, which is the one
     // condition page-fault injection needs.
     plugin->flush_deferred(drakvuf, info, info->proc_data.pid);
 
-    const auto& target = it->second;
     const auto& printers = target.config->argument_printers;
 
     std::vector<fmt::Rstr<std::string>> fmt_args;
