@@ -4,6 +4,10 @@
 #include "plugins/output_format.h"
 #include "libusermode/printers/printers.hpp"
 
+// How many times to fault in a cold page before writing the hook off. Each
+// attempt needs the process to run again, so this is generous.
+static constexpr unsigned DEFERRED_MAX_ATTEMPTS = 20;
+
 libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output)
     : pluginex(drakvuf, output)
 {
@@ -68,32 +72,104 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
             }
         }
 
-        auto key = std::make_pair(so.pid, va);
-        if (this->hooked.find(key) != this->hooked.end())
+        if (this->place_hook(drakvuf, info, so.pid, entry, so.path, va))
             return;
 
-        auto trap = register_trap(info, &libmon::function_hook_cb,
-                breakpoint_at_va_for_pid(so.pid, va), entry.function_name.c_str(), UNLIMITED_TTL);
-        if (!trap)
+        // A breakpoint can only be placed on a resident page, and this
+        // function has simply never been called, so nothing has faulted its
+        // page in. Defer it and fault the page in later, from a callback that
+        // actually runs in this process.
+        this->deferred[so.pid].push_back(deferred_hook{ &entry, so.path, va, 0 });
+
+        PRINT_DEBUG("[LIBMON] pid %d: deferring %s!%s at 0x%lx, page not resident\n", so.pid,
+            entry.dll_name.c_str(), entry.function_name.c_str(), va);
+    });
+
+    if (so.in_context)
+        this->flush_deferred(drakvuf, info, so.pid);
+}
+
+bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+    const plugin_target_config_entry_t& entry, const std::string& so_path, addr_t va)
+{
+    auto key = std::make_pair(pid, va);
+    if (this->hooked.find(key) != this->hooked.end())
+        return true;
+
+    auto trap = register_trap(info, &libmon::function_hook_cb,
+            breakpoint_at_va_for_pid(pid, va), entry.function_name.c_str(), UNLIMITED_TTL);
+    if (!trap)
+        return false;
+
+    this->hooked.emplace(key, hooked_function{ &entry, so_path, trap });
+
+    // Not attributed to `info`: this can run off the CR3 tick, where the
+    // process executing is unrelated to the one being hooked. Pass no trap
+    // info and name the target process explicitly.
+    fmt::print(m_output_format, "libmon", drakvuf, nullptr,
+        keyval("Event", fmt::Rstr("hook_placed")),
+        keyval("PID", fmt::Nval(pid)),
+        keyval("Library", fmt::Qstr(so_path)),
+        keyval("Function", fmt::Qstr(entry.function_name)),
+        keyval("Address", fmt::Xval(va))
+    );
+
+    return true;
+}
+
+// The caller must be running in this process's own context:
+// vmi_request_page_fault injects into the current vCPU, so doing this from the
+// CR3 tick would fault an address in whatever address space happens to be live.
+void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid)
+{
+    auto it = this->deferred.find(pid);
+    if (it == this->deferred.end())
+        return;
+
+    auto& targets = it->second;
+
+    for (auto target = targets.begin(); target != targets.end(); )
+    {
+        if (this->place_hook(drakvuf, info, pid, *target->config, target->so_path, target->va))
         {
-            PRINT_DEBUG("[LIBMON] pid %d: failed to hook %s!%s at 0x%lx\n", so.pid,
-                entry.dll_name.c_str(), entry.function_name.c_str(), va);
-            return;
+            target = targets.erase(target);
+            continue;
         }
 
-        this->hooked.emplace(key, hooked_function{ &entry, so.path, trap });
+        if (++target->attempts > DEFERRED_MAX_ATTEMPTS)
+        {
+            PRINT_DEBUG("[LIBMON] pid %d: giving up on %s at 0x%lx\n", pid,
+                target->config->function_name.c_str(), target->va);
+            target = targets.erase(target);
+            continue;
+        }
 
-        // Not attributed to `info`: library discovery runs off a CR3 tick, so
-        // the process executing right now is unrelated to the one being
-        // hooked. Pass no trap info and name the target process explicitly.
-        fmt::print(m_output_format, "libmon", drakvuf, nullptr,
-            keyval("Event", fmt::Rstr("hook_placed")),
-            keyval("PID", fmt::Nval(so.pid)),
-            keyval("Library", fmt::Qstr(so.path)),
-            keyval("Function", fmt::Qstr(entry.function_name)),
-            keyval("Address", fmt::Xval(va))
-        );
-    });
+        {
+            auto vmi = vmi_lock_guard(drakvuf);
+
+            page_info_t pinfo;
+            if (VMI_SUCCESS == vmi_pagetable_lookup_extended(vmi, info->regs->cr3, target->va, &pinfo))
+            {
+                // Resident now, but the trap still would not go in; leave it
+                // for the next round rather than faulting a page that is
+                // already present.
+                ++target;
+                continue;
+            }
+
+            // Ask the guest to fault the page in and come back for it next
+            // time. One injection per call: a vCPU carries a single pending
+            // fault, and the guest has to run for it to be taken.
+            if (VMI_SUCCESS != vmi_request_page_fault(vmi, info->vcpu, target->va, 0))
+                PRINT_DEBUG("[LIBMON] pid %d: could not request a page fault for 0x%lx\n",
+                    pid, target->va);
+        }
+
+        return;
+    }
+
+    if (targets.empty())
+        this->deferred.erase(it);
 }
 
 // The pid's address space is gone (exit, or a further exec), so every VA we
@@ -101,6 +177,8 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
 // leaving them armed over whatever gets mapped there next.
 void libmon::on_process_reset(vmi_pid_t pid)
 {
+    this->deferred.erase(pid);
+
     for (auto it = this->hooked.begin(); it != this->hooked.end(); )
     {
         if (it->first.first != pid)
@@ -121,6 +199,10 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
     auto it = plugin->hooked.find(std::make_pair(info->proc_data.pid, info->regs->rip));
     if (it == plugin->hooked.end())
         return VMI_EVENT_RESPONSE_NONE;
+
+    // A hook firing is proof this process is on the vCPU, which is the one
+    // condition page-fault injection needs.
+    plugin->flush_deferred(drakvuf, info, info->proc_data.pid);
 
     const auto& target = it->second;
     const auto& printers = target.config->argument_printers;

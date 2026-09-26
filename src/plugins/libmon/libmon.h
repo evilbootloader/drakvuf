@@ -35,8 +35,27 @@ private:
         drakvuf_trap_t* trap;
     };
 
+    // A resolved function whose page was not resident, so no breakpoint could
+    // be placed on it yet.
+    struct deferred_hook
+    {
+        const plugin_target_config_entry_t* config;
+        std::string so_path;
+        addr_t va;
+        unsigned attempts;
+    };
+
     void on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so);
     void on_process_reset(vmi_pid_t pid);
+
+    // Returns false if the page is not resident, in which case the caller
+    // should defer the hook rather than treat it as failed.
+    bool place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+        const plugin_target_config_entry_t& entry, const std::string& so_path, addr_t va);
+
+    // Retry deferred hooks, faulting in one cold page per call. Only safe
+    // from a callback running in that process's own context.
+    void flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid);
 
     static event_response_t function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
@@ -46,6 +65,7 @@ private:
     // Keyed by (pid, entry VA). The breakpoint callback looks itself up by
     // info->regs->rip, which is the address the breakpoint was placed at.
     std::map<std::pair<vmi_pid_t, addr_t>, hooked_function> hooked;
+    std::map<vmi_pid_t, std::vector<deferred_hook>> deferred;
 };
 
 #endif

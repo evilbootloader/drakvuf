@@ -17,6 +17,12 @@ struct so_view_t
     addr_t proc_base;   // task_struct, for drakvuf_exportsym_to_va_at_base()
     addr_t base;        // link_map.l_addr
     std::string path;   // link_map.l_name
+
+    // True when this process is the one currently executing, i.e. the
+    // callback came from its own rendezvous breakpoint rather than from the
+    // CR3 retry tick. Anything that acts on the running vCPU -- injecting a
+    // page fault, say -- is only safe when this holds.
+    bool in_context;
 };
 
 // Consumers are called with the trap info of the _dl_debug_state hit that
@@ -123,7 +129,9 @@ private:
     static event_response_t rendezvous_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
     // Snapshot the link_map and report what changed since last time.
-    void diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, process_state& state);
+    // in_context says whether the process being walked is the one running.
+    void diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+        process_state& state, bool in_context);
 
     void report(vmi_pid_t pid, const char* reason);
 

@@ -229,7 +229,8 @@ bool dl_rendezvous::try_arm(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
     // Whatever the program links against was mapped before we got here, so
     // report that set now instead of waiting for a dlopen() that may never
     // come.
-    this->diff_link_map(drakvuf, info, pid, state);
+    // Reached from the CR3 tick, so some other process is on the vCPU.
+    this->diff_link_map(drakvuf, info, pid, state, false);
     return true;
 }
 
@@ -262,11 +263,13 @@ event_response_t dl_rendezvous::rendezvous_hook_cb(drakvuf_t drakvuf, drakvuf_tr
     if (r_state != RT_CONSISTENT)
         return VMI_EVENT_RESPONSE_NONE;
 
-    plugin->diff_link_map(drakvuf, info, pid, state);
+    // The rendezvous breakpoint fires in ld.so, so this process is running.
+    plugin->diff_link_map(drakvuf, info, pid, state, true);
     return VMI_EVENT_RESPONSE_NONE;
 }
 
-void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, process_state& state)
+void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+    process_state& state, bool in_context)
 {
     std::map<addr_t, std::string> current_libs;
 
@@ -327,7 +330,7 @@ void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
 
         if (this->discovered_cb)
         {
-            so_view_t so{ pid, state.proc_base, base, path };
+            so_view_t so{ pid, state.proc_base, base, path, in_context };
             this->discovered_cb(drakvuf, info, so);
         }
     }
@@ -341,7 +344,7 @@ void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
 
         if (this->removed_cb)
         {
-            so_view_t so{ pid, state.proc_base, base, path };
+            so_view_t so{ pid, state.proc_base, base, path, in_context };
             this->removed_cb(drakvuf, info, so);
         }
     }
