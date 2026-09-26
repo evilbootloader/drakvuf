@@ -11,7 +11,7 @@ static constexpr unsigned DEFERRED_MAX_ATTEMPTS = 1000;
 
 libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output)
     : pluginex(drakvuf, output)
-    , no_retval(c->no_retval)
+    , retval(c->retval)
 {
     load_so_hook_config(c->so_hooks_list, c->print_no_addr, this->wanted_hooks);
 
@@ -72,7 +72,7 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
                 // this library's .dynsym, and an unreadable symbol table
                 // fails every lookup in it at once. Retry later.
                 this->deferred[so.pid].push_back(
-                    deferred_hook{ &entry, so.path, so.base, so.proc_base, 0, 0 });
+                    deferred_hook{ &entry, so.path, so.base, so.proc_base, so.dtb, 0, 0 });
 
                 PRINT_DEBUG("[LIBMON] pid %d: deferring %s!%s, symbol table not readable yet\n",
                     so.pid, entry.dll_name.c_str(), entry.function_name.c_str());
@@ -88,7 +88,7 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
         // page in. Defer it and fault the page in later, from a callback that
         // actually runs in this process.
         this->deferred[so.pid].push_back(
-            deferred_hook{ &entry, so.path, so.base, so.proc_base, va, 0 });
+            deferred_hook{ &entry, so.path, so.base, so.proc_base, so.dtb, va, 0 });
 
         PRINT_DEBUG("[LIBMON] pid %d: deferring %s!%s at 0x%lx, page not resident\n", so.pid,
             entry.dll_name.c_str(), entry.function_name.c_str(), va);
@@ -169,7 +169,20 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
                 target->va = va;
         }
 
-        if (target->va && this->place_hook(drakvuf, info, pid, *target->config,
+        // Check residency ourselves before asking for the trap. Handing
+        // drakvuf_add_trap() an address it cannot translate makes it log two
+        // errors per attempt, and this retries on every hook hit, so a couple
+        // of permanently cold pages otherwise bury the output.
+        bool resident = false;
+        if (target->va)
+        {
+            auto vmi = vmi_lock_guard(drakvuf);
+            page_info_t pinfo;
+            resident = (VMI_SUCCESS == vmi_pagetable_lookup_extended(vmi, target->dtb,
+                            target->va, &pinfo));
+        }
+
+        if (resident && this->place_hook(drakvuf, info, pid, *target->config,
                 target->so_path, target->va))
         {
             target = targets.erase(target);
@@ -271,7 +284,7 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
     for (size_t i = 1; i <= config.argument_printers.size(); i++)
         arguments.push_back(drakvuf_get_function_argument(drakvuf, info, i));
 
-    if (plugin->no_retval || config.no_retval)
+    if (!plugin->retval || config.no_retval)
     {
         plugin->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
         return VMI_EVENT_RESPONSE_NONE;
@@ -321,7 +334,7 @@ event_response_t libmon::function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap
 
 void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     const plugin_target_config_entry_t& config, const std::string& so_path,
-    const std::vector<uint64_t>& arguments, std::optional<uint64_t> retval)
+    const std::vector<uint64_t>& arguments, std::optional<uint64_t> return_value)
 {
     const auto& printers = config.argument_printers;
 
@@ -332,8 +345,8 @@ void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
         fmt_args.push_back(fmt::Rstr(printers[i]->print(drakvuf, info, arguments[i])));
 
     std::optional<fmt::Xval<uint64_t>> fmt_retval;
-    if (retval)
-        fmt_retval = fmt::Xval(*retval);
+    if (return_value)
+        fmt_retval = fmt::Xval(*return_value);
 
     fmt::print(m_output_format, "libmon", drakvuf, info,
         keyval("Event", fmt::Rstr("api_called")),

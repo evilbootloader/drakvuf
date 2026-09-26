@@ -18,10 +18,11 @@ struct libmon_config
     const char* so_hooks_list;
     bool print_no_addr;
 
-    // Skip return hooks entirely. Each one is a second breakpoint per call,
-    // placed and torn down as the call runs, so on a hot function the cost is
-    // noticeable; without it ReturnValue is simply not reported.
-    bool no_retval;
+    // Report return values. Off by default: this places and tears down a
+    // breakpoint per call, at return addresses that live in pages shared with
+    // every other process mapping the library, and that churn has been seen
+    // to destabilise the guest. Opt in knowingly.
+    bool retval;
 };
 
 // Linux counterpart to apimon: logs calls to configured exported functions in
@@ -54,6 +55,7 @@ private:
         std::string so_path;
         addr_t so_base;         // link_map.l_addr, to retry resolution
         addr_t proc_base;       // task_struct, ditto
+        addr_t dtb;             // to test residency without the process running
         addr_t va;              // 0 until resolved
         unsigned attempts;
     };
@@ -72,7 +74,7 @@ private:
 
     void print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
         const plugin_target_config_entry_t& config, const std::string& so_path,
-        const std::vector<uint64_t>& arguments, std::optional<uint64_t> retval);
+        const std::vector<uint64_t>& arguments, std::optional<uint64_t> return_value);
 
     static event_response_t function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
@@ -110,7 +112,7 @@ private:
     // or concurrent calls to the same function do not collide.
     std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
 
-    bool no_retval;
+    bool retval;
 
     // Held only while something is deferred; a CR3 hook fires on every
     // context switch.

@@ -362,7 +362,7 @@ void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
 
         if (this->discovered_cb)
         {
-            so_view_t so{ pid, state.proc_base, base, path, in_context };
+            so_view_t so{ pid, state.proc_base, state.dtb, base, path, in_context };
             this->discovered_cb(drakvuf, info, so);
         }
     }
@@ -376,7 +376,7 @@ void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
 
         if (this->removed_cb)
         {
-            so_view_t so{ pid, state.proc_base, base, path, in_context };
+            so_view_t so{ pid, state.proc_base, state.dtb, base, path, in_context };
             this->removed_cb(drakvuf, info, so);
         }
     }

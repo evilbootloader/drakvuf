@@ -318,9 +318,9 @@ static void print_usage()
 #ifdef ENABLE_PLUGIN_LIBMON
         "\t --so-hooks-list <file>\n"
         "\t                           List of shared object functions to be hooked (Linux)\n"
-        "\t --libmon-no-retval\n"
-        "\t                           Don't hook returns in libmon; drops ReturnValue but\n"
-        "\t                           avoids a second breakpoint per call\n"
+        "\t --libmon-retval\n"
+        "\t                           Report return values in libmon. Costs a breakpoint per\n"
+        "\t                           call and has been seen to destabilise guests\n"
 #endif
 #if defined(ENABLE_PLUGIN_MEMDUMP) || defined(ENABLE_PLUGIN_APIMON) || defined(ENABLE_PLUGIN_RPCMON)
         "\t --dll-hooks-list <file>\n"
@@ -502,7 +502,7 @@ int main(int argc, char** argv)
         opt_memdump_disable_shellcode_detect,
         opt_dll_hooks_list,
         opt_so_hooks_list,
-        opt_libmon_no_retval,
+        opt_libmon_retval,
         opt_fileextractor_timeout,
         opt_fileextractor_hash,
         opt_fileextractor_extract,
@@ -592,7 +592,7 @@ int main(int argc, char** argv)
         {"memdump-disable-shellcode-detect", no_argument, NULL, opt_memdump_disable_shellcode_detect},
         {"dll-hooks-list", required_argument, NULL, opt_dll_hooks_list},
         {"so-hooks-list", required_argument, NULL, opt_so_hooks_list},
-        {"libmon-no-retval", no_argument, NULL, opt_libmon_no_retval},
+        {"libmon-retval", no_argument, NULL, opt_libmon_retval},
         {"fileextractor-timeout", required_argument, NULL, opt_fileextractor_timeout},
         {"fileextractor-max-size-hash", required_argument, NULL, opt_fileextractor_hash},
         {"fileextractor-max-size-extract", required_argument, NULL, opt_fileextractor_extract},
@@ -909,8 +909,8 @@ int main(int argc, char** argv)
             case opt_so_hooks_list:
                 options.so_hooks_list = optarg;
                 break;
-            case opt_libmon_no_retval:
-                options.libmon_no_retval = true;
+            case opt_libmon_retval:
+                options.libmon_retval = true;
                 break;
             case opt_json_clr:
                 options.clr_profile = optarg;
