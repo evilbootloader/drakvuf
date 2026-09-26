@@ -24,6 +24,10 @@ struct so_view_t
 using so_event_cb = std::function<void(drakvuf_t, drakvuf_trap_info_t*, const so_view_t&)>;
 using proc_reset_cb = std::function<void(vmi_pid_t)>;
 
+// Reports why tracking gave up on a process. Consumers should surface this:
+// without it a failure to arm is indistinguishable from a quiet guest.
+using status_cb = std::function<void(vmi_pid_t, const char* reason)>;
+
 // register_trap()'s "init_breakpoint" functor for a permanent breakpoint at
 // an already-known virtual address, scoped to one process. The RAII API has
 // no equivalent (it covers only syscall/return/cr3/cpuid/catchall/memaccess),
@@ -77,6 +81,8 @@ public:
     // address space are meaningless afterwards.
     void set_process_reset_callback(proc_reset_cb on_reset);
 
+    void set_status_callback(status_cb on_status);
+
     // Registered via createSyscallHook/createReturnHook (RAII API), so these
     // run as ordinary bound member functions.
     event_response_t load_elf_binary_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
@@ -86,8 +92,10 @@ public:
 private:
     struct process_state
     {
+        addr_t ld_base = 0;         // AT_BASE: where the interpreter is mapped
         addr_t r_debug_va = 0;
-        drakvuf_trap_t* rendezvous_trap = nullptr;
+        drakvuf_trap_t* entry_trap = nullptr;       // one-shot, at the main executable's entry
+        drakvuf_trap_t* rendezvous_trap = nullptr;  // permanent, at r_debug.r_brk
         std::map<addr_t, std::string> known_libs; // link_map base (l_addr) -> path (l_name), last known snapshot
     };
 
@@ -95,11 +103,22 @@ private:
     // for "breakpoint at an arbitrary already-known VA scoped to one pid"),
     // so this must be a plain-function-pointer-compatible static, and
     // recovers `this` via get_trap_plugin() instead of being bound directly.
-    static event_response_t dl_debug_state_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    // Stage two: fires at the main executable's entry point, by which time
+    // ld.so has finished initialising r_debug and loading the startup set.
+    static event_response_t main_entry_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+
+    // Stage three: fires at r_debug.r_brk, on every dlopen()/dlclose().
+    static event_response_t rendezvous_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+
+    // Snapshot the link_map and report what changed since last time.
+    void diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, process_state& state);
+
+    void report(vmi_pid_t pid, const char* reason);
 
     so_event_cb discovered_cb;
     so_event_cb removed_cb;
     proc_reset_cb reset_cb;
+    status_cb reported_cb;
 
     std::unique_ptr<libhook::SyscallHook> load_elf_hook;
     std::unique_ptr<libhook::SyscallHook> exit_hook;

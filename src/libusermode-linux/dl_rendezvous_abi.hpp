@@ -58,7 +58,8 @@ enum link_map_offset
 // program interpreter, i.e. ld.so.
 enum auxv_type
 {
-    AT_BASE_TYPE = 7,
+    AT_BASE_TYPE  = 7,  // load address of the interpreter (ld.so)
+    AT_ENTRY_TYPE = 9,  // entry point of the main executable
 };
 
 enum dt_tag

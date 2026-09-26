@@ -28,6 +28,18 @@ libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output
     {
         this->on_process_reset(pid);
     });
+
+    // Surface give-up reasons as ordinary events. They would otherwise only
+    // exist as PRINT_DEBUG, which a release build discards, leaving "armed
+    // nothing" and "guest did nothing" looking identical.
+    this->rendezvous->set_status_callback([this](vmi_pid_t pid, const char* reason)
+    {
+        fmt::print(m_output_format, "libmon", this->drakvuf, nullptr,
+            keyval("Event", fmt::Rstr("not_tracked")),
+            keyval("PID", fmt::Nval(pid)),
+            keyval("Reason", fmt::Qstr(std::string(reason)))
+        );
+    });
 }
 
 void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so)
