@@ -76,7 +76,11 @@ private:
         const plugin_target_config_entry_t& config, const std::string& so_path,
         const std::vector<uint64_t>& arguments, std::optional<uint64_t> return_value);
 
-    static event_response_t function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    // Not static, unlike function_hook_cb: this goes through the RAII hook
+    // API, which binds `this` itself. Recovering the plugin by hand here
+    // would reach for trap->data, which for a RAII hook holds the Params
+    // object rather than the legacy plugin_data.
+    event_response_t function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
     // Returns false if the page is not resident, in which case the caller
     // should defer the hook rather than treat it as failed.

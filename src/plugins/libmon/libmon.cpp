@@ -316,7 +316,6 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
 
 event_response_t libmon::function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    auto plugin = get_trap_plugin<libmon>(info);
     auto params = libhook::GetTrapParams<return_data>(info);
 
     // The return address is shared by every call that reaches it, so check
@@ -325,10 +324,12 @@ event_response_t libmon::function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap
     if (!params->verifyResultCallParams(drakvuf, info))
         return VMI_EVENT_RESPONSE_NONE;
 
-    plugin->print_call(drakvuf, info, *params->config, params->so_path,
+    this->print_call(drakvuf, info, *params->config, params->so_path,
         params->arguments, info->regs->rax);
 
-    plugin->ret_hooks.erase(make_hook_id(info, params->target_rsp));
+    // Erasing destroys the ReturnHook, whose destructor removes the trap.
+    // Safe from inside its own callback: libhook defers the deletion.
+    this->ret_hooks.erase(make_hook_id(info, params->target_rsp));
     return VMI_EVENT_RESPONSE_NONE;
 }
 
