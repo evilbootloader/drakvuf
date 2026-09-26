@@ -151,9 +151,25 @@ addr_t linux_get_function_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
 
 addr_t linux_get_function_return_address(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
+    /*
+     * Translate through the current page tables rather than the kernel's.
+     * Passing pid 0 to vmi_read_addr_va() resolves against the kernel address
+     * space, which is right for a hook on a kernel function -- every existing
+     * Linux caller -- but fails outright for one on a userspace function,
+     * whose rsp points into a user stack. CR3 covers both: in kernel context
+     * it maps the kernel stack, in user context the user stack.
+     */
     addr_t ret_addr;
-    if (VMI_FAILURE == vmi_read_addr_va(drakvuf->vmi, info->regs->rsp, 0, &ret_addr))
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = info->regs->rsp
+    );
+
+    if (VMI_FAILURE == vmi_read_addr(drakvuf->vmi, &ctx, &ret_addr))
         return 0;
+
     return ret_addr;
 }
 

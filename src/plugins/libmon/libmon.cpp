@@ -281,7 +281,12 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
             info->trap->name, drakvuf_get_limited_traps_ttl(drakvuf));
     if (!hook)
     {
-        // Report the call anyway; losing the return value beats losing it.
+        // Report the call anyway, without a return value: losing one field
+        // beats losing the event. Logged because the two look identical in
+        // the output otherwise.
+        PRINT_DEBUG("[LIBMON] pid %d: no return hook for %s, reporting at entry\n",
+            info->proc_data.pid, config.function_name.c_str());
+
         plugin->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
         return VMI_EVENT_RESPONSE_NONE;
     }
