@@ -13,16 +13,20 @@ dl_rendezvous::dl_rendezvous(drakvuf_t drakvuf)
     if (!is_supported(drakvuf))
         throw -1;
 
-    // NOTE: needs empirical validation that "load_elf_binary" resolves as a
-    // breakpoint target the same way "begin_new_exec" does for procmon
-    // (src/plugins/procmon/linux.cpp) -- both are non-exported kernel
-    // functions resolved via the debug-info profile, but confirm rather than
-    // assume. Fallback if it doesn't: hook begin_new_exec-return instead and
-    // defer the ld.so search to the first subsequent per-process event.
-    load_elf_hook = createSyscallHook("load_elf_binary", &dl_rendezvous::load_elf_binary_cb);
-    if (!load_elf_hook)
+    // load_elf_binary() would be the obvious hook point, but a breakpoint on
+    // it never fires: it is static in fs/binfmt_elf.c, and the address the
+    // profile gives for it is not where the kernel actually executes. Global
+    // symbols in fs/exec.c (begin_new_exec, do_exit) hook fine.
+    //
+    // finalize_exec() is global, and load_elf_binary() calls it after
+    // create_elf_tables() has filled in mm->saved_auxv and before
+    // START_THREAD(), so on entry the new process is current, the
+    // interpreter is mapped, and the aux vector is readable -- everything
+    // this needs, without a return hook.
+    exec_hook = createSyscallHook("finalize_exec", &dl_rendezvous::finalize_exec_cb);
+    if (!exec_hook)
     {
-        PRINT_DEBUG("[DL_RENDEZVOUS] Method load_elf_binary not found.\n");
+        PRINT_DEBUG("[DL_RENDEZVOUS] Method finalize_exec not found.\n");
         throw -1;
     }
 
@@ -77,43 +81,15 @@ bool dl_rendezvous::is_supported(drakvuf_t drakvuf)
     return true;
 }
 
-event_response_t dl_rendezvous::load_elf_binary_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+event_response_t dl_rendezvous::finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     // Logged unconditionally: if this never appears, the kernel hook is not
     // firing at all, which is a different problem from anything downstream.
-    // At this point `current` is still the caller -- begin_new_exec() runs
-    // later, inside load_elf_binary() -- so this is the exec'ing process.
-    PRINT_DEBUG("[DL_RENDEZVOUS] load_elf_binary entered by pid %d (%s)\n",
+    // begin_new_exec() has already run by now, so current -- and therefore
+    // proc_data -- is the newly exec'd process, not the caller.
+    PRINT_DEBUG("[DL_RENDEZVOUS] finalize_exec entered by pid %d (%s)\n",
         info->proc_data.pid, info->proc_data.name ?: "?");
 
-    auto hook = this->createReturnHook(info, &dl_rendezvous::load_elf_binary_ret_cb, info->trap->name);
-    if (!hook)
-    {
-        PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: failed to create the load_elf_binary return hook\n",
-            info->proc_data.pid);
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    auto params = libhook::GetTrapParams(hook->trap_);
-    auto hook_id = make_hook_id(info, params->target_rsp);
-    this->ret_hooks[hook_id] = std::move(hook);
-
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-event_response_t dl_rendezvous::load_elf_binary_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
-{
-    auto params = libhook::GetTrapParams(info);
-    if (!params->verifyResultCallParams(drakvuf, info))
-        return VMI_EVENT_RESPONSE_NONE;
-
-    auto hook_id = make_hook_id(info, params->target_rsp);
-    this->ret_hooks.erase(hook_id);
-
-    // By the time load_elf_binary() returns, both the main executable and
-    // the interpreter (ld.so) are fully mapped into the new process's
-    // address space (unlike at begin_new_exec-return, which is too early --
-    // see the plan notes). proc_data already reflects the new process here.
     vmi_pid_t pid = info->proc_data.pid;
     addr_t eprocess_base = info->proc_data.base_addr;
 

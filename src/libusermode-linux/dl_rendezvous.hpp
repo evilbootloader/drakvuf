@@ -83,10 +83,9 @@ public:
 
     void set_status_callback(status_cb on_status);
 
-    // Registered via createSyscallHook/createReturnHook (RAII API), so these
-    // run as ordinary bound member functions.
-    event_response_t load_elf_binary_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
-    event_response_t load_elf_binary_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    // Registered via createSyscallHook (RAII API), so these run as ordinary
+    // bound member functions.
+    event_response_t finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
     event_response_t do_exit_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
 private:
@@ -120,9 +119,8 @@ private:
     proc_reset_cb reset_cb;
     status_cb reported_cb;
 
-    std::unique_ptr<libhook::SyscallHook> load_elf_hook;
+    std::unique_ptr<libhook::SyscallHook> exec_hook;
     std::unique_ptr<libhook::SyscallHook> exit_hook;
-    std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
     std::map<vmi_pid_t, process_state> procs;
 };
 
