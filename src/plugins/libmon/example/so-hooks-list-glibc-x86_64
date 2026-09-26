@@ -3,19 +3,29 @@
 # Format (same grammar as apimon's --dll-hooks-list):
 #   <so name>,<function name|hex offset>[,no-retval],<log|log+stack>[,<arg>,...]
 #
-# The <so name> is matched against the basename of the mapped path, so
-# "libc.so.6" matches /lib/x86_64-linux-gnu/libc.so.6. Matching is
-# case-sensitive, unlike the Windows DLL equivalent.
+# The <so name> matches a prefix of the basename of the mapped path, so
+# "libc.so.6" matches /lib/x86_64-linux-gnu/libc.so.6 and "libssl.so" also
+# matches a versioned libssl.so.3. Matching is case-sensitive, unlike the
+# Windows DLL equivalent. A pattern containing '/' matches a path suffix.
 #
-# Each <arg> is [Name:]type. Only a few types change formatting (lpstr/lpcstr
-# read a NUL-terminated string, pulong/pulonglong dereference a pointer); any
-# other type name just documents the signature and prints the raw value.
+# Each <arg> is [Name:]type. Only a few types change formatting (lpcstr reads
+# a NUL-terminated string, pulong/pulonglong dereference a pointer); any other
+# type name just documents the signature and prints the raw value.
+#
+# no-retval skips the return hook for one function, which is worth doing for
+# anything hot if --libmon-retval is in use.
+#
+# A hook whose page is not resident is deferred and retried, so a function the
+# process never calls may simply never appear. That is normal.
 
 # process and library loading
 libc.so.6,execve,log,Path:lpcstr,argv:lpvoid,envp:lpvoid
 libc.so.6,fork,log
 libc.so.6,system,log,Command:lpcstr
-libdl.so.2,dlopen,log,Path:lpcstr,Flags:int
+
+# dlopen lives in libc, not libdl: glibc 2.34 merged libdl away, leaving
+# libdl.so.2 as a compat stub with nothing useful in it.
+libc.so.6,dlopen,log,Path:lpcstr,Flags:int
 
 # files
 libc.so.6,open,log,Path:lpcstr,Flags:int
@@ -31,6 +41,8 @@ libc.so.6,getaddrinfo,log,Node:lpcstr,Service:lpcstr,Hints:lpvoid,Result:lpvoid
 libc.so.6,mprotect,log,Addr:lpvoid,Len:ulong,Prot:int
 libc.so.6,memfd_create,log,Name:lpcstr,Flags:int
 
-# TLS
-libssl.so,SSL_write,log,Ssl:lpvoid,Buf:lpcstr,Num:int
-libssl.so,SSL_read,log,Ssl:lpvoid,Buf:lpvoid,Num:int
+# TLS payloads, for a target that actually uses OpenSSL. Commented out because
+# most processes never load libssl, and an entry that matches a library the
+# process does load but a function it never calls just sits deferred.
+#libssl.so,SSL_write,log,Ssl:lpvoid,Buf:lpcstr,Num:int
+#libssl.so,SSL_read,log,Ssl:lpvoid,Buf:lpvoid,Num:int
