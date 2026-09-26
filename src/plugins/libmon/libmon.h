@@ -39,13 +39,16 @@ private:
         drakvuf_trap_t* trap;
     };
 
-    // A resolved function whose page was not resident, so no breakpoint could
-    // be placed on it yet.
+    // A hook that could not be completed yet, either because the symbol was
+    // not resolvable (ld.so may not have read the library's .dynsym at the
+    // point we armed) or because the function's page was not resident.
     struct deferred_hook
     {
         const plugin_target_config_entry_t* config;
         std::string so_path;
-        addr_t va;
+        addr_t so_base;         // link_map.l_addr, to retry resolution
+        addr_t proc_base;       // task_struct, ditto
+        addr_t va;              // 0 until resolved
         unsigned attempts;
     };
 
@@ -57,9 +60,14 @@ private:
     bool place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
         const plugin_target_config_entry_t& entry, const std::string& so_path, addr_t va);
 
-    // Retry deferred hooks, faulting in one cold page per call. Only safe
-    // from a callback running in that process's own context.
+    // Retry whatever could not be completed earlier. Both resolution and trap
+    // insertion go through the target's own page tables, so this does not
+    // require that process to be the one running.
     void flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid);
+
+    // Drives the retries: without it a process whose every symbol failed
+    // would never hook anything, having no hook left to fire.
+    event_response_t cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
     static event_response_t function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
@@ -76,6 +84,10 @@ private:
     std::set<std::pair<vmi_pid_t, addr_t>> hooked_keys;
 
     std::map<vmi_pid_t, std::vector<deferred_hook>> deferred;
+
+    // Held only while something is deferred; a CR3 hook fires on every
+    // context switch.
+    std::unique_ptr<libhook::Cr3Hook> cr3_hook;
 };
 
 #endif

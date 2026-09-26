@@ -67,8 +67,14 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
                     entry.function_name.c_str());
             if (!va || va == (addr_t)-1)
             {
-                PRINT_DEBUG("[LIBMON] pid %d: failed to resolve %s!%s\n", so.pid,
-                    entry.dll_name.c_str(), entry.function_name.c_str());
+                // Not necessarily absent: we can arm before ld.so has read
+                // this library's .dynsym, and an unreadable symbol table
+                // fails every lookup in it at once. Retry later.
+                this->deferred[so.pid].push_back(
+                    deferred_hook{ &entry, so.path, so.base, so.proc_base, 0, 0 });
+
+                PRINT_DEBUG("[LIBMON] pid %d: deferring %s!%s, symbol table not readable yet\n",
+                    so.pid, entry.dll_name.c_str(), entry.function_name.c_str());
                 return;
             }
         }
@@ -80,18 +86,35 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
         // function has simply never been called, so nothing has faulted its
         // page in. Defer it and fault the page in later, from a callback that
         // actually runs in this process.
-        this->deferred[so.pid].push_back(deferred_hook{ &entry, so.path, va, 0 });
+        this->deferred[so.pid].push_back(
+            deferred_hook{ &entry, so.path, so.base, so.proc_base, va, 0 });
 
         PRINT_DEBUG("[LIBMON] pid %d: deferring %s!%s at 0x%lx, page not resident\n", so.pid,
             entry.dll_name.c_str(), entry.function_name.c_str(), va);
     });
 
-    // Deliberately no flush here. This runs once per newly discovered
-    // library, so a process loading a dozen of them would spend a dozen
-    // retries on the same address without the guest running in between --
-    // and a page fault needs the guest to run to be taken. Retries happen
-    // when one of this process's hooks fires instead, which is both properly
-    // spaced and guaranteed to be in its own context.
+    // Retries are driven from the CR3 tick rather than from here, which runs
+    // once per newly discovered library and would spend several of them in a
+    // single event.
+    if (!this->deferred.empty() && !this->cr3_hook)
+        this->cr3_hook = createCr3Hook(&libmon::cr3_cb);
+}
+
+event_response_t libmon::cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    // flush_deferred() erases from the map, so collect the keys first.
+    std::vector<vmi_pid_t> pids;
+    pids.reserve(this->deferred.size());
+    for (const auto& [pid, targets] : this->deferred)
+        pids.push_back(pid);
+
+    for (auto pid : pids)
+        this->flush_deferred(drakvuf, info, pid);
+
+    if (this->deferred.empty())
+        this->cr3_hook.reset();
+
+    return VMI_EVENT_RESPONSE_NONE;
 }
 
 bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
@@ -136,7 +159,17 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
 
     for (auto target = targets.begin(); target != targets.end(); )
     {
-        if (this->place_hook(drakvuf, info, pid, *target->config, target->so_path, target->va))
+        // Still unresolved: the library's .dynsym was unreadable last time.
+        if (!target->va)
+        {
+            addr_t va = drakvuf_exportsym_to_va_at_base(drakvuf, target->proc_base,
+                    target->so_base, target->config->function_name.c_str());
+            if (va && va != (addr_t)-1)
+                target->va = va;
+        }
+
+        if (target->va && this->place_hook(drakvuf, info, pid, *target->config,
+                target->so_path, target->va))
         {
             target = targets.erase(target);
             continue;
