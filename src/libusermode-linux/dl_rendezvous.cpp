@@ -133,6 +133,8 @@ event_response_t dl_rendezvous::finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap
     state.dtb = info->regs->cr3;            // begin_new_exec() already installed the new mm
     state.proc_base = eprocess_base;
 
+    this->arming.execs++;
+
     // Nothing can be armed yet. The process has not executed an instruction,
     // so none of its pages are faulted in -- a breakpoint anywhere in it
     // would fail the VA->PA translation in inject_trap() -- and r_debug,
@@ -169,6 +171,8 @@ event_response_t dl_rendezvous::arming_tick(drakvuf_t drakvuf, drakvuf_trap_info
     // some unrelated process. Every pending process is read through its own
     // stored dtb instead, which works no matter who is running, so this is
     // purely a retry clock.
+    this->arming.ticks++;
+
     bool pending = false;
 
     for (auto& [pid, state] : this->procs)
@@ -186,10 +190,31 @@ event_response_t dl_rendezvous::arming_tick(drakvuf_t drakvuf, drakvuf_trap_info
     return VMI_EVENT_RESPONSE_NONE;
 }
 
+arming_stats dl_rendezvous::stats() const
+{
+    arming_stats out = this->arming;
+
+#ifdef DRAKVUF_DEBUG
+    // Include the stretch currently in progress, so a snapshot taken while
+    // something is still pending is not an underestimate.
+    if (this->fault_hook || this->cr3_hook)
+    {
+        out.installed_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - this->tick_installed_at).count();
+    }
+#endif
+
+    return out;
+}
+
 void dl_rendezvous::start_arming_tick()
 {
     if (this->fault_hook || this->cr3_hook)
         return;
+
+#ifdef DRAKVUF_DEBUG
+    this->tick_installed_at = std::chrono::steady_clock::now();
+#endif
 
     // Every user page fault, so this is expensive -- but it only runs while a
     // process is waiting to be armed, and it collapses that wait from several
@@ -201,10 +226,20 @@ void dl_rendezvous::start_arming_tick()
 
     PRINT_DEBUG("[DL_RENDEZVOUS] handle_mm_fault not hookable, falling back to CR3 ticks\n");
     this->cr3_hook = createCr3Hook(&dl_rendezvous::cr3_cb);
+    if (this->cr3_hook)
+        this->arming.used_cr3 = true;
 }
 
 void dl_rendezvous::stop_arming_tick()
 {
+#ifdef DRAKVUF_DEBUG
+    if (this->fault_hook || this->cr3_hook)
+    {
+        this->arming.installed_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - this->tick_installed_at).count();
+    }
+#endif
+
     this->fault_hook.reset();
     this->cr3_hook.reset();
 }
@@ -215,6 +250,7 @@ bool dl_rendezvous::try_arm(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
     // or not what we assumed. Give up rather than hold the CR3 hook open.
     if (++state.attempts > ARM_MAX_ATTEMPTS)
     {
+        this->arming.gave_up++;
         this->report(pid, "ld.so did not initialise r_debug; giving up");
         return true;
     }
@@ -254,6 +290,8 @@ bool dl_rendezvous::try_arm(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
             breakpoint_at_va_for_pid(pid, r_brk), "r_brk", UNLIMITED_TTL);
     if (!state.rendezvous_trap)
         return false;           // r_brk's page may not be resident yet either
+
+    this->arming.armed++;
 
     PRINT_DEBUG("[DL_RENDEZVOUS] pid %d: armed after %u attempts (r_debug=0x%lx r_brk=0x%lx)\n",
         pid, state.attempts, r_debug_va, r_brk);

@@ -34,6 +34,13 @@ class libmon : public pluginex
 public:
     libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output);
 
+    // Logs what arming cost, in debug builds only. The arming tick hooks
+    // every user page fault in the guest while any process is waiting, so on
+    // a guest that starts processes constantly it may be installed for most
+    // of a run -- worth measuring on a real workload rather than guessing at,
+    // but a diagnostic rather than something to put in the event stream.
+    bool stop_impl() override;
+
 private:
     struct hooked_function
     {
@@ -166,6 +173,10 @@ private:
     std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
 
     bool no_retval;
+
+    // stop_impl() is retried until it succeeds, so the summary is guarded
+    // rather than logged once per attempt.
+    bool stats_logged = false;
 
     // Held only while something is deferred; a CR3 hook fires on every
     // context switch.

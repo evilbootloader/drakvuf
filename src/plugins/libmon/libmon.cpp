@@ -53,6 +53,25 @@ libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output
     });
 }
 
+bool libmon::stop_impl()
+{
+    if (!this->stats_logged)
+    {
+        this->stats_logged = true;
+
+        // PRINT_DEBUG compiles to nothing in a release build, which would
+        // leave this set and never read.
+        [[maybe_unused]] auto s = this->rendezvous->stats();
+        PRINT_DEBUG("[LIBMON] arming: %lu exec(s), %lu armed, %lu gave up, %lu tick(s) on %s,"
+            " tick installed %.3f s\n",
+            s.execs, s.armed, s.gave_up, s.ticks,
+            s.used_cr3 ? "CR3 writes" : "page faults",
+            s.installed_ns / 1e9);
+    }
+
+    return pluginex::stop_impl();
+}
+
 std::optional<std::string> libmon::resolve_module(vmi_pid_t pid, addr_t addr) const
 {
     auto proc = this->libs.find(pid);

@@ -1,6 +1,7 @@
 #ifndef _INCLUDE_DL_RENDEZVOUS
 #define _INCLUDE_DL_RENDEZVOUS
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -34,6 +35,22 @@ using proc_reset_cb = std::function<void(vmi_pid_t)>;
 // Reports why tracking gave up on a process. Consumers should surface this:
 // without it a failure to arm is indistinguishable from a quiet guest.
 using status_cb = std::function<void(vmi_pid_t, const char* reason)>;
+
+// What waiting for ld.so has cost. Arming needs a clock to retry on, and the
+// only one that is prompt enough is a hook on every user page fault in the
+// guest -- system-wide, not per-process. It is installed only while some
+// process is still waiting, so the question is what fraction of a run that
+// is, which depends on how often the guest starts processes. Nobody has
+// measured it on a busy guest yet, hence these counters.
+struct arming_stats
+{
+    uint64_t execs = 0;         // processes taken up at exec
+    uint64_t armed = 0;         // ... of which reached r_debug
+    uint64_t gave_up = 0;       // ... of which never did
+    uint64_t ticks = 0;         // tick callbacks taken, i.e. VM exits caused
+    uint64_t installed_ns = 0;  // total time the tick was installed; debug builds only
+    bool used_cr3 = false;      // fell back from page faults to CR3 writes
+};
 
 // register_trap()'s "init_breakpoint" functor for a permanent breakpoint at
 // an already-known virtual address, scoped to one process. The RAII API has
@@ -123,6 +140,10 @@ public:
 
     void set_status_callback(status_cb on_status);
 
+    // Snapshot of what arming has cost so far. Live while the tick is
+    // installed, final once nothing is pending.
+    arming_stats stats() const;
+
     // Registered via createSyscallHook (RAII API), so these run as ordinary
     // bound member functions.
     event_response_t finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
@@ -192,6 +213,11 @@ private:
     std::unique_ptr<libhook::SyscallHook> fault_hook;
     std::unique_ptr<libhook::Cr3Hook> cr3_hook;
     std::map<vmi_pid_t, process_state> procs;
+
+    arming_stats arming;
+
+    // Only read in a debug build, where the timings are collected.
+    [[maybe_unused]] std::chrono::steady_clock::time_point tick_installed_at;
 };
 
 #endif
