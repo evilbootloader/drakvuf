@@ -137,7 +137,8 @@ event_response_t libmon::cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
         pids.push_back(pid);
 
     for (auto pid : pids)
-        this->flush_deferred(drakvuf, info, pid);
+        // Not in context: this tick fires for whichever process is running.
+        this->flush_deferred(drakvuf, info, pid, false);
 
     if (this->deferred.empty())
         this->cr3_hook.reset();
@@ -174,9 +175,8 @@ bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
     return true;
 }
 
-// Safe to call from anywhere: resolution and trap insertion both go through
-// the target's own page tables, so the process need not be the one running.
-void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid)
+void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+    bool in_context)
 {
     auto it = this->deferred.find(pid);
     if (it == this->deferred.end())
@@ -223,18 +223,26 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
             continue;
         }
 
-        // No vmi_request_page_fault() here, deliberately. Injecting one does
-        // fault the page in and the hook then places -- but it kills the
-        // guest process. Every caller of this function is a breakpoint
-        // callback, and DRAKVUF resumes from a breakpoint by switching altp2m
-        // view and single-stepping the original instruction; taking an
-        // injected fault instead derails that and execution returns to the
-        // int3. libusermode carries injection-in-progress tracking and an
-        // exception-suppression hook for exactly this, and a Linux equivalent
-        // has to exist before injection can be done safely.
+        // Ask the guest to fault the page in. Without this a function the
+        // process never calls is never hooked, because nothing else will ever
+        // make its page resident.
         //
-        // So just retry: a cold page often becomes resident on its own,
-        // because a neighbouring function in it gets called.
+        // Only from a callback running in this process: the fault is injected
+        // into the current vCPU, so doing it from the retry tick would fault
+        // an address in whatever address space happens to be live. One per
+        // call, since a vCPU carries a single pending fault and the guest has
+        // to run before it is taken.
+        if (in_context && target->va)
+        {
+            auto vmi = vmi_lock_guard(drakvuf);
+
+            if (VMI_SUCCESS != vmi_request_page_fault(vmi, info->vcpu, target->va, 0))
+                PRINT_DEBUG("[LIBMON] pid %d: could not request a page fault for 0x%lx\n",
+                    pid, target->va);
+
+            return;
+        }
+
         ++target;
     }
 
@@ -300,7 +308,9 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
 
     // A hook firing is proof this process is on the vCPU, which is the one
     // condition page-fault injection needs.
-    plugin->flush_deferred(drakvuf, info, info->proc_data.pid);
+    // The pid check above proves this process is the one on the vCPU, which is
+    // what faulting a cold page in requires.
+    plugin->flush_deferred(drakvuf, info, info->proc_data.pid, true);
 
     // Read the arguments here, at entry: by the time the function returns its
     // stack frame is gone and the argument registers have been reused.
