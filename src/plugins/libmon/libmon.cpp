@@ -83,8 +83,12 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
 
         this->hooked.emplace(key, hooked_function{ &entry, so.path, trap });
 
-        fmt::print(m_output_format, "libmon", drakvuf, info,
+        // Not attributed to `info`: library discovery runs off a CR3 tick, so
+        // the process executing right now is unrelated to the one being
+        // hooked. Pass no trap info and name the target process explicitly.
+        fmt::print(m_output_format, "libmon", drakvuf, nullptr,
             keyval("Event", fmt::Rstr("hook_placed")),
+            keyval("PID", fmt::Nval(so.pid)),
             keyval("Library", fmt::Qstr(so.path)),
             keyval("Function", fmt::Qstr(entry.function_name)),
             keyval("Address", fmt::Xval(va))

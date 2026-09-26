@@ -372,51 +372,63 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
     }
     */
 
-    // Reading symbol name mapping in dynstr table
-
-    uint32_t symbol_offset = 1;
-    bool sym_found = false;
-    while (symbol_offset < dynstr_size)
+    /*
+     * Walk .dynsym comparing each entry's name, rather than locating the
+     * string in .dynstr first and then matching st_name offsets against it.
+     *
+     * A string table merges strings that are suffixes of longer ones, so
+     * "open" is typically stored inside "fopen" and its st_name points into
+     * the middle of that string. Scanning .dynstr from one NUL to the next
+     * only ever yields offsets that begin a string, so every suffix-merged
+     * symbol -- open, fork, execve, connect, mprotect and plenty more in
+     * glibc -- was unresolvable.
+     */
+    size_t max_symbols = 65536;
+    if (dynstr_offset > dynsym_offset && dynsym_entry_size)
     {
-        char* symbol_name;
-        ctx.addr = dynstr_offset + symbol_offset;
-        symbol_name = vmi_read_str(vmi, &ctx);
-        if (!symbol_name)
-            return -1;
-        addr_t symbol_size = strlen(symbol_name);
-        if (strcmp(symbol_name, sym) == 0)
-        {
-            g_free(symbol_name);
-            sym_found = true;
-            break;
-        }
-        symbol_offset += symbol_size+1;
-        g_free(symbol_name);
+        // .dynsym is conventionally laid out immediately before .dynstr, so
+        // the gap between them bounds the symbol count. Falls back to the cap
+        // above for anything unusual, since nothing records the count.
+        max_symbols = (dynstr_offset - dynsym_offset) / dynsym_entry_size;
     }
 
-    if (!sym_found)
-        return -1;
-
-    // Mapping symbol name to address in dynsym table
-
-    offset = dynsym_offset;
-    while (true)
+    for (size_t i = 0; i < max_symbols; i++)
     {
-        uint32_t key;
-        ctx.addr =  offset + drakvuf->offsets[ELF64SYM_NAME];
-        if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &key))
+        addr_t entry = dynsym_offset + i * dynsym_entry_size;
+
+        uint32_t st_name;
+        ctx.addr = entry + drakvuf->offsets[ELF64SYM_NAME];
+        if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &st_name))
             return -1;
 
+        if (!st_name || (dynstr_size && st_name >= dynstr_size))
+            continue;
+
+        ctx.addr = dynstr_offset + st_name;
+        char* symbol_name = vmi_read_str(vmi, &ctx);
+        if (!symbol_name)
+            continue;
+
+        int cmp = strcmp(symbol_name, sym);
+        g_free(symbol_name);
+
+        if (cmp)
+            continue;
+
         addr_t value = 0;
-        ctx.addr =  offset + drakvuf->offsets[ELF64SYM_VALUE];
+        ctx.addr = entry + drakvuf->offsets[ELF64SYM_VALUE];
         if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &value))
             return -1;
 
-        if (key == symbol_offset)
-            return text_segment_address + value;
+        // st_value is 0 for an undefined symbol, i.e. one this object imports
+        // rather than defines. Keep looking instead of returning the base.
+        if (!value)
+            continue;
 
-        offset += dynsym_entry_size;
+        return text_segment_address + value;
     }
+
+    return -1;
 }
 
 addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib)
