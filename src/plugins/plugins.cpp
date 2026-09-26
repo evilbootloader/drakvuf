@@ -436,7 +436,7 @@ int drakvuf_plugins::start(const drakvuf_plugin_t plugin_id,
                     {
                         .so_hooks_list = options->so_hooks_list,
                         .print_no_addr = options->userhook_no_addr,
-                        .retval = options->libmon_retval
+                        .no_retval = options->libmon_no_retval
                     };
                     this->plugins[plugin_id] = std::make_unique<libmon>(this->drakvuf, &config, this->output);
                     break;

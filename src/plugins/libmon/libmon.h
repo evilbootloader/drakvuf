@@ -18,11 +18,10 @@ struct libmon_config
     const char* so_hooks_list;
     bool print_no_addr;
 
-    // Report return values. Off by default: this places and tears down a
-    // breakpoint per call, at return addresses that live in pages shared with
-    // every other process mapping the library, and that churn has been seen
-    // to destabilise the guest. Opt in knowingly.
-    bool retval;
+    // Skip return hooks. Each is a second breakpoint per call, placed and torn
+    // down as the call runs, so on a hot function the cost is real; without
+    // them ReturnValue is absent and events are reported at entry instead.
+    bool no_retval;
 };
 
 // Linux counterpart to apimon: logs calls to configured exported functions in
@@ -76,6 +75,11 @@ private:
         const plugin_target_config_entry_t& config, const std::string& so_path,
         const std::vector<uint64_t>& arguments, std::optional<uint64_t> return_value);
 
+    // Which library an address lies in, by the nearest load address at or
+    // below it. link_map gives no extents, so this is bounded by the next
+    // library up and by a sanity cap rather than known section sizes.
+    std::optional<std::string> resolve_module(vmi_pid_t pid, addr_t addr) const;
+
     // Not static, unlike function_hook_cb: this goes through the RAII hook
     // API, which binds `this` itself. Recovering the plugin by hand here
     // would reach for trap->data, which for a RAII hook holds the Params
@@ -112,11 +116,15 @@ private:
 
     std::map<vmi_pid_t, std::vector<deferred_hook>> deferred;
 
+    // Load address -> path for every library seen in a process, so an address
+    // can be attributed back to the library it lies in.
+    std::map<vmi_pid_t, std::map<addr_t, std::string>> libs;
+
     // Calls currently in flight, keyed by (pid, tid, rsp) so that recursive
     // or concurrent calls to the same function do not collide.
     std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
 
-    bool retval;
+    bool no_retval;
 
     // Held only while something is deferred; a CR3 hook fires on every
     // context switch.

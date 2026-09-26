@@ -11,7 +11,7 @@ static constexpr unsigned DEFERRED_MAX_ATTEMPTS = 1000;
 
 libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output)
     : pluginex(drakvuf, output)
-    , retval(c->retval)
+    , no_retval(c->no_retval)
 {
     load_so_hook_config(c->so_hooks_list, c->print_no_addr, this->wanted_hooks);
 
@@ -48,8 +48,35 @@ libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output
     });
 }
 
+// No library is this large, so an address further than this past a load
+// address belongs to something else entirely -- a heap or a stack that
+// happens to sit above the last library we know about.
+static constexpr addr_t MODULE_SPAN_CAP = 0x10000000;
+
+std::optional<std::string> libmon::resolve_module(vmi_pid_t pid, addr_t addr) const
+{
+    auto proc = this->libs.find(pid);
+    if (proc == this->libs.end())
+        return std::nullopt;
+
+    const auto& loaded = proc->second;
+
+    // First library loaded above addr; the one before it is the candidate.
+    auto above = loaded.upper_bound(addr);
+    if (above == loaded.begin())
+        return std::nullopt;
+
+    auto candidate = std::prev(above);
+    if (addr - candidate->first > MODULE_SPAN_CAP)
+        return std::nullopt;
+
+    return candidate->second;
+}
+
 void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so)
 {
+    this->libs[so.pid][so.base] = so.path;
+
     this->wanted_hooks.visit_hooks_for(so.path, [&](const plugin_target_config_entry_t& entry)
     {
         addr_t va;
@@ -147,9 +174,8 @@ bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
     return true;
 }
 
-// The caller must be running in this process's own context:
-// vmi_request_page_fault injects into the current vCPU, so doing this from the
-// CR3 tick would fault an address in whatever address space happens to be live.
+// Safe to call from anywhere: resolution and trap insertion both go through
+// the target's own page tables, so the process need not be the one running.
 void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid)
 {
     auto it = this->deferred.find(pid);
@@ -222,6 +248,7 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
 void libmon::on_process_reset(vmi_pid_t pid)
 {
     this->deferred.erase(pid);
+    this->libs.erase(pid);
 
     // Drop any call still in flight: its return address belongs to an address
     // space that no longer exists.
@@ -284,7 +311,7 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
     for (size_t i = 1; i <= config.argument_printers.size(); i++)
         arguments.push_back(drakvuf_get_function_argument(drakvuf, info, i));
 
-    if (!plugin->retval || config.no_retval)
+    if (plugin->no_retval || config.no_retval)
     {
         plugin->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
         return VMI_EVENT_RESPONSE_NONE;
@@ -349,11 +376,21 @@ void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     if (return_value)
         fmt_retval = fmt::Xval(*return_value);
 
+    // rip is the hooked function when reporting at entry, and the caller's
+    // return address when reporting at return -- so with return values on,
+    // FromModule names whoever made the call, as it does in apimon.
+    std::optional<fmt::Qstr<std::string>> fmt_module;
+    if (auto module = this->resolve_module(info->proc_data.pid, info->regs->rip))
+        fmt_module = fmt::Qstr(*module);
+
+    // No Function field: the output formatters already emit the trap's name
+    // as Method, and the trap is named after the function.
     fmt::print(m_output_format, "libmon", drakvuf, info,
         keyval("Event", fmt::Rstr("api_called")),
         keyval("Library", fmt::Qstr(so_path)),
-        keyval("Function", fmt::Qstr(config.function_name)),
+        keyval("CalledFrom", fmt::Xval(info->regs->rip)),
         keyval("ReturnValue", fmt_retval),
+        keyval("FromModule", fmt_module),
         keyval("Arguments", fmt_args)
     );
 }
