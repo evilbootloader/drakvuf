@@ -7,10 +7,11 @@
 #include "dl_rendezvous.hpp"
 #include "dl_rendezvous_abi.hpp"
 
-// How many context switches to keep retrying before writing a process off.
-// ld.so reaches _dl_debug_initialize() within its first few scheduling
-// slices, so anything that has not got there by now never will.
-static constexpr unsigned ARM_MAX_ATTEMPTS = 500;
+// How many ticks to keep retrying before writing a process off. The tick is
+// normally a page fault, and a process takes a few hundred of those while
+// starting up, so this has to be well clear of that to avoid giving up on a
+// heavy binary mid-start.
+static constexpr unsigned ARM_MAX_ATTEMPTS = 5000;
 
 dl_rendezvous::dl_rendezvous(drakvuf_t drakvuf)
     : pluginex(drakvuf, OUTPUT_DEFAULT)
@@ -135,14 +136,12 @@ event_response_t dl_rendezvous::finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap
     // Nothing can be armed yet. The process has not executed an instruction,
     // so none of its pages are faulted in -- a breakpoint anywhere in it
     // would fail the VA->PA translation in inject_trap() -- and r_debug,
-    // which lives in ld.so's data, is still zeroed. Retry on context
-    // switches instead.
-    if (!this->cr3_hook)
-        this->cr3_hook = createCr3Hook(&dl_rendezvous::cr3_cb);
+    // which lives in ld.so's data, is still zeroed. Retry on a tick instead.
+    this->start_arming_tick();
 
-    if (!this->cr3_hook)
+    if (!this->fault_hook && !this->cr3_hook)
     {
-        this->report(pid, "failed to install the CR3 hook needed to wait for ld.so");
+        this->report(pid, "no tick available to wait for ld.so on");
         this->procs.erase(pid);
         return VMI_EVENT_RESPONSE_NONE;
     }
@@ -153,12 +152,23 @@ event_response_t dl_rendezvous::finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap
     return VMI_EVENT_RESPONSE_NONE;
 }
 
+event_response_t dl_rendezvous::fault_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    return this->arming_tick(drakvuf, info);
+}
+
 event_response_t dl_rendezvous::cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    // Deliberately not keyed off the switched-to process: at a CR3 write
-    // `current` may still be the outgoing task. Every pending process is
-    // read through its own stored dtb instead, which works no matter who is
-    // running, so this is just a periodic retry.
+    return this->arming_tick(drakvuf, info);
+}
+
+event_response_t dl_rendezvous::arming_tick(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    // Deliberately not keyed off the current process. At a CR3 write
+    // `current` may still be the outgoing task, and a fault may well be in
+    // some unrelated process. Every pending process is read through its own
+    // stored dtb instead, which works no matter who is running, so this is
+    // purely a retry clock.
     bool pending = false;
 
     for (auto& [pid, state] : this->procs)
@@ -170,11 +180,33 @@ event_response_t dl_rendezvous::cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* i
             pending = true;
     }
 
-    // Stop paying for a hook that fires on every context switch.
     if (!pending)
-        this->cr3_hook.reset();
+        this->stop_arming_tick();
 
     return VMI_EVENT_RESPONSE_NONE;
+}
+
+void dl_rendezvous::start_arming_tick()
+{
+    if (this->fault_hook || this->cr3_hook)
+        return;
+
+    // Every user page fault, so this is expensive -- but it only runs while a
+    // process is waiting to be armed, and it collapses that wait from several
+    // context switches to the next fault the process takes, which during
+    // ld.so start-up is almost immediate.
+    this->fault_hook = createSyscallHook("handle_mm_fault", &dl_rendezvous::fault_cb);
+    if (this->fault_hook)
+        return;
+
+    PRINT_DEBUG("[DL_RENDEZVOUS] handle_mm_fault not hookable, falling back to CR3 ticks\n");
+    this->cr3_hook = createCr3Hook(&dl_rendezvous::cr3_cb);
+}
+
+void dl_rendezvous::stop_arming_tick()
+{
+    this->fault_hook.reset();
+    this->cr3_hook.reset();
 }
 
 bool dl_rendezvous::try_arm(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, process_state& state)

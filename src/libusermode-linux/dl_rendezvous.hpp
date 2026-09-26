@@ -113,9 +113,19 @@ private:
 
     // Stage two: a tick, not a real event. At finalize_exec the process has
     // not run yet, so nothing of it is paged in and no breakpoint can be
-    // placed in it at all; r_debug is likewise still zeroed. Retry on context
-    // switches until ld.so has initialised r_debug and we can read r_brk.
+    // placed in it at all; r_debug is likewise still zeroed. Retry until
+    // ld.so has initialised r_debug and we can read r_brk.
+    //
+    // Page faults are the better clock: a starting process takes a burst of
+    // them as ld.so maps and reads what it needs, which is exactly the window
+    // being waited on, so they arrive far more densely than context switches.
+    // CR3 is the fallback if handle_mm_fault cannot be hooked.
+    event_response_t fault_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
     event_response_t cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+
+    event_response_t arming_tick(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    void start_arming_tick();
+    void stop_arming_tick();
 
     // Returns true once the process is armed or has been given up on, i.e.
     // when it no longer needs retrying.
@@ -143,8 +153,9 @@ private:
     std::unique_ptr<libhook::SyscallHook> exec_hook;
     std::unique_ptr<libhook::SyscallHook> exit_hook;
 
-    // Installed only while some process still needs arming: a CR3 hook fires
-    // on every context switch, so it is far too costly to leave running.
+    // Both are installed only while some process still needs arming: each
+    // fires system-wide and is far too costly to leave running.
+    std::unique_ptr<libhook::SyscallHook> fault_hook;
     std::unique_ptr<libhook::Cr3Hook> cr3_hook;
     std::map<vmi_pid_t, process_state> procs;
 };
