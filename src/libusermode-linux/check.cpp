@@ -1,10 +1,12 @@
 #include "utils.hpp"
 #include "dl_rendezvous_abi.hpp"
+#include "ld_so_cache.hpp"
 
 // plugin_target_config_entry_t holds unique_ptr<ArgumentPrinter>, which
 // utils.hpp only forward-declares; destroying one needs the complete type.
 #include "libusermode/printers/printers.hpp"
 
+#include <array>
 #include <sstream>
 #include <string>
 
@@ -110,6 +112,150 @@ START_TEST(test_glibc_abi_offsets)
 }
 END_TEST
 
+// The ELF header of a Debian trixie /lib64/ld-linux-x86-64.so.2: ET_DYN,
+// EM_X86_64, with the fields ld_so_key() leans on filled in.
+static std::array<uint8_t, LD_SO_EHDR_SIZE> sample_ehdr()
+{
+    std::array<uint8_t, LD_SO_EHDR_SIZE> h{};
+
+    h[0] = 0x7f;
+    h[1] = 'E';
+    h[2] = 'L';
+    h[3] = 'F';
+    h[4] = 2;       // ELFCLASS64
+    h[5] = 1;       // ELFDATA2LSB
+    h[6] = 1;       // EV_CURRENT
+    h[16] = 3;      // e_type = ET_DYN
+    h[18] = 62;     // e_machine = EM_X86_64
+    h[24] = 0x40;   // e_entry = 0x1d940
+    h[25] = 0xd9;
+    h[26] = 0x01;
+    h[32] = 0x40;   // e_phoff = 0x40
+    h[40] = 0x18;   // e_shoff = 0x35918
+    h[41] = 0x59;
+    h[42] = 0x03;
+
+    return h;
+}
+
+START_TEST(test_ld_so_key_identifies_a_build)
+{
+    auto h = sample_ehdr();
+
+    const uint64_t key = ld_so_key(h.data());
+    ck_assert(key != 0);
+
+    // Stable: the same header is the same build however often it is read, and
+    // from whichever process it was read.
+    ck_assert(ld_so_key(h.data()) == key);
+
+    // e_entry differing is a different build. This is the discrimination the
+    // whole scheme rests on -- two linkers whose code differs cannot agree
+    // here -- so a collision would be a breakpoint at a wrong offset in shared
+    // text, not a missed hook.
+    auto other = h;
+    other[24] ^= 0x10;
+    ck_assert(ld_so_key(other.data()) != key);
+
+    // So is e_shoff, which moves with anything that changes the file's size.
+    other = h;
+    other[40] ^= 0x08;
+    ck_assert(ld_so_key(other.data()) != key);
+}
+END_TEST
+
+START_TEST(test_ld_so_key_rejects_unusable)
+{
+    auto h = sample_ehdr();
+
+    ck_assert(ld_so_key(nullptr) == 0);
+
+    // Not an ELF object at all: what a read of a page that is resident but is
+    // not ld.so's first page looks like.
+    auto bad = h;
+    bad[1] = 'X';
+    ck_assert(ld_so_key(bad.data()) == 0);
+
+    // 32-bit, or big-endian: v1 handles neither, and caching offsets for one
+    // would hand them to a process that cannot use them.
+    bad = h;
+    bad[4] = 1;     // ELFCLASS32
+    ck_assert(ld_so_key(bad.data()) == 0);
+
+    bad = h;
+    bad[5] = 2;     // ELFDATA2MSB
+    ck_assert(ld_so_key(bad.data()) == 0);
+
+    // ET_EXEC rather than ET_DYN: a non-PIE executable, so not an interpreter.
+    bad = h;
+    bad[16] = 2;
+    ck_assert(ld_so_key(bad.data()) == 0);
+
+    // i386 interpreter, as a 32-bit process on an x86-64 guest maps.
+    bad = h;
+    bad[18] = 3;    // EM_386
+    ck_assert(ld_so_key(bad.data()) == 0);
+
+    // All zeroes, which is what a page reads as before anything writes it.
+    std::array<uint8_t, LD_SO_EHDR_SIZE> empty{};
+    ck_assert(ld_so_key(empty.data()) == 0);
+}
+END_TEST
+
+START_TEST(test_layout_plausible)
+{
+    // Real offsets from a glibc 2.41 ld.so.
+    ck_assert(ld_so_layout_plausible(ld_so_layout{ 0x3a1e0, 0x1a2c0 }));
+
+    // Zero means the field was read before ld.so wrote it: ld.so defines both
+    // symbols itself, so neither can sit on its load address.
+    ck_assert(!ld_so_layout_plausible(ld_so_layout{ 0, 0x1a2c0 }));
+    ck_assert(!ld_so_layout_plausible(ld_so_layout{ 0x3a1e0, 0 }));
+
+    // Past the end of any linker: a pointer read out of the wrong place, or
+    // r_brk still holding something that is not an ld.so address.
+    ck_assert(!ld_so_layout_plausible(ld_so_layout{ 0x3a1e0, LD_SO_MAX_SPAN }));
+    ck_assert(!ld_so_layout_plausible(ld_so_layout{ LD_SO_MAX_SPAN + 1, 0x1a2c0 }));
+}
+END_TEST
+
+START_TEST(test_cache_learn_and_forget)
+{
+    ld_so_cache cache;
+    const uint64_t key = ld_so_key(sample_ehdr().data());
+
+    ck_assert(!cache.find(key));
+    ck_assert_int_eq(cache.size(), 0);
+
+    ck_assert(cache.learn(key, ld_so_layout{ 0x3a1e0, 0x1a2c0 }));
+    ck_assert_int_eq(cache.size(), 1);
+
+    const ld_so_layout* found = cache.find(key);
+    ck_assert(found != nullptr);
+    ck_assert(found->r_debug_off == 0x3a1e0);
+    ck_assert(found->r_brk_off == 0x1a2c0);
+
+    // Learning the same build twice reports no new build, so the counters
+    // track builds rather than how many processes were read.
+    ck_assert(!cache.learn(key, ld_so_layout{ 0x3a1e0, 0x1a2c0 }));
+    ck_assert_int_eq(cache.size(), 1);
+
+    // An unusable key and an implausible layout are both refused, so nothing
+    // is ever armed from them.
+    ck_assert(!cache.learn(0, ld_so_layout{ 0x3a1e0, 0x1a2c0 }));
+    ck_assert(!cache.learn(key + 1, ld_so_layout{ 0x3a1e0, 0 }));
+    ck_assert(!cache.find(0));
+    ck_assert(!cache.find(key + 1));
+    ck_assert_int_eq(cache.size(), 1);
+
+    // What happens when a process disproves a layout: it goes, and the next
+    // process of that build reads it again rather than inheriting it.
+    cache.forget(key);
+    ck_assert(!cache.find(key));
+    ck_assert_int_eq(cache.size(), 0);
+}
+END_TEST
+
 static Suite* so_matching_suite(void)
 {
     Suite* s = suite_create("Match shared object names");
@@ -133,10 +279,25 @@ static Suite* glibc_abi_suite(void)
     return s;
 }
 
+static Suite* ld_so_cache_suite(void)
+{
+    Suite* s = suite_create("ld.so layout cache");
+    TCase* tc_core = tcase_create("Core");
+
+    tcase_add_test(tc_core, test_ld_so_key_identifies_a_build);
+    tcase_add_test(tc_core, test_ld_so_key_rejects_unusable);
+    tcase_add_test(tc_core, test_layout_plausible);
+    tcase_add_test(tc_core, test_cache_learn_and_forget);
+    suite_add_tcase(s, tc_core);
+
+    return s;
+}
+
 int main(void)
 {
     SRunner* sr = srunner_create(so_matching_suite());
     srunner_add_suite(sr, glibc_abi_suite());
+    srunner_add_suite(sr, ld_so_cache_suite());
 
     srunner_run_all(sr, CK_NORMAL);
     int number_failed = srunner_ntests_failed(sr);

@@ -103,7 +103,7 @@
 #*************************************************************************#
 
 sources = dl_rendezvous.cpp dl_rendezvous.hpp dl_rendezvous_abi.hpp \
-          utils.cpp utils.hpp
+          ld_so_cache.hpp utils.cpp utils.hpp
 
 AM_CPPFLAGS = -I$(top_srcdir) -I$(top_srcdir)/src -I$(srcdir)
 AM_CPPFLAGS += $(CPPFLAGS)

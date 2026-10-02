@@ -5,11 +5,14 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
 #include <libdrakvuf/libdrakvuf.h>
 #include "plugins/plugins_ex.h"
+
+#include "ld_so_cache.hpp"
 
 // One shared object mapped into a guest process, as reported to consumers.
 struct so_view_t
@@ -45,9 +48,14 @@ using status_cb = std::function<void(vmi_pid_t, const char* reason)>;
 struct arming_stats
 {
     uint64_t execs = 0;         // processes taken up at exec
+    uint64_t adopted = 0;       // ... and processes already running at startup
     uint64_t armed = 0;         // ... of which reached r_debug
+    uint64_t fast_armed = 0;    // ... of which from an already-known ld.so layout
     uint64_t gave_up = 0;       // ... of which never did
     uint64_t ticks = 0;         // tick callbacks taken, i.e. VM exits caused
+    uint64_t builds = 0;        // distinct ld.so builds whose layout is known
+    uint64_t bootstrapped = 0;  // ... of which learned at startup, before any exec
+    uint64_t mismatches = 0;    // cached layouts a process's own r_brk disproved
     uint64_t installed_ns = 0;  // total time the tick was installed; debug builds only
     bool used_cr3 = false;      // fell back from page faults to CR3 writes
 };
@@ -140,6 +148,22 @@ public:
 
     void set_status_callback(status_cb on_status);
 
+    /*
+     * Take up the processes that were already running when we started, which
+     * the exec path cannot see: their finalize_exec happened before the hook
+     * existed. That includes an injected sample, since main.cpp injects at
+     * inject_cmd() and only then calls start_plugins().
+     *
+     * Everything arming needs is already true of a running process -- ld.so's
+     * pages are resident and its r_debug was initialised when it started -- so
+     * these are normally armed on the spot, with no tick and no waiting.
+     *
+     * Separate from the constructor on purpose: arming a process reports the
+     * libraries it already has, and consumers wire their callbacks up after
+     * construction, so doing this there would drop that set on the floor.
+     */
+    void adopt_running_processes(drakvuf_t drakvuf);
+
     // Snapshot of what arming has cost so far. Live while the tick is
     // installed, final once nothing is pending.
     arming_stats stats() const;
@@ -156,8 +180,16 @@ private:
         addr_t dtb = 0;             // its page tables, so we can read it while another process runs
         addr_t proc_base = 0;       // task_struct
         addr_t r_debug_va = 0;
+        addr_t r_brk_va = 0;        // the address breakpointed, kept to check the layout against
+        uint64_t ld_key = 0;        // which ld.so build this is, per ld_so_key()
+        // The frame the breakpoint went into, shared with every other process
+        // running the same ld.so.
+        addr_t trap_pa = 0;
         drakvuf_trap_t* rendezvous_trap = nullptr;  // permanent, at r_debug.r_brk
         unsigned attempts = 0;      // arming retries spent so far
+        bool verified = false;      // this process's own r_brk agrees with where it was breakpointed
+        bool needs_rearm = false;   // ... or disagreed, and the breakpoint must come back out
+        bool abandoned = false;     // given up on; stop retrying and stop reporting it
         std::map<addr_t, std::string> known_libs; // link_map base (l_addr) -> path (l_name), last known snapshot
 
         bool armed() const
@@ -166,10 +198,33 @@ private:
         }
     };
 
+    // A process known to have ld.so's pages resident, kept per build. Arming
+    // before the target has run needs somebody's page tables to translate
+    // through, and the target's own will not do.
+    struct ld_so_donor
+    {
+        addr_t proc_base = 0;
+        addr_t dtb = 0;
+        addr_t ld_base = 0;
+    };
+
+    // One breakpoint per physical frame rather than per process. Every process
+    // running a given ld.so rendezvouses in the same shared frame, and a
+    // breakpoint there is delivered for all of them whichever way it was
+    // expressed -- LOOKUP_PID resolves the VA once at insertion and injects a
+    // physical trap, it does not filter per hit. Registering one per process
+    // would therefore multiply every dlopen() in the guest by the number of
+    // processes tracked, for no extra coverage.
+    struct shared_trap
+    {
+        drakvuf_trap_t* trap = nullptr;
+        unsigned refs = 0;
+    };
+
     // Stage two: a tick, not a real event. At finalize_exec the process has
-    // not run yet, so nothing of it is paged in and no breakpoint can be
-    // placed in it at all; r_debug is likewise still zeroed. Retry until
-    // ld.so has initialised r_debug and we can read r_brk.
+    // not run yet, so nothing of it is paged in -- not even the ELF header
+    // that says which ld.so this is. Retry until that one page arrives; ld.so
+    // reads it itself while setting up its own link map, which is early.
     //
     // Page faults are the better clock: a starting process takes a burst of
     // them as ld.so maps and reads what it needs, which is exactly the window
@@ -185,6 +240,49 @@ private:
     // Returns true once the process is armed or has been given up on, i.e.
     // when it no longer needs retrying.
     bool try_arm(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, process_state& state);
+
+    // Learn where _r_debug and the rendezvous function sit in one ld.so build,
+    // by reading them out of a process that has already started. at_startup
+    // only distinguishes the bootstrap pass from a live exec for the counters.
+    bool learn_layout(drakvuf_t drakvuf, addr_t proc_base, addr_t dtb, addr_t ld_base,
+        bool at_startup);
+
+    // Read every running process's interpreter once, at startup, so the first
+    // exec of the run is armed from a cached layout like every later one
+    // instead of having to wait out ld.so to establish it.
+    void bootstrap_layouts(drakvuf_t drakvuf);
+    static void bootstrap_visitor(drakvuf_t drakvuf, addr_t process, void* visitor_ctx);
+    static void adopt_visitor(drakvuf_t drakvuf, addr_t process, void* visitor_ctx);
+
+    // The three things a task_struct has to give up before it can be tracked.
+    // False for a kernel thread, which has no mm and so no aux vector, and for
+    // a statically linked process, which has no interpreter.
+    bool read_process(drakvuf_t drakvuf, addr_t process, vmi_pid_t* pid, addr_t* dtb,
+        addr_t* ld_base);
+
+    enum class ld_key_status
+    {
+        not_resident,   // ld.so's first page has not been faulted in yet: retry
+        unusable,       // read fine, but not an x86-64 ELF64 shared object
+        ok,
+    };
+
+    // Which ld.so build is mapped at ld_base in the address space dtb
+    // describes. Waiting for this to become readable is the whole of what
+    // arming waits for once a build is known, so the two failures are worth
+    // telling apart: one is retried and the other never will be.
+    ld_key_status read_ld_key(drakvuf_t drakvuf, addr_t dtb, addr_t ld_base, uint64_t* key);
+
+    bool read_r_brk(drakvuf_t drakvuf, addr_t dtb, addr_t r_debug_va, addr_t* r_brk);
+
+    void abandon(vmi_pid_t pid, process_state& state, const char* reason);
+
+    // The frame behind an offset into ld.so: the target's own page tables if it
+    // has got that far, otherwise those of any process that has.
+    std::optional<addr_t> resolve_frame(drakvuf_t drakvuf, const process_state& state, addr_t off);
+
+    bool attach_trap(drakvuf_trap_info_t* info, process_state& state, addr_t pa);
+    void release_trap(process_state& state);
 
     // Stage three: fires at r_debug.r_brk, on every dlopen()/dlclose().
     // Registered via the legacy register_trap() API (no RAII helper exists
@@ -213,6 +311,10 @@ private:
     std::unique_ptr<libhook::SyscallHook> fault_hook;
     std::unique_ptr<libhook::Cr3Hook> cr3_hook;
     std::map<vmi_pid_t, process_state> procs;
+
+    ld_so_cache layouts;
+    std::map<uint64_t, ld_so_donor> donors;
+    std::map<addr_t, shared_trap> pa_traps;
 
     arming_stats arming;
 

@@ -51,6 +51,12 @@ libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output
             keyval("Reason", fmt::Qstr(std::string(reason)))
         );
     });
+
+    // Last, with the callbacks in place, since this reports the libraries those
+    // processes already have. It has to happen at all because an injected
+    // sample is one of them: main.cpp runs inject_cmd() before start_plugins(),
+    // so the sample's exec is over before the hook above exists.
+    this->rendezvous->adopt_running_processes(drakvuf);
 }
 
 bool libmon::stop_impl()
@@ -62,11 +68,14 @@ bool libmon::stop_impl()
         // PRINT_DEBUG compiles to nothing in a release build, which would
         // leave this set and never read.
         [[maybe_unused]] auto s = this->rendezvous->stats();
-        PRINT_DEBUG("[LIBMON] arming: %lu exec(s), %lu armed, %lu gave up, %lu tick(s) on %s,"
-            " tick installed %.3f s\n",
-            s.execs, s.armed, s.gave_up, s.ticks,
+        PRINT_DEBUG("[LIBMON] arming: %lu exec(s) + %lu adopted at startup,"
+            " %lu armed (%lu from a known ld.so layout),"
+            " %lu gave up, %lu tick(s) on %s, tick installed %.3f s\n",
+            s.execs, s.adopted, s.armed, s.fast_armed, s.gave_up, s.ticks,
             s.used_cr3 ? "CR3 writes" : "page faults",
             s.installed_ns / 1e9);
+        PRINT_DEBUG("[LIBMON] ld.so: %lu build(s) known (%lu at startup), %lu layout mismatch(es)\n",
+            s.builds, s.bootstrapped, s.mismatches);
     }
 
     return pluginex::stop_impl();

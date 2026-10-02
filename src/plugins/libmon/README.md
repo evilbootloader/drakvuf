@@ -52,13 +52,38 @@ Windows library-call monitoring is built on PE export tables and
 `NtMapViewOfSection`; neither exists here, so libmon follows glibc's
 dynamic-linker rendezvous protocol, the same mechanism gdb uses.
 
-Per process it hooks `finalize_exec`, reads `AT_BASE` from the aux vector in
-`mm_struct.saved_auxv` to find ld.so, then waits — retrying on page faults —
-until ld.so has initialised `r_debug`. It takes the rendezvous address from
-`r_debug.r_brk` and breakpoints it, so every later `dlopen`/`dlclose` is
-observed, and walks `link_map` to enumerate what is already loaded. Symbols
-are resolved in each library's own `.dynsym` at the load address the linker
-reported, and a breakpoint goes on the resolved address.
+Per process it hooks `finalize_exec` and reads `AT_BASE` from the aux vector in
+`mm_struct.saved_auxv` to find ld.so. The rendezvous address is
+`r_debug.r_brk`, and a breakpoint there observes every `dlopen`/`dlclose`, with
+`link_map` walked at each hit to see what changed. Symbols are resolved in each
+library's own `.dynsym` at the load address the linker reported, and a
+breakpoint goes on the resolved address.
+
+Both addresses that needs — `_r_debug` and `r_brk` — sit at fixed offsets from
+ld.so's load address for a given ld.so build, since ASLR moves the base and not
+the layout. So they are read once per build rather than once per process: at
+startup from a process already running, and otherwise from the first process
+seen running a build. A build is identified by hashing the 64-byte ELF header at
+its load address, which is what makes applying one build's offsets to another
+impossible — see `ld_so_cache.hpp`, since getting that wrong would put a
+breakpoint at a wrong offset in a page the whole guest executes.
+
+Processes already running when libmon starts are taken up at startup rather than
+waited for, since the `exec` path cannot see them. That is not an edge case: an
+injected sample is one of them, because `main.cpp` runs `inject_cmd()` before
+`start_plugins()`, so the sample has already `exec`'d by the time the
+`finalize_exec` hook exists. Such a process needs no waiting at all — its ld.so
+pages are long resident and its `r_debug` was filled in when it started — so it
+is armed on the spot and its current `link_map` reported.
+
+With the offsets known, a process is armed without reading its `r_debug` at
+all, so arming no longer waits for ld.so to finish starting up. It waits only
+for ld.so's first page, which ld.so reads itself — its own `e_phoff`/`e_phnum`,
+through `__ehdr_start` — while setting up its link map, a couple of page faults
+in. Arming that early means the startup `_dl_debug_state()` call that ends
+glibc's `dl_main` is itself observed, so the initial library set arrives through
+the ordinary rendezvous path rather than from a snapshot taken at whatever
+moment retrying happened to succeed.
 
 A library's extent comes from its `PT_LOAD` headers, which is what `FromModule`
 is matched against — `link_map` reports where each library starts but not where
@@ -79,9 +104,17 @@ Several points are less obvious than they look:
   and retried rather than failing. A page the target has not touched can still
   be reached if any other process has: library text is file-backed and shared,
   so the frame is found through that process and breakpointed by physical
-  address.
+  address. The rendezvous breakpoint goes in this way too — it has to, since
+  the page holding `_dl_debug_state` is one the target faults in by making the
+  very call we are trying to be in place for.
 - The breakpoint is in a page shared by every process mapping the library, so
   it fires for processes that were never hooked. Events are filtered by pid.
+  That is not a consequence of expressing it as a physical address: `LOOKUP_PID`
+  resolves the VA once when the trap goes in and injects a physical trap too, it
+  does not filter per hit. So the rendezvous breakpoint is one trap per ld.so
+  frame shared by every process using it, not one per process — otherwise each
+  `dlopen` anywhere in the guest would be multiplied by the number of processes
+  tracked.
 
 ## Limitations
 
@@ -89,11 +122,22 @@ Several points are less obvious than they look:
   and `link_map` layouts differ.
 - Statically linked binaries are invisible: no interpreter, so no `link_map`
   to observe.
-- Only processes that `exec` while libmon is running are monitored. Anything
-  already running when it starts is invisible, since the rendezvous is
-  bootstrapped from the `exec` path.
 - Hooks land a few milliseconds after `exec`. A process that does its work and
   exits inside that window is missed.
+- Every dynamic process on the guest is tracked, not just the sample, because
+  there is nothing to filter on — `link_map` gives paths, not provenance. A
+  breakpoint is one per physical frame however many processes share it, so this
+  costs no extra VM exits, but each hit dispatches one callback per process
+  hooked at that address, which all but one of them discard by pid.
+- The first process of each ld.so build still waits out ld.so, since there is
+  nothing to copy offsets from. On an ordinary guest that is once per run, and
+  only if startup found no process already running that build.
+- Two ld.so builds with byte-identical ELF headers would share cached offsets.
+  A process armed from a layout checks its own `r_debug.r_brk` against it on the
+  first hit and, on a mismatch, drops the layout and starts over — but the
+  breakpoint has been placed by then, so the check reports the collision rather
+  than preventing it. `e_entry` and `e_shoff` make it implausible, not
+  impossible.
 - A hook on a function whose page no *monitored* process has touched is not
   placed until one does; it then lands in all of them at once. Faulting the
   page in deliberately would work, but kills the monitored process: the
