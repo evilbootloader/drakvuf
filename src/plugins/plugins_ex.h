@@ -355,9 +355,11 @@ struct breakpoint_by_pid_searcher
             if (!ret_addr)
                 return nullptr;
 
+            // The return address comes from the stack of the calling thread, which maps it. A
+            // lookup by PID would pause the VM to add the trap, for every call.
             trap->type = BREAKPOINT;
-            trap->breakpoint.lookup_type = LOOKUP_PID;
-            trap->breakpoint.pid = info->trap->breakpoint.pid;
+            trap->breakpoint.lookup_type = LOOKUP_DTB;
+            trap->breakpoint.dtb = info->regs->cr3;
             trap->breakpoint.addr_type = ADDR_VA;
             trap->breakpoint.addr = ret_addr;
             trap->breakpoint.module = info->trap->breakpoint.module;
