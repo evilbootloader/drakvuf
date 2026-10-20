@@ -538,6 +538,28 @@ static bool inject_trap_io(drakvuf_t drakvuf, drakvuf_trap_t* trap)
     return 1;
 }
 
+/*
+ * Breakpoints given by physical address or found through the page tables are
+ * looked up without pausing the domain, inject_trap_pa pauses it only to arm a
+ * new breakpoint. Finding a process or module walks lists in the guest, and
+ * the other trap types change the guest right away, so those pause up front.
+ */
+static bool pause_to_add_trap(const drakvuf_trap_t* trap)
+{
+    if (trap->type != BREAKPOINT)
+        return true;
+
+    switch (trap->breakpoint.lookup_type)
+    {
+        case LOOKUP_NONE:
+        case LOOKUP_DTB:
+        case LOOKUP_KERNEL:
+            return false;
+        default:
+            return true;
+    }
+}
+
 static bool _drakvuf_add_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap)
 {
     bool ret;
@@ -557,7 +579,9 @@ static bool _drakvuf_add_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap)
         return 1;
     }
 
-    drakvuf_pause(drakvuf);
+    bool paused = pause_to_add_trap(trap);
+    if (paused)
+        drakvuf_pause(drakvuf);
 
     switch (trap->type)
     {
@@ -588,7 +612,8 @@ static bool _drakvuf_add_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap)
             break;
     }
 
-    drakvuf_resume(drakvuf);
+    if (paused)
+        drakvuf_resume(drakvuf);
     return ret;
 }
 

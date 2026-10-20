@@ -1346,15 +1346,21 @@ void remove_trap(drakvuf_t drakvuf,
             g_hash_table_remove(drakvuf->breakpoint_lookup_trap, trap);
             container->traps = g_slist_remove(container->traps, trap);
 
-            /* Update list of traps on this gfn */
+            /*
+             * The list of breakpoints on this gfn holds each breakpoint once,
+             * it stays listed until its last trap is removed.
+             */
             GSList* traps_on_gfn = (GSList*)g_hash_table_lookup(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(current_gfn));
-            traps_on_gfn = g_slist_remove(traps_on_gfn, GSIZE_TO_POINTER(container->breakpoint.pa));
-            g_hash_table_remove(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(current_gfn));
-
-            if ( traps_on_gfn )
+            if (!container->traps)
             {
-                // the list head may change so we force a reinsert
-                g_hash_table_insert(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(current_gfn), traps_on_gfn);
+                traps_on_gfn = g_slist_remove(traps_on_gfn, GSIZE_TO_POINTER(container->breakpoint.pa));
+                g_hash_table_remove(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(current_gfn));
+
+                if ( traps_on_gfn )
+                {
+                    // the list head may change so we force a reinsert
+                    g_hash_table_insert(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(current_gfn), traps_on_gfn);
+                }
             }
 
             if (!container->traps)
@@ -1596,37 +1602,19 @@ bool inject_trap_mem(drakvuf_t drakvuf, drakvuf_trap_t* trap, bool guard2)
     return 1;
 }
 
-bool inject_trap_pa(drakvuf_t drakvuf,
+/*
+ * Set up the first trap on a breakpoint: the shadow copy of the page, its
+ * mapping in the altp2m views, the breakpoint instruction and the guard traps.
+ * Call with the domain paused.
+ */
+static bool arm_trap_pa(drakvuf_t drakvuf,
     drakvuf_trap_t* trap,
     addr_t pa)
 {
-    trap->last_ttl_rst = time(NULL);
-
-    // check if already marked
     vmi_instance_t vmi = drakvuf->vmi;
     xen_pfn_t current_gfn = pa >> 12;
-    struct wrapper* container = (struct wrapper*)g_hash_table_lookup(drakvuf->breakpoint_lookup_pa,
-            GSIZE_TO_POINTER(pa));
 
-    if (container)
-    {
-        g_hash_table_insert(drakvuf->breakpoint_lookup_trap,
-            trap,
-            container);
-        container->traps = g_slist_prepend(container->traps, trap);
-
-        GSList* traps = (GSList*)g_hash_table_lookup(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(current_gfn));
-        traps = g_slist_append(traps, GSIZE_TO_POINTER(container->breakpoint.pa));
-
-        /* this should never happen but at least it makes some static analyzers happy */
-        if ( 1 == g_slist_length(traps) )
-            g_hash_table_insert(drakvuf->breakpoint_lookup_gfn,
-                GSIZE_TO_POINTER(current_gfn), traps);
-
-        return 1;
-    }
-
-    container = (struct wrapper*)g_slice_alloc0(sizeof(struct wrapper));
+    struct wrapper* container = (struct wrapper*)g_slice_alloc0(sizeof(struct wrapper));
     if ( !container )
         return 0;
 
@@ -1808,6 +1796,47 @@ err_exit:
         g_hash_table_remove(drakvuf->remapped_gfns, GSIZE_TO_POINTER(remapped_gfn->o));
     g_slice_free(struct wrapper, container);
     return 0;
+}
+
+/*
+ * Call with the VMI lock held, so the breakpoint can't be removed between
+ * looking it up and adding the trap to it.
+ */
+bool inject_trap_pa(drakvuf_t drakvuf,
+    drakvuf_trap_t* trap,
+    addr_t pa)
+{
+    trap->last_ttl_rst = time(NULL);
+
+    // check if already marked
+    struct wrapper* container = (struct wrapper*)g_hash_table_lookup(drakvuf->breakpoint_lookup_pa,
+            GSIZE_TO_POINTER(pa));
+
+    /*
+     * Adding a trap to a breakpoint that is already in memory only changes our
+     * own tables, the guest doesn't see a difference, so it doesn't need to be
+     * paused. This is the common case for syscall return traps.
+     */
+    if (container)
+    {
+        g_hash_table_insert(drakvuf->breakpoint_lookup_trap,
+            trap,
+            container);
+        container->traps = g_slist_prepend(container->traps, trap);
+
+        // The breakpoint is on the list of its gfn since it was armed
+        return 1;
+    }
+
+    /*
+     * Arming a new breakpoint changes the guest in several steps, no vCPU may
+     * run in between. Domain pauses nest, the caller may have paused already.
+     */
+    drakvuf_pause(drakvuf);
+    bool ret = arm_trap_pa(drakvuf, trap, pa);
+    drakvuf_resume(drakvuf);
+
+    return ret;
 }
 
 bool inject_trap(drakvuf_t drakvuf,
