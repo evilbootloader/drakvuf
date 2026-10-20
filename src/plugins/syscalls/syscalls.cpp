@@ -104,6 +104,8 @@
 
 #include <glib.h>
 #include <inttypes.h>
+#include <algorithm>
+#include <cstring>
 #include <libvmi/libvmi.h>
 #include <assert.h>
 #include <string>
@@ -197,7 +199,7 @@ uint64_t syscalls_base::transform_value(drakvuf_t drakvuf, drakvuf_trap_info_t* 
 {
     if ((arg.type == PPVOID) && val)
     {
-        auto vmi = vmi_lock_guard(drakvuf);
+        auto vmi = vmi_reader_guard(drakvuf);
         ACCESS_CONTEXT(ctx,
             .translate_mechanism = VMI_TM_PROCESS_DTB,
             .dtb = info->regs->cr3,
@@ -215,6 +217,32 @@ uint64_t syscalls_base::transform_value(drakvuf_t drakvuf, drakvuf_trap_info_t* 
         val = _val;
     }
     return mask_value(arg, val);
+}
+
+// Return breakpoint of sysret mode kernel, shared by all calls returning through it
+void syscalls_base::kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call)
+{
+    // Print the name and module of this call like the per-call return trap does
+    drakvuf_trap_t trap = *info->trap;
+    trap.name = call.name;
+    trap.breakpoint.module = call.module;
+    drakvuf_trap_info_t ret_info = *info;
+    ret_info.trap = &trap;
+
+    this->print_kernel_sysret(drakvuf, &ret_info, call.num);
+}
+
+// The call returns to ret_addr, the caller of the hooked function
+bool syscalls_base::track_syscall_return(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t ret_addr,
+    uint16_t num, const char* module, const char* name)
+{
+    return return_track_result::tracked ==
+        this->sysret_tracker.track(drakvuf, info, ret_addr, pending_syscall{ num, module, name });
+}
+
+void syscalls_base::forget_process_syscalls(vmi_pid_t pid)
+{
+    this->sysret_tracker.forget_process(pid);
 }
 
 static std::string rstrip(std::string s)
@@ -245,13 +273,30 @@ bool syscalls_base::read_syscalls_filter(const char* filter_file)
 }
 
 
-syscalls_base::syscalls_base(drakvuf_t drakvuf, const syscalls_config* config, output_format_t output) : pluginex(drakvuf, output)
+syscalls_base::syscalls_base(drakvuf_t drakvuf, const syscalls_config* config, output_format_t output)
+    : pluginex(drakvuf, output)
+    , sysret_tracker(*this, return_tracker_mode::kernel, "sysret",
+          [this](drakvuf_t drakvuf_, drakvuf_trap_info_t* info, pending_syscall& call)
+{
+    this->kernel_sysret(drakvuf_, info, call);
+})
 {
     this->os = drakvuf_get_os_type(drakvuf);
     this->kernel_base = drakvuf_get_kernel_base(drakvuf);
     this->register_size = drakvuf_get_address_width(drakvuf); // 4 or 8 (bytes)
     this->is32bit = (drakvuf_get_page_mode(drakvuf) != VMI_PM_IA32E);
     this->disable_sysret = config->disable_sysret;
+
+    const char* mode = config->sysret_mode ?: "kernel";
+    if (!strcmp(mode, "per-call"))
+        this->sysret_mode = sysret_mode_t::PER_CALL;
+    else if (!strcmp(mode, "kernel"))
+        this->sysret_mode = sysret_mode_t::KERNEL;
+    else
+    {
+        fprintf(stderr, "[SYSCALLS] Unknown sysret mode '%s', use per-call or kernel\n", mode);
+        throw -1;
+    }
 
     if (config->syscalls_filter_file && !this->read_syscalls_filter(config->syscalls_filter_file))
         throw -1;
