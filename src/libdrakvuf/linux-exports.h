@@ -111,6 +111,11 @@ addr_t linux_eprocess_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, const char
 
 addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base, const char* sym);
 
+bool linux_module_syms2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base,
+    const char* const* syms, size_t count, addr_t* vas);
+
+size_t linux_module_build_id(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base, uint8_t* id, size_t size);
+
 addr_t linux_module_span(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base);
 
 addr_t linux_get_auxv_value(drakvuf_t drakvuf, addr_t eprocess_base, uint64_t type);

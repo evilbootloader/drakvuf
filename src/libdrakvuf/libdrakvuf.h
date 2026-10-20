@@ -696,9 +696,25 @@ addr_t drakvuf_export_lib_address(drakvuf_t drakvuf, addr_t process_addr, const 
  * against a real range. The dynamic linker reports each library's base but no
  * extent, and guessing one from the next library up claims every anonymous
  * mapping between them.
+ *
+ * drakvuf_exportsyms_to_va_at_base resolves several symbols in one pass over
+ * the symbol table, which drakvuf_exportsym_to_va_at_base reads once per
+ * symbol: vas[i] is the address of syms[i], 0 if the module doesn't define it.
+ * Returns false if the tables could not be read, with the addresses found
+ * until then set.
+ *
+ * drakvuf_get_module_build_id copies the module's GNU build ID, which tells
+ * whether two mappings are of the same file, into id: returns its length, 0
+ * if there is none, it can't be read or is longer than size.
  */
 addr_t drakvuf_exportsym_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr,
     addr_t module_base, const char* sym) NOEXCEPT;
+
+bool drakvuf_exportsyms_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base,
+    const char* const* syms, size_t count, addr_t* vas) NOEXCEPT;
+
+size_t drakvuf_get_module_build_id(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base,
+    uint8_t* id, size_t size) NOEXCEPT;
 
 addr_t drakvuf_get_auxv_value(drakvuf_t drakvuf, addr_t process_addr, uint64_t type) NOEXCEPT;
 

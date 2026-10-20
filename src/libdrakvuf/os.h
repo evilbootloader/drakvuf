@@ -218,6 +218,13 @@ typedef struct os_interface
     addr_t (*module_span)
     (drakvuf_t drakvuf, addr_t process_addr, addr_t module_base);
 
+    /* Linux only: several symbols in one pass, and the module's GNU build ID */
+    bool (*exportsyms_to_va_at_base)
+    (drakvuf_t drakvuf, addr_t process_addr, addr_t module_base, const char* const* syms, size_t count, addr_t* vas);
+
+    size_t (*module_build_id)
+    (drakvuf_t drakvuf, addr_t process_addr, addr_t module_base, uint8_t* id, size_t size);
+
     bool (*get_process_ppid)
     (drakvuf_t drakvuf, addr_t process_base, vmi_pid_t* ppid);
 
