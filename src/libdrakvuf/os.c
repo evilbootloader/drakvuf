@@ -233,7 +233,7 @@ addr_t drakvuf_get_current_process(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     {
         drakvuf_lock_and_get_vmi(drakvuf);
         ret = drakvuf->osi.get_current_process(drakvuf, info);
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_release_vmi(drakvuf);
     }
 
     return ret;
@@ -643,7 +643,7 @@ bool drakvuf_find_process(drakvuf_t drakvuf, vmi_pid_t find_pid, const char* fin
     {
         drakvuf_lock_and_get_vmi(drakvuf);
         ret = drakvuf->osi.find_process(drakvuf, find_pid, find_procname, process_addr);
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_release_vmi(drakvuf);
     }
 
     return ret;
@@ -786,6 +786,7 @@ bool drakvuf_get_process_ppid(drakvuf_t drakvuf, addr_t process_base, vmi_pid_t*
     {
         drakvuf_lock_and_get_vmi(drakvuf);
         ret = drakvuf->osi.get_process_ppid( drakvuf, process_base, ppid );
+        drakvuf_release_vmi(drakvuf);
     }
 
     return ret;
@@ -797,6 +798,7 @@ bool drakvuf_get_process_data_priv(drakvuf_t drakvuf, addr_t process_base, proc_
 
     if ( drakvuf->osi.get_process_data )
     {
+        drakvuf_lock_and_get_vmi(drakvuf);
         ret = drakvuf->osi.get_process_data( drakvuf, process_base, proc_data );
         drakvuf_release_vmi(drakvuf);
     }
