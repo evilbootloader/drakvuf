@@ -276,6 +276,7 @@ struct drakvuf
     bool vmi_response_set_registers[MAX_DRAKVUF_VCPU];
     x86_registers_t regs_modified[MAX_DRAKVUF_VCPU];
     GHashTable* injections_in_progress; // key: <pid:tid>
+    gint injections_count; // entries in injections_in_progress, read without the VMI lock
     bool enable_active_callback_check;
 
     /*

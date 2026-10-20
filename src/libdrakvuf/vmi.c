@@ -719,6 +719,7 @@ struct trap_snapshot
     drakvuf_trap_t** traps;
     size_t count;
     size_t catchall; // the first traps are catchall breakpoints
+    bool limited_ttl; // a trap after the catchall ones has a TTL, which takes the VMI lock to count down
     drakvuf_trap_t* inline_traps[16];
 };
 
@@ -742,10 +743,17 @@ static void trap_snapshot_take(drakvuf_t drakvuf, struct wrapper* s, struct trap
             snapshot->traps[snapshot->count++] = loop->data;
 
     snapshot->catchall = snapshot->count;
+    snapshot->limited_ttl = false;
 
     for (GSList* loop = s->traps; loop; loop = loop->next)
-        if ( !trap_is_removed(loop->data) )
-            snapshot->traps[snapshot->count++] = loop->data;
+    {
+        drakvuf_trap_t* trap = loop->data;
+        if ( trap_is_removed(trap) )
+            continue;
+        snapshot->traps[snapshot->count++] = trap;
+        if ( trap->ttl != UNLIMITED_TTL )
+            snapshot->limited_ttl = true;
+    }
 }
 
 static void trap_snapshot_free(struct trap_snapshot* snapshot)
@@ -907,29 +915,32 @@ static event_response_t _int3_cb(drakvuf_t drakvuf, vmi_event_t* event)
         // Iterate over traps updating ttl. The same trap may be hit on other vCPUs.
         size_t expired = 0;
 
-        time_t cur_time = time(NULL);
-
-        drakvuf_lock_and_get_vmi(drakvuf);
-        for (size_t i = snapshot.catchall; i < snapshot.count; i++)
+        if (snapshot.limited_ttl)
         {
-            drakvuf_trap_t* trap = snapshot.traps[i];
-            if (trap->ttl == UNLIMITED_TTL || trap_is_removed(trap))
-                continue;
+            time_t cur_time = time(NULL);
 
-            if (cur_time - trap->last_ttl_rst >= TRAP_TTL_RESET_INTERVAL_SEC)
+            drakvuf_lock_and_get_vmi(drakvuf);
+            for (size_t i = snapshot.catchall; i < snapshot.count; i++)
             {
-                trap->last_ttl_rst = cur_time;
-                trap->ttl = drakvuf_get_limited_traps_ttl(drakvuf);
-            }
+                drakvuf_trap_t* trap = snapshot.traps[i];
+                if (trap->ttl == UNLIMITED_TTL || trap_is_removed(trap))
+                    continue;
 
-            if (--trap->ttl == 0)
-            {
-                trap->ttl = drakvuf_get_limited_traps_ttl(drakvuf);
-                // Reuse the snapshot, we are done with the earlier entries
-                snapshot.traps[expired++] = trap;
+                if (cur_time - trap->last_ttl_rst >= TRAP_TTL_RESET_INTERVAL_SEC)
+                {
+                    trap->last_ttl_rst = cur_time;
+                    trap->ttl = drakvuf_get_limited_traps_ttl(drakvuf);
+                }
+
+                if (--trap->ttl == 0)
+                {
+                    trap->ttl = drakvuf_get_limited_traps_ttl(drakvuf);
+                    // Reuse the snapshot, we are done with the earlier entries
+                    snapshot.traps[expired++] = trap;
+                }
             }
+            drakvuf_release_vmi(drakvuf);
         }
-        drakvuf_release_vmi(drakvuf);
 
         for (size_t i = 0; i < expired; i++)
             run_trap_ah_cb(drakvuf, snapshot.traps[i]);

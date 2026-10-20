@@ -1326,23 +1326,17 @@ bool drakvuf_is_active_callback(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     if (info->trap->cb_force)
         return true;
 
-    drakvuf_lock_and_get_vmi(drakvuf);
+    // Active callback check disabled, or no injection in progress: run any
+    // callback. Runs for every trap hit, so this is checked without the lock.
+    // An injection of this thread was added by an earlier callback of it.
+    if (!drakvuf->enable_active_callback_check || !g_atomic_int_get(&drakvuf->injections_count))
+        return true;
+
     void const* const injection_trap = drakvuf_lookup_injection(drakvuf, info);
-    drakvuf_release_vmi(drakvuf);
 
-    bool res = false;
-    if (!drakvuf->enable_active_callback_check)
-        // Active callback check disabled. Run any callback.
-        res = true;
-    else if (injection_trap == NULL)
-        // No callback found for the "info". Thus no injection. Run any callback.
-        res = true;
-    else if ( injection_trap == info->trap )
-        // Callback is found. Thus this is injection. Run only a callback for
-        // the injection.
-        res = true;
-
-    return res;
+    // No callback found for the "info", thus no injection: run any callback.
+    // Otherwise this is an injection, run only the callback for it.
+    return injection_trap == NULL || injection_trap == info->trap;
 }
 
 void* drakvuf_lookup_injection(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
@@ -1369,6 +1363,7 @@ void drakvuf_insert_injection(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     drakvuf_lock_and_get_vmi(drakvuf);
 
     g_assert(g_hash_table_insert(drakvuf->injections_in_progress, key, info->trap));
+    g_atomic_int_set(&drakvuf->injections_count, g_hash_table_size(drakvuf->injections_in_progress));
 
     drakvuf_release_vmi(drakvuf);
 }
@@ -1385,6 +1380,7 @@ void drakvuf_remove_injection(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     {
         if (!g_hash_table_remove(drakvuf->injections_in_progress, key))
             PRINT_DEBUG("drakvuf_remove_injection: failed to remove from hash table\n");
+        g_atomic_int_set(&drakvuf->injections_count, g_hash_table_size(drakvuf->injections_in_progress));
     }
 
     drakvuf_release_vmi(drakvuf);
