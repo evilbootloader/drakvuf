@@ -1,9 +1,12 @@
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 
 #include <libdrakvuf/libdrakvuf.h>
 
 #include "libmon.h"
 #include "plugins/output_format.h"
+#include "plugins/helpers/vmi_lock_guard.h"
 #include "libusermode/printers/printers.hpp"
 
 // How many times to retry a hook whose page was cold before writing it off.
@@ -11,8 +14,50 @@
 // exists to bound the list rather than to ration anything expensive.
 static constexpr unsigned DEFERRED_MAX_ATTEMPTS = 1000;
 
+// Deferred hooks retried per CR3 tick and per hook hit. The tick is every
+// context switch and stalls all vCPUs while it runs, so it works through a
+// long list in turns rather than all of it each time.
+static constexpr unsigned DEFERRED_TICK_BUDGET = 64;
+static constexpr unsigned DEFERRED_HIT_BUDGET = 16;
+
+// How often the retries look up symbols of a process whose symbol table could
+// not be read: that reads the whole table.
+static constexpr gint64 RESOLVE_INTERVAL_US = 50 * 1000;
+
+// resolve_symbols(): the library doesn't define the symbol
+static constexpr addr_t SYMBOL_ABSENT = ~(addr_t)0;
+
+// Aux vector entry with the address of the executable's program headers
+static constexpr uint64_t AUXV_AT_PHDR = 3;
+
+/*
+ * The guest changes page tables under us: a fork makes the stack copy-on-write,
+ * and the kernel moves pages. A translation cached by an earlier event can then
+ * point at a frame the process no longer uses, and reading [rsp] or an argument
+ * through it returns old data. Drop the process's translations before reading
+ * its memory, in the vCPU's reader instance and in the main one, which the
+ * argument printers read through.
+ */
+static void flush_translations(drakvuf_t drakvuf, addr_t dtb)
+{
+    {
+        vmi_reader_guard vmi(drakvuf);
+        vmi_v2pcache_flush(vmi, dtb);
+    }
+    vmi_lock_guard vmi(drakvuf);
+    vmi_v2pcache_flush(vmi, dtb);
+}
+
 libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output)
     : pluginex(drakvuf, output)
+    , returns(*this, return_tracker_mode::user, "libmon return",
+          [this](drakvuf_t drakvuf_, drakvuf_trap_info_t* info, pending_call& call)
+{
+    flush_translations(drakvuf_, info->regs->cr3);
+    this->print_call(drakvuf_, info, *call.config, call.so_path, call.arguments, info->regs->rax);
+},
+// Serialized like the other callbacks of libmon, which share its state
+false)
     , no_retval(c->no_retval)
 {
     load_so_hook_config(c->so_hooks_list, c->print_no_addr, this->wanted_hooks);
@@ -76,6 +121,9 @@ bool libmon::stop_impl()
             s.installed_ns / 1e9);
         PRINT_DEBUG("[LIBMON] ld.so: %lu build(s) known (%lu at startup), %lu layout mismatch(es)\n",
             s.builds, s.bootstrapped, s.mismatches);
+#ifdef DRAKVUF_DEBUG
+        this->print_return_pages();
+#endif
     }
 
     return pluginex::stop_impl();
@@ -90,61 +138,367 @@ std::optional<std::string> libmon::resolve_module(vmi_pid_t pid, addr_t addr) co
     return resolve_module_in(proc->second.loaded, addr);
 }
 
+#ifdef DRAKVUF_DEBUG
+void libmon::count_return_page(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t ret_addr, bool transient)
+{
+    addr_t pa = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        if (VMI_SUCCESS != vmi_pagetable_lookup(vmi, info->regs->cr3, ret_addr, &pa))
+            return;
+    }
+
+    auto [page, added] = this->return_pages.try_emplace(pa >> 12);
+    if (added)
+    {
+        vmi_pid_t pid = info->proc_data.pid;
+        std::string where = "anonymous";
+        auto proc = this->libs.find(pid);
+        if (auto module = this->resolve_module(pid, ret_addr))
+            where = *module;
+        else if (proc != this->libs.end() && ret_addr >= proc->second.exe_start && ret_addr < proc->second.exe_end)
+            where = "executable";
+
+        const char* name = info->proc_data.name;
+        page->second = return_page{ pid, ret_addr, where + " (" + (name ? name : "?") + ")", transient, 0 };
+    }
+    page->second.calls++;
+}
+
+// The first ones in detail, all of them counted, on stderr with the trap statistics
+void libmon::log_refused_return(drakvuf_trap_info_t* info, const hooked_function& target, addr_t ret_addr)
+{
+    uint64_t& count = this->refused_returns[target.so_path + "!" + target.config->function_name];
+    uint64_t total = 0;
+    for (const auto& [function, calls] : this->refused_returns)
+        total += calls;
+    count++;
+
+    if (total >= 30)
+        return;
+
+    const x86_registers_t* regs = info->regs;
+    vmi_pid_t pid = info->proc_data.pid;
+
+    fprintf(stderr, "[TRAP-STATS] libmon refused return: pid %d tid %d %s, %s!%s hooked at 0x%" PRIx64
+        " (base 0x%" PRIx64 "), rip 0x%" PRIx64 " rsp 0x%" PRIx64 " [rsp] 0x%" PRIx64 " cr3 0x%" PRIx64 "\n",
+        pid, info->proc_data.tid, info->proc_data.name ? info->proc_data.name : "?",
+        target.so_path.c_str(), target.config->function_name.c_str(), (uint64_t)target.va,
+        (uint64_t)target.so_base, (uint64_t)regs->rip, (uint64_t)regs->rsp, (uint64_t)ret_addr, (uint64_t)regs->cr3);
+    fprintf(stderr, "[TRAP-STATS]   rax 0x%" PRIx64 " rbx 0x%" PRIx64 " rcx 0x%" PRIx64 " rdx 0x%" PRIx64
+        " rsi 0x%" PRIx64 " rdi 0x%" PRIx64 " rbp 0x%" PRIx64 "\n",
+        (uint64_t)regs->rax, (uint64_t)regs->rbx, (uint64_t)regs->rcx, (uint64_t)regs->rdx,
+        (uint64_t)regs->rsi, (uint64_t)regs->rdi, (uint64_t)regs->rbp);
+    fprintf(stderr, "[TRAP-STATS]   r8 0x%" PRIx64 " r9 0x%" PRIx64 " r10 0x%" PRIx64 " r11 0x%" PRIx64
+        " r12 0x%" PRIx64 " r13 0x%" PRIx64 " r14 0x%" PRIx64 " r15 0x%" PRIx64 " rflags 0x%" PRIx64 "\n",
+        (uint64_t)regs->r8, (uint64_t)regs->r9, (uint64_t)regs->r10, (uint64_t)regs->r11,
+        (uint64_t)regs->r12, (uint64_t)regs->r13, (uint64_t)regs->r14, (uint64_t)regs->r15, (uint64_t)regs->rflags);
+
+    // [rsp] again through the same API, and through a fresh page walk and the physical page
+    addr_t again = drakvuf_get_function_return_address(this->drakvuf, info);
+
+    fprintf(stderr, "[TRAP-STATS]   at the start of the hook callback: event %" PRIu64 " rsp 0x%" PRIx64
+        " [rsp] 0x%" PRIx64 ", now: event %" PRIu64 " rsp 0x%" PRIx64 "\n",
+        this->hit_uid, (uint64_t)this->hit_rsp, (uint64_t)this->hit_ret, info->event_uid, (uint64_t)regs->rsp);
+
+    // The vCPU's registers now: the same as the event's while it waits for the response
+    {
+        vmi_lock_guard main(this->drakvuf);
+        uint64_t live_rip = 0, live_rsp = 0;
+        vmi_get_vcpureg(main, &live_rip, RIP, info->vcpu);
+        vmi_get_vcpureg(main, &live_rsp, RSP, info->vcpu);
+        fprintf(stderr, "[TRAP-STATS]   vCPU %u now: rip 0x%" PRIx64 " rsp 0x%" PRIx64 "%s\n", info->vcpu,
+            live_rip, live_rsp, live_rip == regs->rip && live_rsp == regs->rsp ? " (paused at the event)" : " (moved on)");
+    }
+
+    vmi_reader_guard vmi(this->drakvuf);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = regs->cr3);
+
+    addr_t cached_pa = 0, walked_pa = 0, physical = 0;
+    vmi_pagetable_lookup(vmi, regs->cr3, regs->rsp, &cached_pa);
+    page_info_t stack_page = {};
+    if (VMI_SUCCESS == vmi_pagetable_lookup_extended(vmi, regs->cr3, regs->rsp, &stack_page))
+    {
+        walked_pa = stack_page.paddr;
+        vmi_read_addr_pa(vmi, walked_pa, &physical);
+    }
+    addr_t after_walk = 0;
+    ctx.addr = regs->rsp;
+    vmi_read_addr(vmi, &ctx, &after_walk);
+    unsigned int breakpoints = 0;
+    bool remapped = walked_pa && drakvuf_debug_gfn_remapped(this->drakvuf, walked_pa >> 12, &breakpoints);
+    fprintf(stderr, "[TRAP-STATS]   stack frame 0x%" PRIx64 ": %s by drakvuf, %u breakpoint(s) on it\n",
+        (uint64_t)(walked_pa >> 12), remapped ? "remapped" : "not remapped", breakpoints);
+    fprintf(stderr, "[TRAP-STATS]   [rsp] again 0x%" PRIx64 ", stack page cached pa 0x%" PRIx64
+        " walked pa 0x%" PRIx64 ", [rsp] by walked pa 0x%" PRIx64 ", [rsp] after the walk 0x%" PRIx64
+        ", reader %p main %p\n",
+        (uint64_t)again, (uint64_t)cached_pa, (uint64_t)walked_pa, (uint64_t)physical, (uint64_t)after_walk,
+        (void*)(vmi_instance_t)vmi, (void*)drakvuf_lock_and_get_vmi(this->drakvuf));
+    drakvuf_release_vmi(this->drakvuf);
+
+    // Executable: no level of the page tables sets NX
+    auto executable = [&](addr_t va)
+    {
+        page_info_t page = {};
+        if (VMI_SUCCESS != vmi_pagetable_lookup_extended(vmi, regs->cr3, va, &page))
+            return false;
+        addr_t levels = page.x86_ia32e.pml4e_value | page.x86_ia32e.pdpte_value |
+            page.x86_ia32e.pgd_value | page.x86_ia32e.pte_value;
+        return !VMI_GET_BIT(levels, 63);
+    };
+
+    // A return address follows the call that pushed it: call rel32 (e8), call [rip+disp32]
+    // (ff 15), call reg (ff d0-d7, 41 ff d0-d7), call [reg+disp8] (ff 50-57 xx), call [reg+disp32]
+    auto after_call = [&](addr_t va) -> const char*
+    {
+        uint8_t code[8];
+        ctx.addr = va - sizeof(code);
+        if (VMI_SUCCESS != vmi_read(vmi, &ctx, sizeof(code), code, nullptr))
+            return "";
+        if (code[3] == 0xe8)
+            return " after call rel32";
+        if (code[2] == 0xff && code[3] == 0x15)
+            return " after call [rip+disp32]";
+        if (code[6] == 0xff && code[7] >= 0xd0 && code[7] <= 0xd7)
+            return " after call reg";
+        if (code[5] == 0xff && code[6] >= 0x50 && code[6] <= 0x57)
+            return " after call [reg+disp8]";
+        if (code[2] == 0xff && code[3] >= 0x90 && code[3] <= 0x97)
+            return " after call [reg+disp32]";
+        if (code[4] == 0xff && code[5] == 0x14)
+            return " after call [sib]";
+        return "";
+    };
+
+    for (int i = -8; i < 24; i++)
+    {
+        addr_t slot = regs->rsp + i * 8;
+        addr_t value = 0;
+        ctx.addr = slot;
+        if (VMI_SUCCESS != vmi_read_addr(vmi, &ctx, &value))
+        {
+            fprintf(stderr, "[TRAP-STATS]   rsp%+4d 0x%" PRIx64 ": unreadable\n", i * 8, (uint64_t)slot);
+            continue;
+        }
+
+        std::string what;
+        if (value >= 0x1000 && value < 0x800000000000ULL && executable(value))
+        {
+            auto proc = this->libs.find(pid);
+            if (auto module = this->resolve_module(pid, value))
+                what = " code in " + *module;
+            else if (proc != this->libs.end() && value >= proc->second.exe_start && value < proc->second.exe_end)
+                what = " code in the executable";
+            else
+                what = " code, anonymous";
+            what += after_call(value);
+        }
+        fprintf(stderr, "[TRAP-STATS]   rsp%+4d 0x%" PRIx64 ": 0x%016" PRIx64 "%s\n",
+            i * 8, (uint64_t)slot, (uint64_t)value, what.c_str());
+    }
+}
+
+// On stderr with the trap statistics, which name the same pages
+void libmon::print_return_pages() const
+{
+    fprintf(stderr, "[TRAP-STATS] libmon refused returns, [rsp] not executable:%s\n",
+        this->refused_returns.empty() ? " none" : "");
+    for (const auto& [function, calls] : this->refused_returns)
+        fprintf(stderr, "[TRAP-STATS] %10" PRIu64 "  %s\n", calls, function.c_str());
+
+    std::vector<std::pair<addr_t, const return_page*>> pages;
+    for (const auto& [page, info] : this->return_pages)
+        pages.emplace_back(page, &info);
+    std::sort(pages.begin(), pages.end(), [](const auto& a, const auto& b)
+    {
+        return a.second->calls > b.second->calls;
+    });
+
+    size_t transient = std::count_if(pages.begin(), pages.end(), [](const auto& page)
+    {
+        return page.second->transient;
+    });
+    fprintf(stderr, "[TRAP-STATS] libmon return pages: %zu, %zu of them transient (outside mapped files)\n",
+        pages.size(), transient);
+    fprintf(stderr, "[TRAP-STATS] %-16s %10s %-9s %7s %-18s  %s\n", "page", "calls", "transient", "pid", "address", "in");
+    for (size_t i = 0; i < pages.size(); i++)
+    {
+        const auto& [page, info] = pages[i];
+        fprintf(stderr, "[TRAP-STATS] 0x%-14" PRIx64 " %10" PRIu64 " %-9s %7d 0x%-16" PRIx64 "  %s\n",
+            (uint64_t)(page << 12), info->calls, info->transient ? "yes" : "no", info->pid,
+            (uint64_t)info->va, info->where.c_str());
+    }
+}
+#endif
+
+bool libmon::in_mapped_file(vmi_pid_t pid, addr_t addr) const
+{
+    auto proc = this->libs.find(pid);
+    if (proc == this->libs.end())
+        return false;
+
+    if (addr >= proc->second.exe_start && addr < proc->second.exe_end)
+        return true;
+
+    return resolve_module_in(proc->second.loaded, addr).has_value();
+}
+
+std::string libmon::read_build_id(drakvuf_t drakvuf, addr_t proc_base, addr_t so_base)
+{
+    uint8_t id[64];
+    size_t length = drakvuf_get_module_build_id(drakvuf, proc_base, so_base, id, sizeof(id));
+
+    std::string hex;
+    hex.reserve(length * 2);
+    for (size_t i = 0; i < length; i++)
+    {
+        char byte[3];
+        snprintf(byte, sizeof(byte), "%02x", id[i]);
+        hex += byte;
+    }
+    return hex;
+}
+
+std::vector<addr_t> libmon::resolve_symbols(drakvuf_t drakvuf, addr_t proc_base, addr_t so_base,
+    const std::string& build_id, const std::vector<const plugin_target_config_entry_t*>& entries)
+{
+    std::vector<addr_t> vas(entries.size(), 0);
+    std::vector<size_t> lookup;
+    auto known = build_id.empty() ? this->symbol_offsets.end() : this->symbol_offsets.find(build_id);
+
+    for (size_t i = 0; i < entries.size(); i++)
+    {
+        if (entries[i]->type == HOOK_BY_OFFSET)
+        {
+            vas[i] = so_base + entries[i]->offset;
+            continue;
+        }
+
+        if (known != this->symbol_offsets.end())
+        {
+            auto offset = known->second.find(entries[i]);
+            if (offset != known->second.end())
+            {
+                vas[i] = offset->second ? so_base + offset->second : SYMBOL_ABSENT;
+                continue;
+            }
+        }
+
+        lookup.push_back(i);
+    }
+
+    if (lookup.empty())
+        return vas;
+
+    // Resolve against this .so's own .dynsym, using the load address the
+    // dynamic linker reported in link_map.l_addr. Looking the library up by
+    // name instead would go through the VMA list, which no longer exists in
+    // its old form on Linux 6.1 and newer.
+    std::vector<const char*> names;
+    names.reserve(lookup.size());
+    for (size_t i : lookup)
+        names.push_back(entries[i]->function_name.c_str());
+
+    std::vector<addr_t> found(lookup.size(), 0);
+    bool complete = drakvuf_exportsyms_to_va_at_base(drakvuf, proc_base, so_base,
+            names.data(), names.size(), found.data());
+
+    for (size_t k = 0; k < lookup.size(); k++)
+    {
+        size_t i = lookup[k];
+        if (found[k])
+            vas[i] = found[k];
+        else if (complete)
+            vas[i] = SYMBOL_ABSENT;
+        else
+            // Not necessarily absent: we can arm before ld.so has read this
+            // library's .dynsym, and an unreadable symbol table fails every
+            // lookup in it at once. Retry later.
+            continue;
+
+        if (!build_id.empty())
+            this->symbol_offsets[build_id][entries[i]] = found[k] ? found[k] - so_base : 0;
+    }
+
+    return vas;
+}
+
 void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so)
 {
     // Read once, here: the program headers sit in the first mapped page, which
     // ld.so has just read itself, so this is the cheapest moment to ask. A
     // failure is not fatal -- resolve_module() falls back to a size cap.
     addr_t span = drakvuf_get_module_span(drakvuf, so.proc_base, so.base);
+    std::string build_id = this->read_build_id(drakvuf, so.proc_base, so.base);
 
-    auto& proc = this->libs[so.pid];
+    auto [proc_it, new_process] = this->libs.try_emplace(so.pid);
+    auto& proc = proc_it->second;
     proc.proc_base = so.proc_base;
     proc.dtb = so.dtb;
-    proc.loaded[so.base] = loaded_so{ so.path, span ? so.base + span : 0 };
 
+    // The program headers sit right behind the ELF header, in the first page of the executable
+    if (new_process)
+    {
+        addr_t phdr = drakvuf_get_auxv_value(drakvuf, so.proc_base, AUXV_AT_PHDR);
+        addr_t exe_base = phdr & ~(addr_t)(VMI_PS_4KB - 1);
+        addr_t exe_span = phdr ? drakvuf_get_module_span(drakvuf, so.proc_base, exe_base) : 0;
+        if (exe_span)
+        {
+            proc.exe_start = exe_base;
+            proc.exe_end = exe_base + exe_span;
+        }
+    }
+
+    proc.loaded[so.base] = loaded_so{ so.path, span ? so.base + span : 0 };
+    proc.build_ids[so.base] = build_id;
+
+    std::vector<const plugin_target_config_entry_t*> entries;
     this->wanted_hooks.visit_hooks_for(so.path, [&](const plugin_target_config_entry_t& entry)
     {
-        addr_t va;
+        entries.push_back(&entry);
+    });
+    if (entries.empty())
+        return;
 
-        if (entry.type == HOOK_BY_OFFSET)
-        {
-            va = so.base + entry.offset;
-        }
-        else
-        {
-            // Resolve against this .so's own .dynsym, using the load address
-            // the dynamic linker reported in link_map.l_addr. Looking the
-            // library up by name instead would go through the VMA list, which
-            // no longer exists in its old form on Linux 6.1 and newer.
-            va = drakvuf_exportsym_to_va_at_base(drakvuf, so.proc_base, so.base,
-                    entry.function_name.c_str());
-            if (!va || va == (addr_t)-1)
-            {
-                // Not necessarily absent: we can arm before ld.so has read
-                // this library's .dynsym, and an unreadable symbol table
-                // fails every lookup in it at once. Retry later.
-                this->deferred[so.pid].push_back(
-                    deferred_hook{ &entry, so.path, so.base, so.proc_base, so.dtb, 0, 0 });
+    auto vas = this->resolve_symbols(drakvuf, so.proc_base, so.base, build_id, entries);
 
-                PRINT_DEBUG("[LIBMON] pid %d: deferring %s!%s, symbol table not readable yet\n",
-                    so.pid, entry.dll_name.c_str(), entry.function_name.c_str());
-                return;
-            }
+    for (size_t i = 0; i < entries.size(); i++)
+    {
+        const auto& entry = *entries[i];
+        addr_t va = vas[i];
+
+        if (va == SYMBOL_ABSENT)
+        {
+            PRINT_DEBUG("[LIBMON] pid %d: %s doesn't define %s\n", so.pid, so.path.c_str(),
+                entry.function_name.c_str());
+            continue;
         }
 
-        if (this->place_hook(drakvuf, info, so.pid, entry, so.path, so.base, va))
-            return;
+        if (!va)
+        {
+            this->deferred[so.pid].push_back(
+                deferred_hook{ &entry, so.path, so.base, so.proc_base, so.dtb, 0, 0, build_id });
+
+            PRINT_DEBUG("[LIBMON] pid %d: deferring %s!%s, symbol table not readable yet\n",
+                so.pid, entry.dll_name.c_str(), entry.function_name.c_str());
+            continue;
+        }
+
+        if (this->place_hook(drakvuf, info, so.pid, so.dtb, entry, so.path, so.base, va))
+            continue;
 
         // A breakpoint can only be placed on a resident page, and this
         // function has simply never been called, so nothing has faulted its
         // page in. Defer it and fault the page in later, from a callback that
         // actually runs in this process.
         this->deferred[so.pid].push_back(
-            deferred_hook{ &entry, so.path, so.base, so.proc_base, so.dtb, va, 0 });
+            deferred_hook{ &entry, so.path, so.base, so.proc_base, so.dtb, va, 0, build_id });
 
         PRINT_DEBUG("[LIBMON] pid %d: deferring %s!%s at 0x%lx, page not resident\n", so.pid,
             entry.dll_name.c_str(), entry.function_name.c_str(), va);
-    });
+    }
 
     // Retries are driven from the CR3 tick rather than from here, which runs
     // once per newly discovered library and would spend several of them in a
@@ -155,14 +509,24 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
 
 event_response_t libmon::cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    // flush_deferred() erases from the map, so collect the keys first.
+    // Every process with deferred hooks in turn, from where the last tick stopped
     std::vector<vmi_pid_t> pids;
     pids.reserve(this->deferred.size());
-    for (const auto& [pid, targets] : this->deferred)
-        pids.push_back(pid);
+    for (auto it = this->deferred.lower_bound(this->next_deferred); it != this->deferred.end(); ++it)
+        pids.push_back(it->first);
+    for (auto it = this->deferred.begin(); it != this->deferred.end() && it->first < this->next_deferred; ++it)
+        pids.push_back(it->first);
 
+    unsigned budget = DEFERRED_TICK_BUDGET;
     for (auto pid : pids)
-        this->flush_deferred(drakvuf, info, pid);
+    {
+        if (!budget)
+        {
+            this->next_deferred = pid;
+            break;
+        }
+        this->flush_deferred(drakvuf, info, pid, budget);
+    }
 
     if (this->deferred.empty())
         this->cr3_hook.reset();
@@ -170,7 +534,7 @@ event_response_t libmon::cr3_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     return VMI_EVENT_RESPONSE_NONE;
 }
 
-bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, addr_t dtb,
     const plugin_target_config_entry_t& entry, const std::string& so_path,
     addr_t so_base, addr_t va, std::optional<addr_t> pa)
 {
@@ -178,15 +542,29 @@ bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
     if (this->hooked_keys.count(key))
         return true;
 
-    drakvuf_trap_t* trap = pa
-        ? register_trap(info, &libmon::function_hook_cb,
-            breakpoint_at_pa(*pa), entry.function_name.c_str(), UNLIMITED_TTL)
-        : register_trap(info, &libmon::function_hook_cb,
-            breakpoint_at_va_for_pid(pid, va), entry.function_name.c_str(), UNLIMITED_TTL);
-    if (!trap)
-        return false;
+    addr_t hook_pa;
+    if (pa)
+        hook_pa = *pa;
+    else
+    {
+        vmi_lock_guard vmi(drakvuf);
+        if (VMI_SUCCESS != vmi_pagetable_lookup(vmi, dtb, va, &hook_pa))
+            return false;
+    }
 
-    this->hooked.emplace(trap, hooked_function{ &entry, so_path, so_base, pid, va, trap });
+    // Another process may have hooked the function in the same frame of the library already
+    auto it = this->pa_hooks.find(hook_pa);
+    if (it == this->pa_hooks.end())
+    {
+        drakvuf_trap_t* trap = register_trap(info, &libmon::function_hook_cb,
+                breakpoint_at_pa(hook_pa), entry.function_name.c_str(), UNLIMITED_TTL);
+        if (!trap)
+            return false;
+
+        it = this->pa_hooks.emplace(hook_pa, pa_hook{ trap, {} }).first;
+    }
+
+    it->second.by_pid[pid].push_back(hooked_function{ &entry, so_path, so_base, va });
     this->hooked_keys.insert(key);
 
     // Not attributed to `info`: this can run off the CR3 tick, where the
@@ -206,7 +584,11 @@ bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
 std::optional<addr_t> libmon::find_shared_pa(drakvuf_t drakvuf, vmi_pid_t pid,
     const deferred_hook& target) const
 {
-    if (!target.va)
+    // Same path, but not necessarily the same file: a library can be replaced
+    // on disk while the old inode stays mapped, and then the same offset is a
+    // different function. Only a mapping with the same build ID is the same
+    // file, a library without one is not reached through other processes.
+    if (!target.va || target.build_id.empty())
         return std::nullopt;
 
     const addr_t offset = target.va - target.so_base;
@@ -216,27 +598,14 @@ std::optional<addr_t> libmon::find_shared_pa(drakvuf_t drakvuf, vmi_pid_t pid,
         if (other_pid == pid)
             continue;
 
-        for (const auto& [other_base, lib] : other.loaded)
+        for (const auto& [other_base, build_id] : other.build_ids)
         {
-            if (lib.path != target.so_path)
+            if (build_id != target.build_id)
                 continue;
-
-            // Same path, but not necessarily the same file: a library can be
-            // replaced on disk while the old inode stays mapped, and then the
-            // same offset is a different function. Resolving the symbol in
-            // the donor and requiring the same offset settles it. An offset
-            // hook has no name to check, and is taken on trust.
-            if (target.config->type != HOOK_BY_OFFSET)
-            {
-                addr_t donor_va = drakvuf_exportsym_to_va_at_base(drakvuf, other.proc_base,
-                        other_base, target.config->function_name.c_str());
-                if (!donor_va || donor_va == (addr_t)-1 || donor_va - other_base != offset)
-                    continue;
-            }
 
             addr_t pa = 0;
             {
-                auto vmi = vmi_lock_guard(drakvuf);
+                vmi_lock_guard vmi(drakvuf);
                 if (VMI_SUCCESS != vmi_pagetable_lookup(vmi, other.dtb, other_base + offset, &pa))
                     continue;
             }
@@ -253,24 +622,51 @@ std::optional<addr_t> libmon::find_shared_pa(drakvuf_t drakvuf, vmi_pid_t pid,
 
 // Safe from anywhere: resolution and trap insertion both go through the
 // target's own page tables, so it need not be the process running.
-void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid)
+void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, unsigned& budget)
 {
     auto it = this->deferred.find(pid);
-    if (it == this->deferred.end())
+    if (it == this->deferred.end() || !budget)
         return;
 
     auto& targets = it->second;
 
-    for (auto target = targets.begin(); target != targets.end(); )
+    // Still unresolved: the library's .dynsym was unreadable last time. One
+    // lookup per library for all of them, and not more often than every
+    // RESOLVE_INTERVAL_US, since that reads the whole symbol table.
+    gint64 now = g_get_monotonic_time();
+    auto& last = this->last_resolve[pid];
+    if (now - last >= RESOLVE_INTERVAL_US)
     {
-        // Still unresolved: the library's .dynsym was unreadable last time.
-        if (!target->va)
+        last = now;
+
+        std::map<addr_t, std::vector<deferred_hook*>> unresolved;   // by load address
+        for (auto& target : targets)
+            if (!target.va)
+                unresolved[target.so_base].push_back(&target);
+
+        for (auto& [so_base, hooks] : unresolved)
         {
-            addr_t va = drakvuf_exportsym_to_va_at_base(drakvuf, target->proc_base,
-                    target->so_base, target->config->function_name.c_str());
-            if (va && va != (addr_t)-1)
-                target->va = va;
+            std::vector<const plugin_target_config_entry_t*> entries;
+            for (auto hook : hooks)
+                entries.push_back(hook->config);
+
+            auto vas = this->resolve_symbols(drakvuf, hooks[0]->proc_base, so_base, hooks[0]->build_id, entries);
+            for (size_t i = 0; i < hooks.size(); i++)
+                hooks[i]->va = vas[i];
         }
+    }
+
+    for (auto target = targets.begin(); target != targets.end() && budget; )
+    {
+        if (target->va == SYMBOL_ABSENT)
+        {
+            PRINT_DEBUG("[LIBMON] pid %d: %s doesn't define %s\n", pid, target->so_path.c_str(),
+                target->config->function_name.c_str());
+            target = targets.erase(target);
+            continue;
+        }
+
+        budget--;
 
         // Check residency ourselves before asking for the trap. Handing
         // drakvuf_add_trap() an address it cannot translate makes it log two
@@ -279,13 +675,13 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
         bool resident = false;
         if (target->va)
         {
-            auto vmi = vmi_lock_guard(drakvuf);
+            vmi_lock_guard vmi(drakvuf);
             page_info_t pinfo;
             resident = (VMI_SUCCESS == vmi_pagetable_lookup_extended(vmi, target->dtb,
                             target->va, &pinfo));
         }
 
-        if (resident && this->place_hook(drakvuf, info, pid, *target->config,
+        if (resident && this->place_hook(drakvuf, info, pid, target->dtb, *target->config,
                 target->so_path, target->so_base, target->va))
         {
             target = targets.erase(target);
@@ -300,7 +696,7 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
         {
             if (auto pa = this->find_shared_pa(drakvuf, pid, *target))
             {
-                if (this->place_hook(drakvuf, info, pid, *target->config,
+                if (this->place_hook(drakvuf, info, pid, target->dtb, *target->config,
                         target->so_path, target->so_base, target->va, pa))
                 {
                     target = targets.erase(target);
@@ -336,15 +732,42 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
     }
 
     if (targets.empty())
+    {
         this->deferred.erase(it);
+        this->last_resolve.erase(pid);
+    }
 }
 
-std::map<const drakvuf_trap_t*, libmon::hooked_function>::iterator
-libmon::drop_hook(std::map<const drakvuf_trap_t*, hooked_function>::iterator it)
+template<typename Drop>
+void libmon::drop_hooks(vmi_pid_t pid, Drop drop)
 {
-    this->hooked_keys.erase(std::make_pair(it->second.pid, it->second.va));
-    this->destroy_trap(it->second.trap);
-    return this->hooked.erase(it);
+    for (auto it = this->pa_hooks.begin(); it != this->pa_hooks.end(); )
+    {
+        auto by_pid = it->second.by_pid.find(pid);
+        if (by_pid != it->second.by_pid.end())
+        {
+            auto& hooks = by_pid->second;
+            hooks.erase(std::remove_if(hooks.begin(), hooks.end(), [&](const hooked_function& hook)
+            {
+                if (!drop(hook))
+                    return false;
+                this->hooked_keys.erase(std::make_pair(pid, hook.va));
+                return true;
+            }), hooks.end());
+
+            if (hooks.empty())
+                it->second.by_pid.erase(by_pid);
+        }
+
+        // The last process with a hook here is gone
+        if (it->second.by_pid.empty())
+        {
+            this->destroy_trap(it->second.trap);
+            it = this->pa_hooks.erase(it);
+        }
+        else
+            ++it;
+    }
 }
 
 // dlclose. The same reasoning as on_process_reset(), for one library rather
@@ -359,6 +782,7 @@ void libmon::on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const s
     if (proc != this->libs.end())
     {
         proc->second.loaded.erase(so.base);
+        proc->second.build_ids.erase(so.base);
         if (proc->second.loaded.empty())
             this->libs.erase(proc);
     }
@@ -374,7 +798,10 @@ void libmon::on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const s
         }), targets.end());
 
         if (targets.empty())
+        {
             this->deferred.erase(deferred_it);
+            this->last_resolve.erase(so.pid);
+        }
     }
 
     // Calls still in flight are deliberately left alone. Their return
@@ -383,17 +810,13 @@ void libmon::on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const s
     // hooked function is exactly the case that would lose an event here.
 
     [[maybe_unused]] unsigned dropped = 0;
-    for (auto it = this->hooked.begin(); it != this->hooked.end(); )
+    this->drop_hooks(so.pid, [&](const hooked_function& hook)
     {
-        if (it->second.pid != so.pid || it->second.so_base != so.base)
-        {
-            ++it;
-            continue;
-        }
-
-        it = this->drop_hook(it);
+        if (hook.so_base != so.base)
+            return false;
         dropped++;
-    }
+        return true;
+    });
 
     PRINT_DEBUG("[LIBMON] pid %d: %s unloaded, dropped %u hook(s)\n",
         so.pid, so.path.c_str(), dropped);
@@ -405,49 +828,47 @@ void libmon::on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const s
 void libmon::on_process_reset(vmi_pid_t pid)
 {
     this->deferred.erase(pid);
+    this->last_resolve.erase(pid);
     this->libs.erase(pid);
 
     // Drop any call still in flight: its return address belongs to an address
     // space that no longer exists.
-    for (auto it = this->ret_hooks.begin(); it != this->ret_hooks.end(); )
-    {
-        if (static_cast<vmi_pid_t>(it->first.first >> 32) == pid)
-            it = this->ret_hooks.erase(it);
-        else
-            ++it;
-    }
+    this->returns.forget_process(pid);
 
-    for (auto it = this->hooked.begin(); it != this->hooked.end(); )
+    this->drop_hooks(pid, [](const hooked_function&)
     {
-        if (it->second.pid != pid)
-        {
-            ++it;
-            continue;
-        }
-
-        it = this->drop_hook(it);
-    }
+        return true;
+    });
 }
 
 event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     auto plugin = get_trap_plugin<libmon>(info);
 
-    auto it = plugin->hooked.find(info->trap);
-    if (it == plugin->hooked.end())
+#ifdef DRAKVUF_DEBUG
+    plugin->hit_rsp = info->regs->rsp;
+    plugin->hit_ret = drakvuf_get_function_return_address(drakvuf, info);
+    plugin->hit_uid = info->event_uid;
+#endif
+
+    auto it = plugin->pa_hooks.find(info->trap_pa);
+    if (it == plugin->pa_hooks.end() || it->second.trap != info->trap)
     {
         PRINT_DEBUG("[LIBMON] hook hit for an unknown trap, ignoring\n");
         return VMI_EVENT_RESPONSE_NONE;
     }
 
-    const auto& target = it->second;
-
     // The breakpoint lives in a physical page of libc, which every process
-    // mapping the library shares, so this fires for processes we never hooked
-    // -- and would fire once per hooked process if several share the page.
-    // Report only for the process this hook was placed for.
-    if (info->proc_data.pid != target.pid)
+    // mapping the library shares, so this fires for processes we never hooked.
+    // Report only the hooks of the process running.
+    auto hooks = it->second.by_pid.find(info->proc_data.pid);
+    if (hooks == it->second.by_pid.end())
         return VMI_EVENT_RESPONSE_NONE;
+
+    // Copied: retrying the deferred hooks below may add to this breakpoint's
+    std::vector<hooked_function> targets = hooks->second;
+
+    flush_translations(drakvuf, info->regs->cr3);
 
     PRINT_DEBUG("[LIBMON] hook hit: pid %d rip=0x%lx (%s)\n",
         info->proc_data.pid, info->regs->rip,
@@ -455,8 +876,17 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
 
     // A hook firing is proof this process is on the vCPU, which is the one
     // condition page-fault injection needs.
-    plugin->flush_deferred(drakvuf, info, info->proc_data.pid);
+    unsigned budget = DEFERRED_HIT_BUDGET;
+    plugin->flush_deferred(drakvuf, info, info->proc_data.pid, budget);
 
+    for (const auto& target : targets)
+        plugin->on_call(drakvuf, info, target);
+
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+void libmon::on_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const hooked_function& target)
+{
     // Read the arguments here, at entry: by the time the function returns its
     // stack frame is gone and the argument registers have been reused.
     const auto& config = *target.config;
@@ -466,15 +896,29 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
     for (size_t i = 1; i <= config.argument_printers.size(); i++)
         arguments.push_back(drakvuf_get_function_argument(drakvuf, info, i));
 
-    if (plugin->no_retval || config.no_retval)
+    if (this->no_retval || config.no_retval)
     {
-        plugin->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
-        return VMI_EVENT_RESPONSE_NONE;
+        this->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
+        return;
     }
 
-    auto hook = plugin->createReturnHook<return_data>(info, &libmon::function_return_hook_cb,
-            info->trap->name, drakvuf_get_limited_traps_ttl(drakvuf));
-    if (!hook)
+    // One breakpoint per return address, shared by the calls returning there.
+    // Kept between calls only in code mapped from a file: writing to the page
+    // of a breakpoint pauses the VM to copy it again, which JIT code does a lot.
+    addr_t ret_addr = drakvuf_get_function_return_address(drakvuf, info);
+    bool transient = !this->in_mapped_file(info->proc_data.pid, ret_addr);
+#ifdef DRAKVUF_DEBUG
+    if (ret_addr)
+        this->count_return_page(drakvuf, info, ret_addr, transient);
+#endif
+    auto result = ret_addr
+        ? this->returns.track(drakvuf, info, ret_addr, pending_call{ &config, target.so_path, arguments }, transient)
+        : return_track_result::untranslated;
+#ifdef DRAKVUF_DEBUG
+    if (result == return_track_result::not_executable)
+        this->log_refused_return(info, target, ret_addr);
+#endif
+    if (result != return_track_result::tracked)
     {
         // Report the call anyway, without a return value: losing one field
         // beats losing the event. Logged because the two look identical in
@@ -482,62 +926,28 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
         PRINT_DEBUG("[LIBMON] pid %d: no return hook for %s, reporting at entry\n",
             info->proc_data.pid, config.function_name.c_str());
 
-        plugin->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
-        return VMI_EVENT_RESPONSE_NONE;
+        this->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
     }
-
-    auto params = libhook::GetTrapParams<return_data>(hook->trap_);
-    params->arguments = std::move(arguments);
-    params->config = &config;
-    params->so_path = target.so_path;
-
-    plugin->ret_hooks[make_hook_id(info, params->target_rsp)] = std::move(hook);
-
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
-event_response_t libmon::function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
-{
-    auto params = libhook::GetTrapParams<return_data>(info);
-
-    // The return address is shared by every call that reaches it, so check
-    // this is the call instance we armed for rather than a recursive or
-    // concurrent one.
-    if (!params->verifyResultCallParams(drakvuf, info))
-    {
-        // Logged because a rejected return is indistinguishable in the output
-        // from one that never fired, and the two mean very different things.
-        PRINT_DEBUG("[LIBMON] return rejected: pid %d/%d tid %d/%d rip 0x%lx/0x%lx\n",
-            info->proc_data.pid, params->target_pid,
-            info->proc_data.tid, params->target_tid,
-            info->regs->rip, params->target_rsp);
-
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    PRINT_DEBUG("[LIBMON] return hit: pid %d %s -> 0x%lx\n",
-        info->proc_data.pid, params->config->function_name.c_str(), info->regs->rax);
-
-    this->print_call(drakvuf, info, *params->config, params->so_path,
-        params->arguments, info->regs->rax);
-
-    // Erasing destroys the ReturnHook, whose destructor removes the trap.
-    // Safe from inside its own callback: libhook defers the deletion.
-    this->ret_hooks.erase(make_hook_id(info, params->target_rsp));
-    return VMI_EVENT_RESPONSE_NONE;
 }
 
 void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     const plugin_target_config_entry_t& config, const std::string& so_path,
     const std::vector<uint64_t>& arguments, std::optional<uint64_t> return_value)
 {
+    // The output formatters emit the trap's name as Method, and both the hook
+    // and the return breakpoint are shared, so name a copy after the function.
+    drakvuf_trap_t trap = *info->trap;
+    trap.name = config.function_name.c_str();
+    drakvuf_trap_info_t call_info = *info;
+    call_info.trap = &trap;
+
     const auto& printers = config.argument_printers;
 
     std::vector<fmt::Rstr<std::string>> fmt_args;
     fmt_args.reserve(arguments.size());
 
     for (size_t i = 0; i < arguments.size() && i < printers.size(); i++)
-        fmt_args.push_back(fmt::Rstr(printers[i]->print(drakvuf, info, arguments[i])));
+        fmt_args.push_back(fmt::Rstr(printers[i]->print(drakvuf, &call_info, arguments[i])));
 
     std::optional<fmt::Xval<uint64_t>> fmt_retval;
     if (return_value)
@@ -547,15 +957,15 @@ void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     // return address when reporting at return -- so with return values on,
     // FromModule names whoever made the call, as it does in apimon.
     std::optional<fmt::Qstr<std::string>> fmt_module;
-    if (auto module = this->resolve_module(info->proc_data.pid, info->regs->rip))
+    if (auto module = this->resolve_module(call_info.proc_data.pid, call_info.regs->rip))
         fmt_module = fmt::Qstr(*module);
 
     // No Function field: the output formatters already emit the trap's name
-    // as Method, and the trap is named after the function.
-    fmt::print(m_output_format, "libmon", drakvuf, info,
+    // as Method.
+    fmt::print(m_output_format, "libmon", drakvuf, &call_info,
         keyval("Event", fmt::Rstr("api_called")),
         keyval("Library", fmt::Qstr(so_path)),
-        keyval("CalledFrom", fmt::Xval(info->regs->rip)),
+        keyval("CalledFrom", fmt::Xval(call_info.regs->rip)),
         keyval("ReturnValue", fmt_retval),
         keyval("FromModule", fmt_module),
         keyval("Arguments", fmt_args)
