@@ -109,6 +109,7 @@
 #include "libdrakvuf.h"
 #include "private.h"
 #include "json-profile.h"
+#include "trap_stats.h"
 
 #ifdef DRAKVUF_DEBUG
 bool verbose = 0;
@@ -620,6 +621,7 @@ static bool _drakvuf_add_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap)
 bool drakvuf_add_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap)
 {
     drakvuf_lock_and_get_vmi(drakvuf);
+    trap_stats_add(trap);
     bool ret = _drakvuf_add_trap(drakvuf, trap);
     drakvuf_release_vmi(drakvuf);
     return ret;
@@ -728,7 +730,15 @@ bool drakvuf_is_parallel_events(drakvuf_t drakvuf)
 
 vmi_instance_t drakvuf_lock_and_get_vmi(drakvuf_t drakvuf)
 {
-#ifdef ENABLE_THREADSAFETY
+#if defined(ENABLE_THREADSAFETY) && defined(DRAKVUF_DEBUG)
+    // Only waiting for the lock counts in the trap statistics
+    if (!g_rec_mutex_trylock(&drakvuf->vmi_lock))
+    {
+        gint64 start = trap_stats_now();
+        g_rec_mutex_lock(&drakvuf->vmi_lock);
+        trap_stats_vmi_wait(trap_stats_now() - start);
+    }
+#elif defined(ENABLE_THREADSAFETY)
     g_rec_mutex_lock(&drakvuf->vmi_lock);
 #endif
     return drakvuf->vmi;
@@ -745,6 +755,7 @@ void drakvuf_release_vmi(drakvuf_t drakvuf)
 
 bool drakvuf_pause (drakvuf_t drakvuf)
 {
+    trap_stats_pause();
     return vmi_pause_vm(drakvuf->vmi) == VMI_SUCCESS;
 }
 

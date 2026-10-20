@@ -123,6 +123,7 @@
 #include "private.h"
 #include "libdrakvuf.h"
 #include "vmi.h"
+#include "trap_stats.h"
 
 static uint8_t bp = TRAP;
 
@@ -183,10 +184,27 @@ static inline void serial_callback_enter(drakvuf_t drakvuf, vmi_event_t* event)
 {
     if ( drakvuf->parallel_events )
     {
+        gint64 start = trap_stats_now();
         g_mutex_lock(&drakvuf->serial_cb_lock);
+        trap_stats_serial_event_wait(trap_stats_now() - start);
         reader_enter(drakvuf, event);
     }
     drakvuf_lock_and_get_vmi(drakvuf);
+}
+
+/*
+ * Runs the callback of a trap. Debug builds count it in the trap statistics,
+ * for the plugin that added the trap, which also owns the traps added by the
+ * callback.
+ */
+static inline event_response_t call_trap_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info, gint64 serial_wait_ns)
+{
+#ifdef DRAKVUF_DEBUG
+    return trap_stats_call(drakvuf, info, serial_wait_ns);
+#else
+    UNUSED(serial_wait_ns);
+    return info->trap->cb(drakvuf, info);
+#endif
 }
 
 static inline void serial_callback_exit(drakvuf_t drakvuf)
@@ -304,11 +322,23 @@ static bool refresh_shadow_copy(vmi_instance_t vmi, struct memcb_pass* pass)
     }
 
     GSList* loop = (GSList*)pass->traps;
+#ifdef DRAKVUF_DEBUG
+    if (loop)
+    {
+        struct wrapper* first = (struct wrapper*)g_hash_table_lookup(drakvuf->breakpoint_lookup_pa, loop->data);
+        trap_stats_page_copy(pass->remapped_gfn->o, first && first->traps ? first->traps->data : NULL);
+    }
+#endif
     while (loop)
     {
         uint8_t test = 0;
         addr_t pa = GPOINTER_TO_SIZE(loop->data);
         struct wrapper* s = (struct wrapper*)g_hash_table_lookup(drakvuf->breakpoint_lookup_pa, loop->data);
+
+#ifdef DRAKVUF_DEBUG
+        for (GSList* t = s ? s->traps : NULL; t; t = t->next)
+            trap_stats_shadow_copy(t->data);
+#endif
 
         if ( VMI_FAILURE == vmi_read_8_pa(vmi, pa, &test) )
         {
@@ -400,7 +430,7 @@ static event_response_t _post_mem_cb(drakvuf_t drakvuf, vmi_event_t* event)
                 copy_proc_data_from_priv(&trap_info.proc_data, &pass->proc_data);
                 copy_proc_data_from_priv(&trap_info.attached_proc_data, &pass->attached_proc_data);
 
-                rsp |= trap->cb(drakvuf, &trap_info);
+                rsp |= call_trap_cb(drakvuf, &trap_info, 0);
             }
 
             loop = loop->next;
@@ -596,7 +626,7 @@ static event_response_t _pre_mem_cb(drakvuf_t drakvuf, vmi_event_t* event)
                 (trap->memaccess.access & event->mem_event.out_access))
             {
                 trap_info.trap = trap;
-                rsp |= trap->cb(drakvuf, &trap_info);
+                rsp |= call_trap_cb(drakvuf, &trap_info, 0);
             }
 
             loop = loop->next;
@@ -619,7 +649,7 @@ static event_response_t _pre_mem_cb(drakvuf_t drakvuf, vmi_event_t* event)
 
                     loop = loop->next;
                     if (!trap_is_removed(trap_info.trap))
-                        rsp |= trap_info.trap->cb(drakvuf, &trap_info);
+                        rsp |= call_trap_cb(drakvuf, &trap_info, 0);
                 }
             }
         }
@@ -769,24 +799,34 @@ static void trap_snapshot_free(struct trap_snapshot* snapshot)
 static event_response_t run_trap_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     if ( !drakvuf->parallel_events || info->trap->mt_safe )
-        return info->trap->cb(drakvuf, info);
+        return call_trap_cb(drakvuf, info, 0);
 
+    gint64 start = trap_stats_now();
     g_mutex_lock(&drakvuf->serial_cb_lock);
-    event_response_t rsp = info->trap->cb(drakvuf, info);
+    event_response_t rsp = call_trap_cb(drakvuf, info, trap_stats_now() - start);
     g_mutex_unlock(&drakvuf->serial_cb_lock);
     return rsp;
+}
+
+static inline void call_trap_ah_cb(drakvuf_t drakvuf, drakvuf_trap_t* trap)
+{
+#ifdef DRAKVUF_DEBUG
+    trap_stats_ah_call(drakvuf, trap);
+#else
+    trap->ah_cb(drakvuf, trap);
+#endif
 }
 
 static void run_trap_ah_cb(drakvuf_t drakvuf, drakvuf_trap_t* trap)
 {
     if ( !drakvuf->parallel_events || trap->mt_safe )
     {
-        trap->ah_cb(drakvuf, trap);
+        call_trap_ah_cb(drakvuf, trap);
         return;
     }
 
     g_mutex_lock(&drakvuf->serial_cb_lock);
-    trap->ah_cb(drakvuf, trap);
+    call_trap_ah_cb(drakvuf, trap);
     g_mutex_unlock(&drakvuf->serial_cb_lock);
 }
 
@@ -983,6 +1023,7 @@ static event_response_t int3_cb(vmi_instance_t vmi, vmi_event_t* event)
 {
     UNUSED(vmi);
     drakvuf_t drakvuf = (drakvuf_t)event->data;
+    gint64 start = trap_stats_now();
     event_response_t ret;
 
     if ( drakvuf->parallel_events )
@@ -998,6 +1039,7 @@ static event_response_t int3_cb(vmi_instance_t vmi, vmi_event_t* event)
         drakvuf_release_vmi(drakvuf);
     }
 
+    trap_stats_int3(trap_stats_now() - start);
     return ret;
 }
 
@@ -1031,7 +1073,7 @@ static event_response_t _cr3_cb(drakvuf_t drakvuf, vmi_event_t* event)
             trap_info.trap = (drakvuf_trap_t*)loop->data;
 
             if (!trap_is_removed(trap_info.trap))
-                rsp |= trap_info.trap->cb(drakvuf, &trap_info);
+                rsp |= call_trap_cb(drakvuf, &trap_info, 0);
             loop = loop->next;
         }
         drakvuf->in_callback = 0;
@@ -1116,7 +1158,7 @@ static event_response_t _cr4_cb(drakvuf_t drakvuf, vmi_event_t* event)
     {
         trap_info.trap = (drakvuf_trap_t*)loop->data;
         if (!trap_is_removed(trap_info.trap))
-            rsp |= trap_info.trap->cb(drakvuf, &trap_info);
+            rsp |= call_trap_cb(drakvuf, &trap_info, 0);
         loop = loop->next;
     }
     drakvuf->in_callback = 0;
@@ -1166,7 +1208,7 @@ static event_response_t _debug_cb(drakvuf_t drakvuf, vmi_event_t* event)
         {
             trap_info.trap = (drakvuf_trap_t*)loop->data;
             if (!trap_is_removed(trap_info.trap))
-                rsp |= trap_info.trap->cb(drakvuf, &trap_info);
+                rsp |= call_trap_cb(drakvuf, &trap_info, 0);
             loop = loop->next;
         }
         drakvuf->in_callback = 0;
@@ -1215,7 +1257,7 @@ static event_response_t _msr_cb(drakvuf_t drakvuf, vmi_event_t* event)
         {
             trap_info.trap = (drakvuf_trap_t*)loop->data;
             if (!trap_is_removed(trap_info.trap))
-                rsp |= trap_info.trap->cb(drakvuf, &trap_info);
+                rsp |= call_trap_cb(drakvuf, &trap_info, 0);
             loop = loop->next;
         }
         drakvuf->in_callback = 0;
@@ -1265,7 +1307,7 @@ static event_response_t _cpuid_cb(drakvuf_t drakvuf, vmi_event_t* event)
         {
             trap_info.trap = (drakvuf_trap_t*)loop->data;
             if (!trap_is_removed(trap_info.trap))
-                rsp |= trap_info.trap->cb(drakvuf, &trap_info);
+                rsp |= call_trap_cb(drakvuf, &trap_info, 0);
             loop = loop->next;
         }
         drakvuf->in_callback = 0;
@@ -1313,7 +1355,7 @@ static event_response_t _io_cb(drakvuf_t drakvuf, vmi_event_t* event)
     {
         trap_info.trap = (drakvuf_trap_t*)loop->data;
         if (!trap_is_removed(trap_info.trap))
-            rsp |= trap_info.trap->cb(drakvuf, &trap_info);
+            rsp |= call_trap_cb(drakvuf, &trap_info, 0);
         loop = loop->next;
     }
     drakvuf->in_callback = 0;
@@ -1354,6 +1396,7 @@ void remove_trap(drakvuf_t drakvuf,
             PRINT_DEBUG("Removing breakpoint trap from 0x%lx.\n",
                 container->breakpoint.pa);
 
+            trap_stats_remove(trap);
             g_hash_table_remove(drakvuf->breakpoint_lookup_trap, trap);
             container->traps = g_slist_remove(container->traps, trap);
 
@@ -1843,6 +1886,7 @@ bool inject_trap_pa(drakvuf_t drakvuf,
      * Arming a new breakpoint changes the guest in several steps, no vCPU may
      * run in between. Domain pauses nest, the caller may have paused already.
      */
+    trap_stats_arm(trap);
     drakvuf_pause(drakvuf);
     bool ret = arm_trap_pa(drakvuf, trap, pa);
     drakvuf_resume(drakvuf);
@@ -2156,6 +2200,8 @@ void drakvuf_vmi_event_callback (int fd, void* data)
         bool paused = clears_events && drakvuf_pause(drakvuf);
         if (clears_events && !paused)
             fprintf(stderr, "Failed to pause the VM to clear events of removed traps\n");
+        if (paused)
+            trap_stats_drain();
 
         if (paused && VMI_SUCCESS != drain_ring(drakvuf))
         {
@@ -2512,6 +2558,8 @@ void close_vmi(drakvuf_t drakvuf)
     PRINT_DEBUG("close_vmi starting\n");
 
     xen_pause(drakvuf->xen, drakvuf->domID);
+
+    trap_stats_print();
 
     if (drakvuf->vmi)
     {

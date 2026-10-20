@@ -133,6 +133,7 @@
 #include "userhook.hpp"
 #include "utils.hpp"
 #include "uh-private.hpp"
+#include "plugins/helpers/trap_owner_scope.h"
 
 static bool g_injection_mode_enabled = false;
 
@@ -874,6 +875,9 @@ bool userhook::is_supported(drakvuf_t drakvuf)
 
 userhook::userhook(drakvuf_t drakvuf, bool injection_mode_enabled): pluginex(drakvuf, OUTPUT_DEFAULT), injection_mode(injection_mode_enabled)
 {
+    // Shared by the plugins hooking user mode, its traps and the ones its callbacks add count for libusermode
+    trap_owner_scope owner("libusermode");
+
     if (!is_supported(drakvuf))
         throw -1;
 

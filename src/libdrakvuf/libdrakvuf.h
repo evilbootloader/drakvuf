@@ -316,6 +316,11 @@ struct drakvuf_trap
     // removed traps stay listed until all vCPU threads are idle and are
     // skipped meanwhile. Owned by libdrakvuf.
     gint removed;
+
+    // Trap statistics of debug builds: the plugin that added the trap and its
+    // counters. Set by drakvuf_add_trap, owned by libdrakvuf.
+    const char* owner;
+    void* stats;
 };
 
 
@@ -475,6 +480,29 @@ void drakvuf_remove_trap (drakvuf_t drakvuf,
     drakvuf_trap_t* trap,
     drakvuf_trap_free_t free_routine) NOEXCEPT;
 void drakvuf_unhook_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap) NOEXCEPT;
+
+/*
+ * Trap statistics of debug builds: the traps added on the calling thread until
+ * drakvuf_trap_owner_leave count for owner, a string that lives until
+ * DRAKVUF exits. Returns the previous owner to pass to drakvuf_trap_owner_leave.
+ * Callbacks run with the owner of their trap. Does nothing in release builds.
+ */
+#ifdef DRAKVUF_DEBUG
+const char* drakvuf_trap_owner_enter(const char* owner) NOEXCEPT;
+void drakvuf_trap_owner_leave(const char* previous) NOEXCEPT;
+/* Debug builds: whether drakvuf remapped the guest frame for breakpoints, and how many are on it */
+bool drakvuf_debug_gfn_remapped(drakvuf_t drakvuf, addr_t gfn, unsigned int* breakpoints) NOEXCEPT;
+#else
+static inline const char* drakvuf_trap_owner_enter(const char* owner) NOEXCEPT
+{
+    (void)owner;
+    return NULL;
+}
+static inline void drakvuf_trap_owner_leave(const char* previous) NOEXCEPT
+{
+    (void)previous;
+}
+#endif
 
 void drakvuf_loop (drakvuf_t drakvuf, bool (*is_interrupted)(drakvuf_t, void*), void* data) NOEXCEPT;
 void drakvuf_interrupt (drakvuf_t drakvuf,
