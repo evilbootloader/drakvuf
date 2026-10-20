@@ -144,7 +144,7 @@ addr_t linux_get_function_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     );
 
     uint64_t ret;
-    if (VMI_FAILURE == vmi_read_64(drakvuf->vmi, &ctx, &ret))
+    if (VMI_FAILURE == vmi_read_64(drakvuf_vmi(drakvuf), &ctx, &ret))
         return 0;
     return ret;
 }
@@ -167,7 +167,7 @@ addr_t linux_get_function_return_address(drakvuf_t drakvuf, drakvuf_trap_info_t*
         .addr = info->regs->rsp
     );
 
-    if (VMI_FAILURE == vmi_read_addr(drakvuf->vmi, &ctx, &ret_addr))
+    if (VMI_FAILURE == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &ret_addr))
         return 0;
 
     return ret_addr;
@@ -189,15 +189,15 @@ bool linux_check_return_context(drakvuf_trap_info_t* info, vmi_pid_t pid, uint32
 
 bool linux_get_kernel_symbol_rva(drakvuf_t drakvuf, const char* function, addr_t* rva)
 {
-    json_object* kernel_json = vmi_get_kernel_json(drakvuf->vmi);
-    if (VMI_FAILURE == vmi_get_symbol_addr_from_json(drakvuf->vmi, kernel_json, function, rva))
+    json_object* kernel_json = vmi_get_kernel_json(drakvuf_vmi(drakvuf));
+    if (VMI_FAILURE == vmi_get_symbol_addr_from_json(drakvuf_vmi(drakvuf), kernel_json, function, rva))
     {
         bool find = false;
         for (uint8_t i = 0; i < 255; i++)
         {
             char tmp[64];
             snprintf(tmp, sizeof(tmp), "%s.isra.%d", function, i);
-            if (VMI_SUCCESS == vmi_get_symbol_addr_from_json(drakvuf->vmi, kernel_json, tmp, rva))
+            if (VMI_SUCCESS == vmi_get_symbol_addr_from_json(drakvuf_vmi(drakvuf), kernel_json, tmp, rva))
             {
                 find = true;
                 break;
@@ -228,15 +228,15 @@ char* linux_get_filepath_from_dentry(drakvuf_t drakvuf, addr_t dentry_addr)
 
     ctx.addr = dentry_addr + drakvuf->offsets[DENTRY_D_PARENT];
     // TODO Bound this loop
-    while (VMI_SUCCESS == vmi_read_addr(drakvuf->vmi, &ctx, &parent) && parent != dentry_addr)
+    while (VMI_SUCCESS == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &parent) && parent != dentry_addr)
     {
         gchar* name = NULL;
         addr_t qstr_str_addr;
         ctx.addr = dentry_addr + drakvuf->offsets[DENTRY_D_NAME] + drakvuf->offsets[QSTR_NAME];
-        if (VMI_SUCCESS == vmi_read_addr(drakvuf->vmi, &ctx, &qstr_str_addr))
+        if (VMI_SUCCESS == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &qstr_str_addr))
         {
             ctx.addr = qstr_str_addr;
-            name = vmi_read_str(drakvuf->vmi, &ctx);
+            name = vmi_read_str(drakvuf_vmi(drakvuf), &ctx);
         }
 
         if (name == NULL)
@@ -290,7 +290,7 @@ static char* linux_get_banner(drakvuf_t drakvuf)
         .dtb = drakvuf->kpgd,
         .addr = linux_banner_addr);
 
-    return vmi_read_str(drakvuf->vmi, &ctx);
+    return vmi_read_str(drakvuf_vmi(drakvuf), &ctx);
 }
 #endif
 
@@ -302,16 +302,16 @@ static char* linux_read_kernel_version(drakvuf_t drakvuf, addr_t process_base)
 
     ctx.addr = process_base + drakvuf->offsets[TASK_STRUCT_NSPROXY];
     addr_t nsproxy_addr;
-    if (VMI_FAILURE == vmi_read_addr(drakvuf->vmi, &ctx, &nsproxy_addr))
+    if (VMI_FAILURE == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &nsproxy_addr))
         return NULL;
 
     ctx.addr = nsproxy_addr + drakvuf->offsets[NSPROXY_UTS_NS];
     addr_t uts_ns_addr;
-    if (VMI_FAILURE == vmi_read_addr(drakvuf->vmi, &ctx, &uts_ns_addr))
+    if (VMI_FAILURE == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &uts_ns_addr))
         return NULL;
 
     ctx.addr = uts_ns_addr + drakvuf->offsets[UTS_NAMESPACE_NAME] + drakvuf->offsets[NEW_UTSNAME_RELEASE];
-    return vmi_read_str(drakvuf->vmi, &ctx);
+    return vmi_read_str(drakvuf_vmi(drakvuf), &ctx);
 }
 
 static char* linux_read_kernel_version_from_current(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
@@ -367,7 +367,7 @@ const kernel_version_t* linux_get_kernel_version(drakvuf_t drakvuf, drakvuf_trap
 
 static bool find_kernbase(drakvuf_t drakvuf)
 {
-    if ( VMI_FAILURE == vmi_translate_ksym2v(drakvuf->vmi, "_text", &drakvuf->kernbase) )
+    if ( VMI_FAILURE == vmi_translate_ksym2v(drakvuf_vmi(drakvuf), "_text", &drakvuf->kernbase) )
         return 0;
 
     return !!drakvuf->kernbase;
@@ -378,7 +378,7 @@ bool set_os_linux(drakvuf_t drakvuf)
     if ( !find_kernbase(drakvuf) )
         return 0;
 
-    if ( !drakvuf->kpgd && VMI_FAILURE == vmi_get_offset(drakvuf->vmi, "kpgd", &drakvuf->kpgd) )
+    if ( !drakvuf->kpgd && VMI_FAILURE == vmi_get_offset(drakvuf_vmi(drakvuf), "kpgd", &drakvuf->kpgd) )
         return 0;
 
     // Get the offsets from the Rekall profile

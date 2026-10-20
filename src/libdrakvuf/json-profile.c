@@ -123,7 +123,7 @@ bool json_lookup_array(
     addr_t* rva,
     addr_t* size)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     if (!json)
     {
@@ -268,7 +268,7 @@ bool drakvuf_get_kernel_struct_size(drakvuf_t drakvuf,
     const char* struct_name,
     size_t* size)
 {
-    return VMI_SUCCESS == vmi_get_struct_size_from_json(drakvuf->vmi, vmi_get_kernel_json(drakvuf->vmi), struct_name, size);
+    return VMI_SUCCESS == vmi_get_struct_size_from_json(drakvuf_vmi(drakvuf), vmi_get_kernel_json(drakvuf_vmi(drakvuf)), struct_name, size);
 }
 
 bool drakvuf_get_kernel_struct_member_rva(drakvuf_t drakvuf,
@@ -276,7 +276,7 @@ bool drakvuf_get_kernel_struct_member_rva(drakvuf_t drakvuf,
     const char* symbol,
     addr_t* rva)
 {
-    return VMI_SUCCESS == vmi_get_struct_member_offset_from_json(drakvuf->vmi, vmi_get_kernel_json(drakvuf->vmi), struct_name, symbol, rva);
+    return VMI_SUCCESS == vmi_get_struct_member_offset_from_json(drakvuf_vmi(drakvuf), vmi_get_kernel_json(drakvuf_vmi(drakvuf)), struct_name, symbol, rva);
 }
 
 bool drakvuf_get_bitfield_offset_and_size(drakvuf_t drakvuf,
@@ -286,7 +286,7 @@ bool drakvuf_get_bitfield_offset_and_size(drakvuf_t drakvuf,
     size_t* start_bit,
     size_t* end_bit)
 {
-    return VMI_SUCCESS == vmi_get_bitfield_offset_and_size_from_json(drakvuf->vmi, vmi_get_kernel_json(drakvuf->vmi), struct_name, struct_member, offset, start_bit, end_bit);
+    return VMI_SUCCESS == vmi_get_bitfield_offset_and_size_from_json(drakvuf_vmi(drakvuf), vmi_get_kernel_json(drakvuf_vmi(drakvuf)), struct_name, struct_member, offset, start_bit, end_bit);
 }
 
 bool json_get_symbol_rva(drakvuf_t drakvuf,
@@ -294,7 +294,7 @@ bool json_get_symbol_rva(drakvuf_t drakvuf,
     const char* function,
     addr_t* rva)
 {
-    return VMI_SUCCESS == vmi_get_symbol_addr_from_json(drakvuf->vmi, json, function, rva);
+    return VMI_SUCCESS == vmi_get_symbol_addr_from_json(drakvuf_vmi(drakvuf), json, function, rva);
 }
 
 bool json_get_struct_size(drakvuf_t drakvuf,
@@ -302,7 +302,7 @@ bool json_get_struct_size(drakvuf_t drakvuf,
     const char* struct_name,
     size_t* size)
 {
-    return VMI_SUCCESS == vmi_get_struct_size_from_json(drakvuf->vmi, json, struct_name, size);
+    return VMI_SUCCESS == vmi_get_struct_size_from_json(drakvuf_vmi(drakvuf), json, struct_name, size);
 }
 
 bool json_get_struct_member_rva(drakvuf_t drakvuf,
@@ -311,5 +311,5 @@ bool json_get_struct_member_rva(drakvuf_t drakvuf,
     const char* symbol,
     addr_t* rva)
 {
-    return VMI_SUCCESS == vmi_get_struct_member_offset_from_json(drakvuf->vmi, json, struct_name, symbol, rva);
+    return VMI_SUCCESS == vmi_get_struct_member_offset_from_json(drakvuf_vmi(drakvuf), json, struct_name, symbol, rva);
 }

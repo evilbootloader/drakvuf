@@ -180,6 +180,7 @@ void drakvuf_close(drakvuf_t drakvuf, const bool pause)
 
     drakvuf_release_vmi(drakvuf);
     g_rec_mutex_clear(&drakvuf->vmi_lock);
+    g_mutex_clear(&drakvuf->serial_cb_lock);
     g_free(drakvuf);
 }
 
@@ -225,6 +226,7 @@ bool drakvuf_init(
         PRINT_DEBUG("drakvuf_init: Rekall WoW64 profile not used\n");
 
     g_rec_mutex_init(&drakvuf->vmi_lock);
+    g_mutex_init(&drakvuf->serial_cb_lock);
 
     if ( !xen_init_interface(&drakvuf->xen) )
         goto err;
@@ -317,6 +319,11 @@ bool drakvuf_init_os(drakvuf_t drakvuf)
 {
     drakvuf_lock_and_get_vmi(drakvuf);
     bool ret = _drakvuf_init_os(drakvuf);
+
+    // The reader instances copy the paging and OS settings
+    if (ret && drakvuf->parallel_events && !create_reader_vmis(drakvuf))
+        fprintf(stderr, "Guest memory reads will be serialized\n");
+
     drakvuf_release_vmi(drakvuf);
     return ret;
 }
@@ -541,6 +548,9 @@ static bool _drakvuf_add_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap)
     if (!trap->ah_cb)
         trap->ah_cb = drakvuf_unhook_trap;
 
+    // The same trap may be added again after it was removed
+    g_atomic_int_set(&trap->removed, 0);
+
     if (g_hash_table_lookup(drakvuf->remove_traps, trap))
     {
         g_hash_table_remove(drakvuf->remove_traps, trap);
@@ -592,7 +602,16 @@ bool drakvuf_add_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap)
 
 static void _drakvuf_remove_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap, drakvuf_trap_free_t free_routine)
 {
-    if ( drakvuf->in_callback)
+    /*
+     * With parallel events the callbacks of other vCPU threads may still use
+     * the trap while events are being processed. It is skipped from now on
+     * and freed once they are idle.
+     */
+    bool deferred = drakvuf->parallel_events && g_atomic_int_get(&drakvuf->listening);
+    if (deferred)
+        g_atomic_int_set(&trap->removed, 1);
+
+    if ( drakvuf->in_callback || deferred )
     {
         struct free_trap_wrapper* free_wrapper = (struct free_trap_wrapper*)g_hash_table_lookup(drakvuf->remove_traps, trap);
 
@@ -624,6 +643,62 @@ void drakvuf_remove_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap, drakvuf_trap_f
 void drakvuf_unhook_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap)
 {
     drakvuf_remove_trap(drakvuf, trap, NULL);
+}
+
+vmi_instance_t drakvuf_lock_and_get_reader_vmi(drakvuf_t drakvuf)
+{
+    return drakvuf_reader_lock(drakvuf);
+}
+
+void drakvuf_release_reader_vmi(drakvuf_t drakvuf)
+{
+    drakvuf_reader_unlock(drakvuf);
+}
+
+bool drakvuf_enable_parallel_events(drakvuf_t drakvuf)
+{
+#ifndef ENABLE_THREADSAFETY
+    UNUSED(drakvuf);
+    fprintf(stderr, "Parallel event processing requires DRAKVUF built with --enable-threadsafety\n");
+    return false;
+#else
+    if (drakvuf->parallel_events)
+        return true;
+
+    if (drakvuf->vcpus > MAX_DRAKVUF_VCPU)
+    {
+        fprintf(stderr, "Parallel event processing supports up to %u vCPUs\n", MAX_DRAKVUF_VCPU);
+        return false;
+    }
+
+    drakvuf_lock_and_get_vmi(drakvuf);
+
+    /*
+     * Reading guest memory works without the reader instances too, but then
+     * all reads are serialized by the VMI lock.
+     */
+    if (!create_reader_vmis(drakvuf))
+        fprintf(stderr, "Guest memory reads will be serialized\n");
+
+    bool ret = VMI_SUCCESS == vmi_events_set_parallel(drakvuf->vmi, true);
+    if (ret)
+        drakvuf->parallel_events = true;
+    else
+    {
+        fprintf(stderr, "Failed to start parallel event processing\n");
+        destroy_reader_vmis(drakvuf);
+    }
+
+    drakvuf_release_vmi(drakvuf);
+
+    PRINT_DEBUG("Parallel event processing for %u vCPUs: %s\n", drakvuf->vcpus, ret ? "on" : "off");
+    return ret;
+#endif
+}
+
+bool drakvuf_is_parallel_events(drakvuf_t drakvuf)
+{
+    return drakvuf->parallel_events;
 }
 
 vmi_instance_t drakvuf_lock_and_get_vmi(drakvuf_t drakvuf)
@@ -737,36 +812,36 @@ static int _drakvuf_read_addr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
     if (is32bit)
     {
         uint32_t value32 = 0;
-        int status = vmi_read_32(drakvuf->vmi, ctx, &value32);
+        int status = vmi_read_32(drakvuf_vmi(drakvuf), ctx, &value32);
         if (value)
             *value = value32;
         return status;
     }
     else
-        return vmi_read_64(drakvuf->vmi, ctx, value);
+        return vmi_read_64(drakvuf_vmi(drakvuf), ctx, value);
 }
 
 int drakvuf_read_addr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const access_context_t* ctx, addr_t* value)
 {
-    drakvuf_lock_and_get_vmi(drakvuf);
+    drakvuf_reader_lock(drakvuf);
     int ret = _drakvuf_read_addr(drakvuf, info, ctx, value);
-    drakvuf_release_vmi(drakvuf);
+    drakvuf_reader_unlock(drakvuf);
     return ret;
 }
 
 bool drakvuf_get_current_process_data(drakvuf_t drakvuf, drakvuf_trap_info_t* info, proc_data_priv_t* proc_data)
 {
-    drakvuf_lock_and_get_vmi(drakvuf);
+    drakvuf_reader_lock(drakvuf);
     addr_t process_base = drakvuf_get_current_process(drakvuf, info);
     // TODO - Windows version of get process tid needed.
     bool ret = drakvuf_get_process_data_priv(drakvuf, process_base, proc_data) && drakvuf_get_current_thread_id(drakvuf, info, (uint32_t*)&proc_data->tid);
-    drakvuf_release_vmi(drakvuf);
+    drakvuf_reader_unlock(drakvuf);
     return ret;
 }
 
 bool drakvuf_get_process_data(drakvuf_t drakvuf, addr_t process_base, proc_data_t* proc_data)
 {
-    drakvuf_lock_and_get_vmi(drakvuf);
+    drakvuf_reader_lock(drakvuf);
     proc_data_priv_t proc_data_priv = { 0 };
     bool success = drakvuf_get_process_data_priv(drakvuf, process_base, &proc_data_priv);
     proc_data->name = proc_data_priv.name;
@@ -776,13 +851,13 @@ bool drakvuf_get_process_data(drakvuf_t drakvuf, addr_t process_base, proc_data_
     proc_data->userid = proc_data_priv.userid;
     proc_data->tid = proc_data_priv.tid;
     proc_data->bitness = proc_data_priv.bitness;
-    drakvuf_release_vmi(drakvuf);
+    drakvuf_reader_unlock(drakvuf);
     return success;
 }
 
 char* drakvuf_read_ascii_str(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t addr)
 {
-    drakvuf_lock_and_get_vmi(drakvuf);
+    drakvuf_reader_lock(drakvuf);
 
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB,
@@ -790,16 +865,16 @@ char* drakvuf_read_ascii_str(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_
         .addr = addr
     );
 
-    char* ret = vmi_read_str(drakvuf->vmi, &ctx);
+    char* ret = vmi_read_str(drakvuf_vmi(drakvuf), &ctx);
 
-    drakvuf_release_vmi(drakvuf);
+    drakvuf_reader_unlock(drakvuf);
 
     return ret;
 }
 
 static unicode_string_t* _drakvuf_read_unicode_common(drakvuf_t drakvuf, const access_context_t* ctx)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     unicode_string_t* us = vmi_read_unicode_str(vmi, ctx);
     if ( !us )
@@ -825,9 +900,9 @@ static unicode_string_t* _drakvuf_read_unicode_common(drakvuf_t drakvuf, const a
 
 unicode_string_t* drakvuf_read_unicode_common(drakvuf_t drakvuf, const access_context_t* ctx)
 {
-    drakvuf_lock_and_get_vmi(drakvuf);
+    drakvuf_reader_lock(drakvuf);
     unicode_string_t* ret = _drakvuf_read_unicode_common(drakvuf, ctx);
-    drakvuf_release_vmi(drakvuf);
+    drakvuf_reader_unlock(drakvuf);
     return ret;
 }
 
@@ -858,7 +933,7 @@ unicode_string_t* drakvuf_read_unicode_va(drakvuf_t drakvuf, addr_t vaddr, vmi_p
 
 static unicode_string_t* _drakvuf_read_unicode32_common(drakvuf_t drakvuf, const access_context_t* ctx)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     unicode_string_t* us = vmi_read_unicode_str_pm( vmi, ctx, VMI_PM_LEGACY );
     if ( !us )
@@ -884,9 +959,9 @@ static unicode_string_t* _drakvuf_read_unicode32_common(drakvuf_t drakvuf, const
 
 unicode_string_t* drakvuf_read_unicode32_common(drakvuf_t drakvuf, const access_context_t* ctx)
 {
-    drakvuf_lock_and_get_vmi(drakvuf);
+    drakvuf_reader_lock(drakvuf);
     unicode_string_t* ret = _drakvuf_read_unicode32_common(drakvuf, ctx);
-    drakvuf_release_vmi(drakvuf);
+    drakvuf_reader_unlock(drakvuf);
     return ret;
 }
 
@@ -917,8 +992,8 @@ unicode_string_t* drakvuf_read_unicode32_va(drakvuf_t drakvuf, addr_t vaddr, vmi
 
 size_t drakvuf_wchar_string_length(drakvuf_t drakvuf, const access_context_t* ctx)
 {
-    drakvuf_lock_and_get_vmi(drakvuf);
-    vmi_instance_t vmi = drakvuf->vmi;
+    drakvuf_reader_lock(drakvuf);
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     access_context_t mutable_ctx = *ctx;
 
     size_t str_len = 0;
@@ -934,13 +1009,13 @@ size_t drakvuf_wchar_string_length(drakvuf_t drakvuf, const access_context_t* ct
     }
 
 end:
-    drakvuf_release_vmi(drakvuf);
+    drakvuf_reader_unlock(drakvuf);
     return (str_len / 2);
 }
 
 static unicode_string_t* _drakvuf_read_wchar_array(drakvuf_t drakvuf, const access_context_t* ctx, size_t length)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     unicode_string_t us;
 
@@ -986,9 +1061,9 @@ static unicode_string_t* _drakvuf_read_wchar_array(drakvuf_t drakvuf, const acce
 
 unicode_string_t* drakvuf_read_wchar_array(drakvuf_t drakvuf, const access_context_t* ctx, size_t length)
 {
-    drakvuf_lock_and_get_vmi(drakvuf);
+    drakvuf_reader_lock(drakvuf);
     unicode_string_t* ret = _drakvuf_read_wchar_array(drakvuf, ctx, length);
-    drakvuf_release_vmi(drakvuf);
+    drakvuf_reader_unlock(drakvuf);
     return ret;
 }
 

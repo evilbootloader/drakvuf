@@ -307,6 +307,15 @@ struct drakvuf_trap
     // Callback invoked when the trap hits api-hammering limit. If not set (NULL),
     // the trap will be simply unhooked (not deleted).
     void(*ah_cb)(drakvuf_t, drakvuf_trap_t*);
+
+    // With parallel event processing, a breakpoint callback marked mt_safe may
+    // run concurrently on several vCPU threads. All other callbacks are
+    // serialized. Must be set before the trap is added.
+    bool mt_safe;
+    // Set atomically when the trap is removed. With parallel event processing
+    // removed traps stay listed until all vCPU threads are idle and are
+    // skipped meanwhile. Owned by libdrakvuf.
+    gint removed;
 };
 
 
@@ -341,6 +350,15 @@ typedef enum object_manager_object
 
 vmi_instance_t drakvuf_lock_and_get_vmi(drakvuf_t drakvuf) NOEXCEPT;
 void drakvuf_release_vmi(drakvuf_t drakvuf) NOEXCEPT;
+
+/*
+ * Instance for reading guest memory only. On a vCPU event thread with parallel
+ * event processing this is the thread's own LibVMI instance and no lock is
+ * taken, otherwise it behaves like drakvuf_lock_and_get_vmi. Do not use it to
+ * write memory or to change events, SLAT views or registers.
+ */
+vmi_instance_t drakvuf_lock_and_get_reader_vmi(drakvuf_t drakvuf) NOEXCEPT;
+void drakvuf_release_reader_vmi(drakvuf_t drakvuf) NOEXCEPT;
 
 ////////////////////////////////////////////////////////////////////////////
 
@@ -441,6 +459,14 @@ bool drakvuf_init (drakvuf_t* drakvuf,
     bool get_userid,
     bool enable_active_callback_check) NOEXCEPT;
 bool drakvuf_init_os (drakvuf_t drakvuf) NOEXCEPT;
+/*
+ * Process events of each vCPU on its own thread. Breakpoint callbacks of traps
+ * marked mt_safe run concurrently, all other callbacks stay serialized.
+ * Requires a build with --enable-threadsafety and Xen vm_event interface 7.
+ * Must be called from the thread running drakvuf_loop, outside of callbacks.
+ */
+bool drakvuf_enable_parallel_events(drakvuf_t drakvuf) NOEXCEPT;
+bool drakvuf_is_parallel_events(drakvuf_t drakvuf) NOEXCEPT;
 void drakvuf_close (drakvuf_t drakvuf, const bool pause) NOEXCEPT;
 int drakvuf_send_qemu_monitor_command(drakvuf_t drakvuf, const char* in, char** out);
 bool drakvuf_add_trap(drakvuf_t drakvuf,
@@ -449,6 +475,7 @@ void drakvuf_remove_trap (drakvuf_t drakvuf,
     drakvuf_trap_t* trap,
     drakvuf_trap_free_t free_routine) NOEXCEPT;
 void drakvuf_unhook_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap) NOEXCEPT;
+
 void drakvuf_loop (drakvuf_t drakvuf, bool (*is_interrupted)(drakvuf_t, void*), void* data) NOEXCEPT;
 void drakvuf_interrupt (drakvuf_t drakvuf,
     int sig) NOEXCEPT;

@@ -142,7 +142,7 @@
 
 addr_t linux_eprocess_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib, const char* sym)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     vmi_pid_t pid;
     if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
@@ -251,7 +251,7 @@ next:
  */
 addr_t linux_module_span(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     if (!drakvuf->offsets[ELF64PHDR_MEMSZ])
         return 0;
@@ -328,7 +328,7 @@ addr_t linux_module_span(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_
  */
 addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base, const char* sym)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     vmi_pid_t pid;
     if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
@@ -547,7 +547,7 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
 
 addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     vmi_pid_t pid;
     if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
@@ -629,7 +629,7 @@ next:
  */
 addr_t linux_get_auxv_value(drakvuf_t drakvuf, addr_t eprocess_base, uint64_t type)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     // A profile without saved_auxv leaves the offset zeroed, which would make
     // us read from the head of mm_struct instead.

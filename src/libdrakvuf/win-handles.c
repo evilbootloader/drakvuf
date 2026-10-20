@@ -121,7 +121,7 @@
 static addr_t drakvuf_get_obj_by_handle_impl(drakvuf_t drakvuf, addr_t process, uint64_t handle)
 {
     handle = handle & ~3ULL;
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     addr_t handletable = 0;
     addr_t tablecode = 0;
     addr_t obj = 0;

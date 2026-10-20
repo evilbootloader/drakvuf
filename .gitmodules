@@ -4,8 +4,9 @@
 	ignore = dirty
 [submodule "libvmi"]
 	path = libvmi
-	url = https://github.com/libvmi/libvmi
+	url = https://github.com/evilbootloader/libvmi
 	ignore = dirty
+	branch = feature/vcpu-parallel-events
 [submodule "volatility3"]
 	path = volatility3
 	url = https://github.com/volatilityfoundation/volatility3

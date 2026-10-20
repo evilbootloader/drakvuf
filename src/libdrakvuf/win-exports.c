@@ -130,7 +130,7 @@ modlist_sym2va(drakvuf_t drakvuf, addr_t module_list_head, access_context_t* ctx
     {
         ctx->addr = dllbase;
 
-        status_t ret = vmi_translate_sym2v(drakvuf->vmi, ctx, symbol, va);
+        status_t ret = vmi_translate_sym2v(drakvuf_vmi(drakvuf), ctx, symbol, va);
         if ( ret == VMI_SUCCESS )
             PRINT_DEBUG("\t%s @ 0x%lx\n", symbol, *va);
 
@@ -146,7 +146,7 @@ addr_t ksym2va(drakvuf_t drakvuf, vmi_pid_t pid, const char* proc_name, const ch
 
     if (4 == pid || !strcmp(proc_name, "System"))
     {
-        if (VMI_FAILURE == vmi_read_addr_ksym(drakvuf->vmi, "PsLoadedModuleList", &module_list))
+        if (VMI_FAILURE == vmi_read_addr_ksym(drakvuf_vmi(drakvuf), "PsLoadedModuleList", &module_list))
             return 0;
     }
     else
@@ -185,17 +185,17 @@ addr_t eprocess_sym2va (drakvuf_t drakvuf, addr_t eprocess_base, const char* mod
         .translate_mechanism = VMI_TM_PROCESS_DTB
     );
 
-    if (VMI_FAILURE==vmi_read_addr_va(drakvuf->vmi, eprocess_base + drakvuf->offsets[EPROCESS_PDBASE], 0, &ctx.dtb))
+    if (VMI_FAILURE==vmi_read_addr_va(drakvuf_vmi(drakvuf), eprocess_base + drakvuf->offsets[EPROCESS_PDBASE], 0, &ctx.dtb))
         return 0;
-    if (VMI_FAILURE==vmi_read_addr_va(drakvuf->vmi, eprocess_base + drakvuf->offsets[EPROCESS_PEB], 0, &peb) || peb == 0)
+    if (VMI_FAILURE==vmi_read_addr_va(drakvuf_vmi(drakvuf), eprocess_base + drakvuf->offsets[EPROCESS_PEB], 0, &peb) || peb == 0)
         return 0;
 
     ctx.addr = peb + drakvuf->offsets[PEB_LDR];
-    if (VMI_FAILURE==vmi_read_addr(drakvuf->vmi, &ctx, &ldr))
+    if (VMI_FAILURE==vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &ldr))
         return 0;
 
     ctx.addr = ldr + drakvuf->offsets[PEB_LDR_DATA_INLOADORDERMODULELIST];
-    if (VMI_FAILURE==vmi_read_addr(drakvuf->vmi, &ctx, &inloadorder))
+    if (VMI_FAILURE==vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &inloadorder))
         return 0;
 
     PRINT_DEBUG("Found PEB @ 0x%lx. LDR @ 0x%lx. INLOADORDER @ 0x%lx.\n",

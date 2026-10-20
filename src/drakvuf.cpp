@@ -295,6 +295,11 @@ void drakvuf_c::resume()
     drakvuf_resume(drakvuf);
 }
 
+bool drakvuf_c::enable_parallel_events()
+{
+    return drakvuf_enable_parallel_events(drakvuf);
+}
+
 void drakvuf_c::toggle_context_interception(GSList* processes)
 {
     GSList* process = processes;

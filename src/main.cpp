@@ -216,6 +216,8 @@ static void print_usage()
         "\t -a <plugin>               Activate the specified plugin\n"
         "\t -p                        Leave domain paused after DRAKVUF exits\n"
         "\t -F, --fast-singlestep     Enable fast singlestepping (requires Xen 4.14+)\n"
+        "\t --parallel-events         Process the events of each vCPU on its own thread\n"
+        "\t                           (requires a build with --enable-threadsafety)\n"
         "\t --traps-ttl <ttl value>   Maximum number of times trap can be triggered in 10sec period. Protects against api hammering.\n"
         "\t --ignore-pid <PID>        Ignore events from process with PID (can be repeated multiple times).\n"
         "\t --enable-active-callback-check\n"
@@ -450,6 +452,7 @@ int main(int argc, char** argv)
     bool leave_paused = false;
     bool libvmi_conf = false;
     bool fast_singlestep = false;
+    bool parallel_events = false;
     addr_t kpgd = 0;
     auto terminated_processes = std::make_shared<std::unordered_map<vmi_pid_t, bool>>();
     plugins_options options = { .terminated_processes = terminated_processes };
@@ -526,6 +529,7 @@ int main(int argc, char** argv)
         opt_terminate,
         opt_termination_timeout,
         opt_traps_ttl,
+        opt_parallel_events,
         opt_wait_stop_plugins,
         opt_codemon_dump_dir,
         opt_codemon_filter_executable,
@@ -617,6 +621,7 @@ int main(int argc, char** argv)
         {"userhook-injection-mode", no_argument, NULL, opt_userhook_injection_mode},
         {"fast-singlestep", no_argument, NULL, 'F'},
         {"traps-ttl", required_argument, NULL, opt_traps_ttl},
+        {"parallel-events", no_argument, NULL, opt_parallel_events},
         {"wait-stop-plugins", required_argument, NULL, opt_wait_stop_plugins},
         {"codemon-dump-dir", required_argument, NULL, opt_codemon_dump_dir},
         {"codemon-filter-executable", required_argument, NULL, opt_codemon_filter_executable},
@@ -846,6 +851,9 @@ int main(int argc, char** argv)
                 break;
             case opt_traps_ttl:
                 limited_traps_ttl = strtoull(optarg, NULL, 0);
+                break;
+            case opt_parallel_events:
+                parallel_events = true;
                 break;
             case 'k':
                 kpgd = strtoull(optarg, NULL, 0);
@@ -1223,6 +1231,9 @@ int main(int argc, char** argv)
 
     if (context_based_interception)
         drakvuf->toggle_context_interception(context_processes);
+
+    if (parallel_events && !drakvuf->enable_parallel_events())
+        return drakvuf_exit_code_t::FAIL;
 
     PRINT_DEBUG("Starting plugins\n");
 
