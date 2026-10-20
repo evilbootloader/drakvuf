@@ -106,6 +106,7 @@
 #include <sys/stat.h>
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <fstream>
 
 #include <libvmi/libvmi.h>
@@ -116,6 +117,7 @@
 
 /* x86_64 syscall numbers */
 #define __NR_write      1
+#define __NR_close      3
 #define __NR_pwrite64   18
 #define __NR_writev     20
 #define __NR_pwritev    296
@@ -208,7 +210,7 @@ linux_fileextractor::linux_fileextractor(drakvuf_t drakvuf, const fileextractor_
 
     /* Register syscall hook - try do_syscall_64 first (reliable on FRED kernels
      * where x64_sys_call may be called via static_call, bypassing INT3 at entry) */
-    syscall_hook = createSyscallHook("do_syscall_64", &linux_fileextractor::syscall_cb, "do_syscall_64");
+    syscall_hook = createSyscallHook("do_syscall_64", &linux_fileextractor::syscall_cb, "do_syscall_64", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
         fprintf(stderr, "[FILEEXTRACTOR-LINUX] Hooked do_syscall_64\n");
@@ -217,7 +219,7 @@ linux_fileextractor::linux_fileextractor(drakvuf_t drakvuf, const fileextractor_
     {
         fprintf(stderr, "[FILEEXTRACTOR-LINUX] do_syscall_64 hook failed, trying x64_sys_call\n");
         /* Fallback to x64_sys_call */
-        syscall_hook = createSyscallHook("x64_sys_call", &linux_fileextractor::syscall_cb, "x64_sys_call");
+        syscall_hook = createSyscallHook("x64_sys_call", &linux_fileextractor::syscall_cb, "x64_sys_call", UNLIMITED_TTL, true);
         if (syscall_hook)
         {
             fprintf(stderr, "[FILEEXTRACTOR-LINUX] Hooked x64_sys_call\n");
@@ -254,7 +256,7 @@ bool linux_fileextractor::get_pt_regs_and_nr(drakvuf_t drakvuf, drakvuf_trap_inf
         }
 
         /* Fallback: read orig_rax from pt_regs */
-        auto vmi = vmi_lock_guard(drakvuf);
+        vmi_reader_guard vmi(drakvuf);
         return VMI_SUCCESS == vmi_read_addr_va(vmi, *pt_regs_addr + this->regs[FE_PT_REGS_ORIG_RAX], 0, nr);
     }
 
@@ -276,7 +278,7 @@ bool linux_fileextractor::read_pt_regs_arg(drakvuf_t drakvuf, addr_t pt_regs_add
     if (arg_index < 0 || arg_index >= 6)
         return false;
 
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     return VMI_SUCCESS == vmi_read_addr_va(vmi, pt_regs_addr + this->regs[arg_offsets[arg_index]], 0, value);
 }
 
@@ -285,7 +287,7 @@ std::string linux_fileextractor::get_filename_from_fd(drakvuf_t drakvuf, drakvuf
     if (fd < 0)
         return "";
 
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
 
     /* Get current task_struct */
     addr_t task = drakvuf_get_current_process(drakvuf, info);
@@ -334,7 +336,7 @@ bool linux_fileextractor::read_user_buffer(drakvuf_t drakvuf, drakvuf_trap_info_
 
     buffer.resize(size);
 
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB,
         .dtb = info->regs->cr3,
@@ -419,6 +421,11 @@ void linux_fileextractor::print_extraction_info(drakvuf_t drakvuf, drakvuf_trap_
         g_free(const_cast<char*>(process_name));
 }
 
+/* How long a descriptor found to be a pipe, socket or device is skipped for */
+#define IGNORED_FD_US (G_USEC_PER_SEC)
+
+/* Runs on several vCPU threads at once: every other syscall returns without a
+ * lock, writes and closes take write_mtx */
 event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     addr_t pt_regs_addr = 0;
@@ -426,6 +433,21 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
 
     if (!get_pt_regs_and_nr(drakvuf, info, &pt_regs_addr, &nr))
         return VMI_EVENT_RESPONSE_NONE;
+
+    /* A closed descriptor can be reused for another file, which must not be
+     * appended to the dump of this one */
+    if (nr == __NR_close)
+    {
+        uint64_t fd_val = 0;
+        if (read_pt_regs_arg(drakvuf, pt_regs_addr, 0, &fd_val))
+        {
+            auto key = std::make_pair(static_cast<uint64_t>(info->attached_proc_data.pid), (int)fd_val);
+            std::lock_guard<std::mutex> lock(this->write_mtx);
+            this->tracked_files.erase(key);
+            this->ignored_fds.erase(key);
+        }
+        return VMI_EVENT_RESPONSE_NONE;
+    }
 
     /* Only handle write syscalls */
     if (!is_write_syscall(nr))
@@ -458,6 +480,17 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
     vmi_pid_t pid = info->attached_proc_data.pid;
     auto file_key = std::make_pair(static_cast<uint64_t>(pid), fd);
 
+    std::lock_guard<std::mutex> lock(this->write_mtx);
+
+    gint64 now = g_get_monotonic_time();
+    auto ignored = ignored_fds.find(file_key);
+    if (ignored != ignored_fds.end())
+    {
+        if (now - ignored->second < IGNORED_FD_US)
+            return VMI_EVENT_RESPONSE_NONE;
+        ignored_fds.erase(ignored);
+    }
+
     /* Get or create file tracking info */
     auto it = tracked_files.find(file_key);
     if (it == tracked_files.end())
@@ -475,6 +508,7 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
             filename.find("pipe:") == 0 ||
             filename.find("anon_inode:") == 0)
         {
+            ignored_fds[file_key] = now;
             return VMI_EVENT_RESPONSE_NONE;
         }
 

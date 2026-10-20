@@ -109,6 +109,7 @@
 #include "private.h"
 
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -187,6 +188,15 @@ private:
     };
 
     std::map<std::pair<uint64_t, int>, file_info_t> tracked_files;
+
+    /* Descriptors of pipes, sockets and the like, skipped without resolving
+     * their path on every write. Forgotten after a while, since a descriptor
+     * can be reused without a close we see (dup2, exec). */
+    std::map<std::pair<uint64_t, int>, gint64> ignored_fds;
+
+    /* The syscall hook runs on several vCPU threads at once, the writes it
+     * handles take this for the state above and the dump files */
+    std::mutex write_mtx;
 
     /* Hooks */
     std::unique_ptr<libhook::SyscallHook> syscall_hook;
