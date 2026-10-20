@@ -124,3 +124,29 @@ private:
     drakvuf_t drakvuf;
     vmi_instance_t vmi;
 };
+
+/*
+ * For reading guest memory only. With parallel events this is the LibVMI
+ * instance of the current vCPU thread and no lock is held, see
+ * drakvuf_lock_and_get_reader_vmi.
+ */
+struct vmi_reader_guard
+{
+    explicit vmi_reader_guard(drakvuf_t drakvuf) : drakvuf{drakvuf}, vmi{drakvuf_lock_and_get_reader_vmi(drakvuf)}
+    {
+    }
+
+    operator vmi_instance_t() const
+    {
+        return vmi;
+    }
+
+    ~vmi_reader_guard()
+    {
+        drakvuf_release_reader_vmi(drakvuf);
+    }
+
+private:
+    drakvuf_t drakvuf;
+    vmi_instance_t vmi;
+};

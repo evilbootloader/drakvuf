@@ -111,6 +111,7 @@
 #endif /* HAVE_CONFIG_H */
 
 #include <iostream>
+#include <mutex>
 
 namespace fmt
 {
@@ -143,6 +144,9 @@ public:
 };
 
 extern std::ostream cout;
+
+// Held while one record is written to cout, plugins may print on several vCPU threads
+extern std::mutex cout_mutex;
 
 } // namespace fmt
 

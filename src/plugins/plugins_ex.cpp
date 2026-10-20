@@ -139,8 +139,14 @@ bool pluginex::stop_impl()
 
 void pluginex::destroy_all_traps()
 {
-    while (!traps.empty())
-        destroy_trap(traps.front());
+    std::vector<drakvuf_trap_t*> destroyed;
+    {
+        std::lock_guard<std::mutex> lock(traps_mtx);
+        destroyed.swap(traps);
+    }
+
+    for (auto trap : destroyed)
+        delete_trap(trap);
 }
 
 std::unique_ptr<libhook::ManualHook> pluginex::createManualHook(drakvuf_trap_t* info, drakvuf_trap_free_t free_routine)
@@ -151,13 +157,17 @@ std::unique_ptr<libhook::ManualHook> pluginex::createManualHook(drakvuf_trap_t* 
 
 void pluginex::destroy_trap(drakvuf_trap_t* target)
 {
-    auto it = std::find(traps.begin(), traps.end(), target);
-    if (it == traps.end())
     {
-        PRINT_DEBUG("[PLUGINEX] BUG: attempted to destroy non-existant trap");
-        throw -1;
+        // A return trap may be destroyed on another vCPU thread than the one that registered it
+        std::lock_guard<std::mutex> lock(traps_mtx);
+        auto it = std::find(traps.begin(), traps.end(), target);
+        if (it == traps.end())
+        {
+            PRINT_DEBUG("[PLUGINEX] BUG: attempted to destroy non-existant trap");
+            throw -1;
+        }
+        traps.erase(it);
     }
-    traps.erase(it);
     delete_trap(target);
 }
 

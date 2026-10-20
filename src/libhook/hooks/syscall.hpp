@@ -119,7 +119,7 @@ public:
      */
     template<typename Params = CallResult>
     [[nodiscard]]
-    static auto create(drakvuf_t, const std::string& syscall_name, cb_wrapper_t cb, uint64_t ttl, const std::optional<std::string>& display_name)
+    static auto create(drakvuf_t, const std::string& syscall_name, cb_wrapper_t cb, uint64_t ttl, const std::optional<std::string>& display_name, bool mt_safe = false)
     -> std::unique_ptr<SyscallHook>;
 
     /**
@@ -164,7 +164,7 @@ protected:
 };
 
 template<typename Params>
-auto SyscallHook::create(drakvuf_t drakvuf, const std::string& syscall_name, cb_wrapper_t cb, uint64_t ttl, const std::optional<std::string>& opt_display_name)
+auto SyscallHook::create(drakvuf_t drakvuf, const std::string& syscall_name, cb_wrapper_t cb, uint64_t ttl, const std::optional<std::string>& opt_display_name, bool mt_safe)
 -> std::unique_ptr<SyscallHook>
 {
     static_assert(std::is_base_of_v<CallResult, Params>, "Params must derive from CallResult");
@@ -189,6 +189,9 @@ auto SyscallHook::create(drakvuf_t drakvuf, const std::string& syscall_name, cb_
 
     if (!trap)
         return {};
+
+    // The callback may run on several vCPU threads at once, set before the trap is added
+    trap->mt_safe = mt_safe;
 
     // not using std::make_unique because ctor is private
     const std::string& display_name = opt_display_name ? *opt_display_name : syscall_name;

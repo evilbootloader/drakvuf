@@ -164,5 +164,6 @@ protected:
 
 static StrBuf outbuf;
 std::ostream cout(&outbuf);
+std::mutex cout_mutex;
 
 } // namespace fmt

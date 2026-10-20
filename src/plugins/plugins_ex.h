@@ -112,6 +112,7 @@
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <mutex>
 #include <optional>
 
 #include "plugins.h"
@@ -480,7 +481,7 @@ public:
 
     template<typename Params = PluginResult, typename Callback>
     [[nodiscard]]
-    std::unique_ptr<libhook::SyscallHook> createSyscallHook(const std::string& syscall_name, Callback cb, const std::optional<std::string>& display_name = {}, int ttl = UNLIMITED_TTL);
+    std::unique_ptr<libhook::SyscallHook> createSyscallHook(const std::string& syscall_name, Callback cb, const std::optional<std::string>& display_name = {}, int ttl = UNLIMITED_TTL, bool mt_safe = false);
 
     template<typename Params = PluginResult, typename Callback>
     [[nodiscard]]
@@ -528,12 +529,24 @@ public:
     template<typename Params = void>
     void register_trap(drakvuf_trap_t* trap);
 
+    // Calls prepare(trap, params) before the trap is added, so the trap and
+    // its params are complete when the callback first runs. With parallel
+    // events that can happen right away on another vCPU thread.
+    template<typename Params, typename IB, typename Prepare>
+    drakvuf_trap_t* register_prepared_trap(drakvuf_trap_info_t* info,
+        hook_cb_t hook_cb,
+        IB init_breakpoint,
+        const char* trap_name,
+        Prepare prepare);
+
     void destroy_trap(drakvuf_trap_t* target);
 
     const output_format_t m_output_format;
     drakvuf_t drakvuf;
 
 private:
+    // Traps may be registered and destroyed on several vCPU threads
+    std::mutex traps_mtx;
     std::vector<drakvuf_trap_t*> traps;
 
     void delete_trap(drakvuf_trap_t* target);
@@ -608,11 +621,11 @@ std::unique_ptr<libhook::ReturnHook> pluginex::createReturnHook(drakvuf_trap_inf
 }
 
 template<typename Params, typename Callback>
-std::unique_ptr<libhook::SyscallHook> pluginex::createSyscallHook(const std::string& syscall_name, Callback cb, const std::optional<std::string>& display_name, int ttl)
+std::unique_ptr<libhook::SyscallHook> pluginex::createSyscallHook(const std::string& syscall_name, Callback cb, const std::optional<std::string>& display_name, int ttl, bool mt_safe)
 {
     static_assert(std::is_base_of_v<PluginResult, Params>, "Params must derive from PluginResult");
 
-    auto hook = libhook::SyscallHook::create<Params>(this->drakvuf, syscall_name, this->wrap_plugin_cb(cb), ttl, display_name);
+    auto hook = libhook::SyscallHook::create<Params>(this->drakvuf, syscall_name, this->wrap_plugin_cb(cb), ttl, display_name, mt_safe);
     if (hook)
         static_cast<Params*>(hook->trap_->data)->plugin_ = this;
     else
@@ -725,8 +738,40 @@ drakvuf_trap_t* pluginex::register_trap(drakvuf_trap_info_t* info,
         return nullptr;
     }
 
-    traps.push_back(std::move(trap));
-    return traps.back();
+    std::lock_guard<std::mutex> lock(traps_mtx);
+    traps.push_back(trap);
+    return trap;
+}
+
+template<typename Params, typename IB, typename Prepare>
+drakvuf_trap_t* pluginex::register_prepared_trap(drakvuf_trap_info_t* info,
+    hook_cb_t hook_cb,
+    IB init_breakpoint,
+    const char* trap_name,
+    Prepare prepare)
+{
+    static_assert(std::is_base_of_v<call_result_t, Params>, "Params must derive from call_result_t");
+
+    auto trap = new drakvuf_trap_t();
+    auto params = new Params;
+    trap->data = new plugin_data(this, params);
+    trap->name = trap_name;
+    trap->cb = hook_cb;
+    trap->ttl = drakvuf_get_limited_traps_ttl(drakvuf);
+
+    prepare(trap, params);
+
+    if (!init_breakpoint(drakvuf, info, trap))
+    {
+        PRINT_DEBUG("%s for %s\n", ERROR_MSG_ADDING_TRAP, trap_name ? trap_name : trap->name);
+        delete static_cast<plugin_data*>(trap->data);
+        delete trap;
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(traps_mtx);
+    traps.push_back(trap);
+    return trap;
 }
 
 template<typename Params, typename IB>
@@ -752,7 +797,8 @@ void pluginex::register_trap(drakvuf_trap_t* trap)
         trap->data = new plugin_data(this, new Params);
     }
 
-    traps.push_back(std::move(trap));
+    std::lock_guard<std::mutex> lock(traps_mtx);
+    traps.push_back(trap);
 }
 
 #endif // PLUGIN_EX_H

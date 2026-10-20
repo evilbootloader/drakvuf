@@ -175,6 +175,7 @@ void librarymon::print_call_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, c
 
     if (m_output_format == OUTPUT_DEFAULT)
     {
+        std::lock_guard<std::mutex> lock(fmt::cout_mutex);
         deffmt::print("librarymon", drakvuf, info,
             keyval("EPROCESS", fmt::Xval(info->proc_data.base_addr)),
             keyval("MODULE_NAME", fmt::Qstr(cname)),
