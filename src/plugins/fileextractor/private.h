@@ -538,7 +538,9 @@ struct FILE_FS_DEVICE_INFORMATION
 } __attribute__((packed));
 
 // TODO Move into "task_t" as "MAX_READ_BYTES"
-static const uint64_t BYTES_TO_READ = 0x10000;
+// The bytes copied per chunk, each costs three injected calls: map, copy, unmap.
+// A multiple of the 64 KiB allocation granularity, which view offsets must keep.
+static const uint64_t BYTES_TO_READ = 0x100000;
 
 // FILE_FS_DEVICE_INFORMATION.DeviceType of a file on a disk, the only one extracted
 static const uint32_t FILE_DEVICE_DISK = 7;
