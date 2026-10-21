@@ -847,7 +847,7 @@ void win_syscalls::print_syscall(
         from_dll_opt = fmt::Estr(std::move(*from_dll));
 
     if (from_parent_dll.has_value())
-        from_dll_opt = fmt::Estr(std::move(*from_parent_dll));
+        from_parent_dll_opt = fmt::Estr(std::move(*from_parent_dll));
 
     if (mode != MAXIMUM_MODE)
         priv_mode_opt = fmt::Rstr(mode == USER_MODE ? "User" : "Kernel");
