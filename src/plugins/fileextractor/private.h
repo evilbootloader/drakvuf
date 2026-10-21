@@ -329,6 +329,12 @@ public:
     bool closed{false};    // indicates whether the file handle was closed.
     bool error{false};    // indicates whether error occurred.
 
+    // Other threads' operations on the handle while an injected call of the task is in
+    // flight, applied once the extraction is done: the file offset and the data of the
+    // writes that returned, in their order, and a close of the handle.
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> deferred_writes;
+    bool close_deferred{false};
+
     union
     {
         struct
@@ -408,6 +414,13 @@ public:
         }
     }
 
+    // Every stage but pending and finished waits for the return of the call
+    // injected on the task's thread (target)
+    bool injection_in_flight()
+    {
+        return m_stage != stage_t::pending && m_stage != stage_t::finished;
+    }
+
     std::string to_str(const stage_t stage)
     {
 
@@ -461,7 +474,9 @@ struct writefile_result_t : public PluginResult
           len(),
           str(),
           byteoffset(),
-          idx()
+          idx(),
+          task_id(),
+          file_obj()
     {
     }
 
@@ -469,6 +484,9 @@ struct writefile_result_t : public PluginResult
     uint64_t str;
     uint64_t byteoffset;
     int idx;
+    // The task when the call was made, it may extract the file at the return
+    uint64_t task_id;
+    addr_t file_obj;
 };
 
 struct IO_STATUS_BLOCK_32

@@ -355,6 +355,9 @@ event_response_t win_fileextractor::setinformation_cb(drakvuf_t,
         // free resourses after extraction and first NtWriteFile result from saved data
         free_resources(info, *task);
         task->extracted = true;
+        apply_deferred_writes(*task);
+        if (task->close_deferred)
+            finish_deferred_close(info, *task);
     }
 
     PRINT_DEBUG("[FILEEXTRACTOR] [%8zu] [%d:%d] On NtSetInformationFile handled\n"
@@ -457,7 +460,11 @@ event_response_t win_fileextractor::writefile_cb(drakvuf_t,
             // free resourses after extraction and first NtWriteFile result from saved data
             free_resources(info, *task);
             task->extracted = true;
+            apply_deferred_writes(*task);
             writefile_cb_impl(drakvuf, info, *task, task->first_str, task->first_len);
+            // The handle is gone, so the first write fails in the guest
+            if (task->close_deferred)
+                finish_deferred_close(info, *task);
         }
     }
     // file update
@@ -478,32 +485,95 @@ event_response_t win_fileextractor::writefile_cb(drakvuf_t,
     return VMI_EVENT_RESPONSE_NONE;
 }
 
+static uint64_t get_write_byteoffset(bool append, addr_t write_offset_addr,
+    uint64_t write_offset, uint64_t currentbyteoffset)
+{
+    if (append)
+        return FILE_WRITE_TO_END_OF_FILE;
+
+    // check for special offset
+    if (!write_offset_addr || !((write_offset & 0xffffffff) ^ FILE_USE_FILE_POINTER_POSITION))
+        return currentbyteoffset;
+
+    return write_offset;
+}
+
 void win_fileextractor::writefile_cb_impl(drakvuf_t,
     drakvuf_trap_info_t* info,
     task_t& task, uint64_t str, uint64_t len)
 {
+    hook_write_return(info, task, str, len,
+        get_write_byteoffset(task.append, task.write_offset_addr, task.write_offset, task.currentbyteoffset));
+}
+
+void win_fileextractor::hook_write_return(drakvuf_trap_info_t* info,
+    task_t& task, uint64_t str, uint64_t len, uint64_t byteoffset)
+{
     // return hook setup
     auto hook = createReturnHook<writefile_result_t>(info,
             &win_fileextractor::writefile_ret_cb);
+    if (!hook)
+        return;
     auto params = libhook::GetTrapParams<writefile_result_t>(hook->trap_);
 
     params->len = len;
     params->str = str;
     params->idx = task.idx;
-
-    if (!task.append)
-    {
-        // check for special offset
-        if (!task.write_offset_addr || !((task.write_offset & 0xffffffff) ^ FILE_USE_FILE_POINTER_POSITION))
-            params->byteoffset = task.currentbyteoffset;
-        else
-            params->byteoffset = task.write_offset;
-    }
-    else
-        params->byteoffset = FILE_WRITE_TO_END_OF_FILE;
+    params->byteoffset = byteoffset;
+    params->task_id = make_task_id(task);
+    params->file_obj = task.file_obj;
 
     auto hook_id = make_hook_id(info, params->target_rsp);
     writefile_ret_hooks[hook_id] = std::move(hook);
+}
+
+// Another thread writes to the handle while an injected call of the task is in flight.
+// The write reaches the file before or after the section view is copied, so its data is
+// applied over the copy once the extraction is done (apply_deferred_writes()). Its offset
+// is computed here: the task's offset fields belong to the write that started the extraction.
+void win_fileextractor::defer_write(vmi_instance_t vmi, drakvuf_trap_info_t* info,
+    task_t& task, handle_t handle)
+{
+    addr_t str = drakvuf_get_function_argument(drakvuf, info, 6);
+    uint32_t len = drakvuf_get_function_argument(drakvuf, info, 7);
+    addr_t write_offset_addr = drakvuf_get_function_argument(drakvuf, info, 8);
+
+    uint64_t write_offset = 0;
+    uint64_t currentbyteoffset = 0;
+    if (write_offset_addr)
+        get_write_offset(vmi, info, write_offset_addr, &write_offset);
+    get_file_object_currentbyteoffset(vmi, info, handle, &currentbyteoffset);
+
+    hook_write_return(info, task, str, len,
+        get_write_byteoffset(task.append, write_offset_addr, write_offset, currentbyteoffset));
+}
+
+void win_fileextractor::apply_deferred_writes(task_t& task)
+{
+    if (task.idx && !task.error)
+        for (const auto& [offset, data]: task.deferred_writes)
+            save_file_chunk_rb(task.idx, offset, data.data(), data.size());
+
+    if (!task.deferred_writes.empty())
+        PRINT_DEBUG("[FILEEXTRACTOR] Applied %zu deferred writes: pid %lu, handle %#lx\n"
+            , task.deferred_writes.size(), task.pid, task.handle);
+
+    task.deferred_writes.clear();
+}
+
+// The handle was closed on another thread while an injected call of the task was in
+// flight: finish the task like close_cb_handle_extracted() once the extraction is done
+void win_fileextractor::finish_deferred_close(drakvuf_trap_info_t* info, task_t& task)
+{
+    PRINT_DEBUG("[FILEEXTRACTOR] Finish deferred close: pid %lu, handle %#lx\n"
+        , task.pid, task.handle);
+
+    task.closed = true;
+    calc_checksum(task);
+    update_file_metadata(nullptr, task);
+    print_file_information(info, task);
+    // The registers are this thread's own, the extraction restored them already
+    remove_task(info, task, nullptr, false);
 }
 
 bool FAILED(unsigned long rax)
@@ -533,6 +603,31 @@ event_response_t win_fileextractor::writefile_ret_cb(drakvuf_t drakvuf,
     uint64_t len = params_copy.len;
     uint64_t byteoffset = params_copy.byteoffset;
     int idx = params_copy.idx;
+
+    // The task may have started or finished an extraction since the call
+    auto task_it = tasks.find(params_copy.task_id);
+    task_t* task = nullptr;
+    if (task_it != tasks.end() && task_it->second->file_obj == params_copy.file_obj)
+        task = task_it->second.get();
+
+    if (task && task->injection_in_flight())
+    {
+        read_mem_chunks(info->regs->cr3, str, byteoffset, len,
+            [task](uint64_t chunk_offset, const uint8_t* data, size_t chunk_size)
+        {
+            task->deferred_writes.emplace_back(chunk_offset, std::vector<uint8_t>(data, data + chunk_size));
+        });
+        PRINT_DEBUG("[FILEEXTRACTOR] [%8zu] [%d:%d] Deferred NtWriteFile return\n"
+            , info->event_uid
+            , info->attached_proc_data.pid, info->attached_proc_data.tid
+        );
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    if (task && task->idx)
+        idx = task->idx;
+    if (!idx)
+        return VMI_EVENT_RESPONSE_NONE;
 
     dump_mem_to_file(info->regs->cr3, str, idx, byteoffset, len);
 
@@ -1648,7 +1743,7 @@ bool win_fileextractor::save_file_chunk(int file_sequence_number,
 }
 
 bool win_fileextractor::save_file_chunk_rb(int file_sequence_number, uint64_t currentoffset,
-    void* buffer,
+    const void* buffer,
     size_t size)
 {
     auto file = get_data_filename(this->dump_folder, file_sequence_number);
@@ -1672,6 +1767,17 @@ bool win_fileextractor::save_file_chunk_rb(int file_sequence_number, uint64_t cu
 }
 
 void win_fileextractor::dump_mem_to_file(uint64_t cr3, addr_t str, int idx, uint64_t offset, size_t size)
+{
+    read_mem_chunks(cr3, str, offset, size,
+        [&](uint64_t chunk_offset, const uint8_t* data, size_t chunk_size)
+    {
+        save_file_chunk_rb(idx, chunk_offset, data, chunk_size);
+    });
+}
+
+// Passes the readable pages of a write's buffer to sink with their file offsets
+void win_fileextractor::read_mem_chunks(uint64_t cr3, addr_t str, uint64_t offset, size_t size,
+    const std::function<void(uint64_t, const uint8_t*, size_t)>& sink)
 {
     vmi_lock_guard vmi(drakvuf);
     ACCESS_CONTEXT(ctx,
@@ -1708,7 +1814,7 @@ void win_fileextractor::dump_mem_to_file(uint64_t cr3, addr_t str, int idx, uint
 
             if (access_ptrs[i])
             {
-                save_file_chunk_rb(idx, currentbyteoffset, static_cast<uint8_t*>(access_ptrs[i]) + intra_page_offset, write_size);
+                sink(currentbyteoffset, static_cast<uint8_t*>(access_ptrs[i]) + intra_page_offset, write_size);
                 // check for special offset
                 if (((currentbyteoffset & 0xffffffff) ^ FILE_WRITE_TO_END_OF_FILE))
                     currentbyteoffset += write_size;
@@ -1829,19 +1935,46 @@ bool win_fileextractor::is_handle_valid(handle_t handle)
     return handle && !VMI_GET_BIT(handle, 31);
 }
 
-task_t* win_fileextractor::close_cb_get_task(drakvuf_trap_info_t* info)
+// The task whose injected call returns to this hook. Only a task with a call in
+// flight waits for one: an idle task keeps the context of its last injection,
+// which a later call of the same thread would match.
+task_t* win_fileextractor::find_returning_task(drakvuf_trap_info_t* info)
 {
-    task_t* task = nullptr;
     for (auto& i: tasks)
-        if (drakvuf_check_return_context(drakvuf,
+        if (i.second->injection_in_flight() &&
+            drakvuf_check_return_context(drakvuf,
                 info,
                 i.second->target.ret_pid,
                 i.second->target.ret_tid,
                 i.second->target.ret_rsp))
-        {
-            task = i.second.get();
-            break;
-        }
+            return i.second.get();
+
+    return nullptr;
+}
+
+// A task found by its handle while its injected call is in flight on its thread,
+// e.g. another thread of the process writes to the same handle. Only the return
+// of that call may advance the task: dispatch_task() takes this call's registers
+// for its result and restores or reuses the registers saved on the task's thread,
+// moving this thread onto that thread's stack. The caller defers or skips the call.
+bool win_fileextractor::is_task_busy(drakvuf_trap_info_t* info, task_t* task, const char* action)
+{
+    if (!task->injection_in_flight())
+        return false;
+
+    PRINT_DEBUG("[FILEEXTRACTOR] [%8zu] [%d:%d] [%d:%u] "
+        "%s on injection in flight\n"
+        , info->event_uid
+        , info->attached_proc_data.pid, info->attached_proc_data.tid
+        , task->target.ret_pid, task->target.ret_tid
+        , action
+    );
+    return true;
+}
+
+task_t* win_fileextractor::close_cb_get_task(drakvuf_trap_info_t* info)
+{
+    task_t* task = find_returning_task(info);
 
     if (!task && !is_stopping())
     {
@@ -1861,6 +1994,11 @@ task_t* win_fileextractor::close_cb_get_task(drakvuf_trap_info_t* info)
         }
 
         task = task_it->second.get();
+        if (is_task_busy(info, task, "Defer close"))
+        {
+            task->close_deferred = true;
+            return nullptr;
+        }
     }
 
     return task;
@@ -1961,6 +2099,7 @@ void win_fileextractor::close_cb_handle_unextracted(drakvuf_trap_info_t* info,
 
     if (task_t::stage_t::finished == task->stage())
     {
+        apply_deferred_writes(*task);
         calc_checksum(*task);
         update_file_metadata(info, *task);
         print_file_information(info, *task);
@@ -2118,6 +2257,9 @@ task_t* win_fileextractor::get_task_for_eof(vmi_instance_t vmi,
     }
 
     task_t* task = tasks.find(id)->second.get();
+    if (is_task_busy(info, task, "Skip NtSetInformationFile"))
+        return nullptr;
+
     task->new_eof = eof;
     return task;
 }
@@ -2129,17 +2271,7 @@ task_t* win_fileextractor::setinformation_cb_get_task(drakvuf_trap_info_t* info)
     // checking the call context
     // if returned from the injected call, then we continue extracting file
     // else we make a new task, or update extracted file
-    task_t* task = nullptr;
-    for (auto& i: tasks)
-        if (drakvuf_check_return_context(drakvuf,
-                info,
-                i.second->target.ret_pid,
-                i.second->target.ret_tid,
-                i.second->target.ret_rsp))
-        {
-            task = i.second.get();
-            break;
-        }
+    task_t* task = find_returning_task(info);
 
     if (task)
         return task->extracted ? nullptr : task;
@@ -2173,6 +2305,11 @@ task_t* win_fileextractor::setinformation_cb_get_task(drakvuf_trap_info_t* info)
     if (task && task->extracted)
         return nullptr;
 
+    // As for an extracted task, the end of file and delete requests do not change
+    // an extraction once it runs
+    if (task && is_task_busy(info, task, "Skip NtSetInformationFile"))
+        return nullptr;
+
     return task;
 }
 
@@ -2183,17 +2320,7 @@ task_t* win_fileextractor::writefile_cb_get_task(drakvuf_trap_info_t* info)
     // checking the call context
     // if returned from the injected call, then we continue extracting file
     // else we make a new task, or update extracted file
-    task_t* task = nullptr;
-    for (auto& i: tasks)
-        if (drakvuf_check_return_context(drakvuf,
-                info,
-                i.second->target.ret_pid,
-                i.second->target.ret_tid,
-                i.second->target.ret_rsp))
-        {
-            task = i.second.get();
-            break;
-        }
+    task_t* task = find_returning_task(info);
 
     addr_t handle = drakvuf_get_function_argument(drakvuf, info, 1);
 
@@ -2244,6 +2371,11 @@ task_t* win_fileextractor::writefile_cb_get_task(drakvuf_trap_info_t* info)
             tasks[id]->process_name = info->proc_data.name;
         }
         task = tasks.find(id)->second.get();
+        if (is_task_busy(info, task, "Defer NtWriteFile"))
+        {
+            defer_write(vmi, info, *task, handle);
+            return nullptr;
+        }
     }
 
     if (task && task->error)

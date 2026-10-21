@@ -110,6 +110,7 @@
 #include "helpers/exclude_matcher.h"
 #include "private.h"
 
+#include <functional>
 #include <map>
 #include <utility>
 #include <cstdint>
@@ -239,8 +240,10 @@ private:
         void* buffer,
         size_t size);
     bool save_file_chunk_rb(int file_sequence_number, uint64_t currentoffset,
-        void* buffer,
+        const void* buffer,
         size_t size);
+    void read_mem_chunks(uint64_t cr3, addr_t str, uint64_t offset, size_t size,
+        const std::function<void(uint64_t, const uint8_t*, size_t)>& sink);
     void dump_mem_to_file(uint64_t cr3, addr_t str, int idx, uint64_t offset, size_t size);
     uint64_t make_task_id(vmi_pid_t pid, handle_t handle);
     uint64_t make_task_id(task_t&);
@@ -259,6 +262,12 @@ private:
     void print_extraction_failure(drakvuf_trap_info_t* info, const std::string& filename, const std::string& message);
     void print_extraction_exclusion(drakvuf_trap_info_t* info, const std::string& filename);
 
+    task_t* find_returning_task(drakvuf_trap_info_t*);
+    bool is_task_busy(drakvuf_trap_info_t*, task_t*, const char* action);
+    void defer_write(vmi_instance_t, drakvuf_trap_info_t*, task_t&, handle_t);
+    void apply_deferred_writes(task_t&);
+    void finish_deferred_close(drakvuf_trap_info_t*, task_t&);
+    void hook_write_return(drakvuf_trap_info_t*, task_t&, uint64_t str, uint64_t len, uint64_t byteoffset);
     task_t* close_cb_get_task(drakvuf_trap_info_t*);
     task_t* get_task_for_delete(vmi_instance_t, drakvuf_trap_info_t*,
         handle_t handle, addr_t fileinfo, uint32_t fileinfoclass);
