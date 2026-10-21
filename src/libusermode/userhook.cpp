@@ -313,12 +313,26 @@ bool make_trap(vmi_instance_t vmi, drakvuf_t drakvuf, addr_t process_dtb, hook_t
 
     // during CoW we need to find all traps placed on the same physical page
     // that's why we'll manually resolve vaddr and store paddr under trap->breakpoint.addr
-    addr_t pa;
+    page_info_t page = {};
 
-    if (vmi_pagetable_lookup(vmi, process_dtb, exec_func, &pa) != VMI_SUCCESS)
+    if (vmi_pagetable_lookup_extended(vmi, process_dtb, exec_func, &page) != VMI_SUCCESS)
     {
         PRINT_DEBUG("[USERHOOK] Failed to lookup paddr in make_trap\n");
         return false;
+    }
+    addr_t pa = page.paddr;
+
+    // An export that is data, such as msvcrt's _pgmptr, is never called. Its breakpoint
+    // would only copy the page again on every write to it, with the VM paused.
+    if (vmi_get_page_mode(vmi, 0) == VMI_PM_IA32E)
+    {
+        const auto& entries = page.x86_ia32e;
+        addr_t levels = entries.pml4e_value | entries.pdpte_value | entries.pgd_value | entries.pte_value;
+        if (VMI_GET_BIT(levels, 63))
+        {
+            PRINT_DEBUG("[USERHOOK] %s is not in executable memory, not hooked\n", target->target_name.c_str());
+            return false;
+        }
     }
 
     drakvuf_trap_t* trap = g_slice_new0(drakvuf_trap_t);
