@@ -734,6 +734,17 @@ win_fileextractor::error win_fileextractor::dispatch_task(
 {
     task.on_return = task.injection_in_flight();
 
+    // While the plugin stops, an extraction past the timeout ends at the return of
+    // its current call instead of injecting the next one. DRAKVUF exits when its own
+    // stop wait runs out, and a call still in the guest then returns to a frame
+    // nothing restores.
+    if (task.on_return && timeout && is_stopping() &&
+        g_get_real_time() / G_USEC_PER_SEC - begin_stop_at > timeout)
+    {
+        print_extraction_failure(info, task.filename, "Timeout");
+        return error::error;
+    }
+
     error status = error::error;
     switch (task.stage())
     {
