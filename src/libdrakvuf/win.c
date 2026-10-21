@@ -582,6 +582,12 @@ bool win_is_wow64(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     if ( (info->regs->cs_sel & 3) == 0)
         return 0;
 
+    // A WoW64 thread also runs 64-bit code: the 64-bit ntdll and the WoW64 layer, which
+    // take arguments in registers and return to 64-bit addresses. 32-bit code runs in
+    // compatibility mode, with the KGDT64_R3_CMCODE selector.
+    if ( (info->regs->cs_sel & ~3) != 0x20 )
+        return 0;
+
     addr_t wow_ctx;
     addr_t ethread = drakvuf_get_current_thread(drakvuf, info);
     return drakvuf_get_wow_context(drakvuf, ethread, &wow_ctx);
