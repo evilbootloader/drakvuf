@@ -773,11 +773,13 @@ win_fileextractor::error win_fileextractor::dispatch_pending(
     drakvuf_trap_info_t* info,
     task_t& task)
 {
+    // Saved first: the caller restores them on every error, a new task has none yet
+    // and a task restarted at close has those of an earlier extraction
+    memcpy(&task.target.regs, info->regs, sizeof(x86_registers_t));
+
     // do not start dumping new file
     if (this->is_stopping())
         return error::none;
-
-    memcpy(&task.target.regs, info->regs, sizeof(x86_registers_t));
 
     if (!get_file_object_flags(info, vmi, task.handle, &task.fo_flags))
         return error::error;
