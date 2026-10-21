@@ -786,6 +786,13 @@ win_fileextractor::error win_fileextractor::dispatch_pending(
     if (!get_file_object_flags(info, vmi, task.handle, &task.fo_flags))
         return error::error;
 
+    // The type ZwQueryVolumeInformationFile reports, read from the file object without
+    // injecting it. Most writes go to named pipes and the null device.
+    uint32_t device_type = 0;
+    if (get_file_device_type(vmi, info, task.handle, &device_type) &&
+        FILE_DEVICE_DISK != device_type)
+        return stop_on_device_type(info, task, device_type);
+
     task.target_process_base = info->attached_proc_data.base_addr;
     task.target.ret_pid = info->attached_proc_data.pid;
     task.target.ret_tid = info->attached_proc_data.tid;
@@ -830,22 +837,28 @@ win_fileextractor::error win_fileextractor::dispatch_queryvolumeinfo(
             return error::error;
         }
 
-        if (7 != dev_info.device_type) // FILE_DEVICE_DISK
-        {
-            ostringstream msg;
-            msg << "ZwQueryVolumeInformationFile stop processing device type "
-                << dev_info.device_type;
-
-            print_extraction_failure(info, task.filename, msg.str());
-            task.stage(task_t::stage_t::finished);
-            return error::none;
-        }
+        if (FILE_DEVICE_DISK != dev_info.device_type)
+            return stop_on_device_type(info, task, dev_info.device_type);
 
         if (!inject_queryinfo(info, vmi, task))
             return error::error;
     }
 
     return error::success;
+}
+
+// Files that are not on a disk are not extracted. The message names
+// ZwQueryVolumeInformationFile however the type was read, so the record stays the same.
+win_fileextractor::error win_fileextractor::stop_on_device_type(drakvuf_trap_info_t* info,
+    task_t& task,
+    uint32_t device_type)
+{
+    ostringstream msg;
+    msg << "ZwQueryVolumeInformationFile stop processing device type " << device_type;
+
+    print_extraction_failure(info, task.filename, msg.str());
+    task.stage(task_t::stage_t::finished);
+    return error::none;
 }
 
 win_fileextractor::error win_fileextractor::dispatch_queryinfo(
@@ -1377,6 +1390,34 @@ bool win_fileextractor::get_file_object_handle_count(drakvuf_trap_info_t* info,
         *handle_count = handles_value;
 
     return success;
+}
+
+// The type of the device the file object was opened on, read from guest memory
+bool win_fileextractor::get_file_device_type(vmi_instance_t vmi,
+    drakvuf_trap_info_t* info,
+    handle_t handle,
+    uint32_t* device_type)
+{
+    addr_t obj = drakvuf_get_obj_by_handle(drakvuf,
+            info->attached_proc_data.base_addr,
+            handle);
+    if (!obj)
+        return false;
+
+    addr_t file = obj + this->offsets[OBJECT_HEADER_BODY];
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = file + this->offsets[FILE_OBJECT_DEVICEOBJECT]
+    );
+
+    addr_t device = 0;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &device) || !device)
+        return false;
+
+    ctx.addr = device + this->offsets[DEVICE_OBJECT_DEVICETYPE];
+    return VMI_SUCCESS == vmi_read_32(vmi, &ctx, device_type);
 }
 
 bool win_fileextractor::get_file_object_flags(drakvuf_trap_info_t* info,

@@ -199,6 +199,7 @@ private:
     error dispatch_task(vmi_instance_t, drakvuf_trap_info_t*, task_t&);
     error dispatch_pending(vmi_instance_t, drakvuf_trap_info_t*, task_t&);
     error dispatch_queryvolumeinfo(vmi_instance_t, drakvuf_trap_info_t*, task_t&);
+    error stop_on_device_type(drakvuf_trap_info_t*, task_t&, uint32_t device_type);
     error dispatch_queryinfo(vmi_instance_t, drakvuf_trap_info_t*, task_t&);
     error dispatch_createsection(vmi_instance_t, drakvuf_trap_info_t*, task_t&);
     error dispatch_mapview(vmi_instance_t, drakvuf_trap_info_t*, task_t&);
@@ -222,6 +223,7 @@ private:
         handle_t,
         uint64_t* handle_count);
 
+    bool get_file_device_type(vmi_instance_t, drakvuf_trap_info_t*, handle_t, uint32_t*);
     bool get_file_object_flags(drakvuf_trap_info_t*,
         vmi_instance_t,
         handle_t,
