@@ -732,6 +732,8 @@ win_fileextractor::error win_fileextractor::dispatch_task(
     drakvuf_trap_info_t* info,
     task_t& task)
 {
+    task.on_return = task.injection_in_flight();
+
     error status = error::error;
     switch (task.stage())
     {
@@ -1845,9 +1847,11 @@ uint64_t win_fileextractor::make_task_id(vmi_pid_t pid, handle_t handle)
     return (u64_pid << 32) | u64_handle;
 }
 
+// The id the task was created under. target.ret_pid is the same process, but only
+// set once an extraction starts, and a task removed before that stayed in the map.
 uint64_t win_fileextractor::make_task_id(task_t& task)
 {
-    return make_task_id(task.target.ret_pid, task.handle);
+    return make_task_id(task.pid, task.handle);
 }
 
 void win_fileextractor::free_pool(addr_t va)
@@ -1879,7 +1883,10 @@ void win_fileextractor::free_resources(drakvuf_trap_info_t* info, task_t& task)
         "pid %d, name '''%s''', stage %d\n"
         , task.target.ret_pid, task.filename.data()
         , (int)task.stage());
-    drakvuf_vmi_response_set_gpr_registers(drakvuf, info, &task.target.regs, true);
+    // Any other event is another call, possibly of another thread, and the saved
+    // registers are an earlier one's
+    if (task.on_return)
+        drakvuf_vmi_response_set_gpr_registers(drakvuf, info, &task.target.regs, true);
     free_pool(task.pool);
 }
 

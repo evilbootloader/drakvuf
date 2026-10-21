@@ -335,6 +335,10 @@ public:
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> deferred_writes;
     bool close_deferred{false};
 
+    // The event being dispatched is the return of the task's injected call: only then
+    // do the thread's registers belong to the injection and get restored.
+    bool on_return{false};
+
     union
     {
         struct
