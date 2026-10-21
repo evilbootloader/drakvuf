@@ -946,6 +946,8 @@ win_fileextractor::error win_fileextractor::dispatch_mapview(
         msg << "ZwMapViewOfSection failed with status 0x"
             << std::hex << info->regs->rax;
         print_extraction_failure(info, task.filename, msg.str());
+        // Nothing more is injected: the caller restores the registers
+        return error::error;
     }
     else
     {
