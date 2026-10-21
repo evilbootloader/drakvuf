@@ -114,6 +114,7 @@
 #include <glib.h>
 #include <libusermode/userhook.hpp>
 #include "plugins/plugins_ex.h"
+#include "plugins/helpers/return_tracker.h"
 
 struct apimon_config
 {
@@ -126,6 +127,13 @@ struct apimon_module
     std::string name;
     addr_t base;
     size_t size;
+};
+
+// A hooked call in progress, reported at its return
+struct apimon_call
+{
+    hook_target_entry_t* target;
+    std::vector<uint64_t> arguments;
 };
 
 class apimon: public pluginex
@@ -141,11 +149,10 @@ public:
 
     std::optional<std::string> resolve_module(drakvuf_t drakvuf, addr_t process, addr_t addr, vmi_pid_t pid);
 
-    event_response_t usermode_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info* info);
-
     void usermode_print(drakvuf_trap_info*, std::vector<uint64_t>&, hook_target_entry_t*);
 
-    std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
+    // One breakpoint per return address, shared by the calls returning there
+    return_tracker<apimon_call> returns;
 };
 
 #endif

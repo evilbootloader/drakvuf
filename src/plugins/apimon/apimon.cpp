@@ -112,17 +112,6 @@
 #include "crypto.h"
 
 
-namespace
-{
-
-struct ApimonReturnHookData : PluginResult
-{
-    std::vector<uint64_t> arguments;
-    hook_target_entry_t* target = nullptr;
-};
-
-}
-
 
 static event_response_t delete_process_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
@@ -137,11 +126,20 @@ static event_response_t delete_process_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
     }
 
     plugin->procs.erase(pid);
+    plugin->returns.forget_process(pid);
     return VMI_EVENT_RESPONSE_NONE;
 }
 
-void apimon::usermode_print(drakvuf_trap_info* info, std::vector<uint64_t>& args, hook_target_entry_t* target)
+void apimon::usermode_print(drakvuf_trap_info* hit_info, std::vector<uint64_t>& args, hook_target_entry_t* target)
 {
+    // The output formatters emit the trap's name as Method, and at the return
+    // the trap is the breakpoint shared by all calls returning there
+    drakvuf_trap_t trap = *hit_info->trap;
+    trap.name = target->target_name.c_str();
+    drakvuf_trap_info_t call_info = *hit_info;
+    call_info.trap = &trap;
+    drakvuf_trap_info_t* info = &call_info;
+
     std::map < std::string, std::string > extra_data;
 
     if (!strcmp(info->trap->name, "CryptGenKey"))
@@ -188,21 +186,6 @@ void apimon::usermode_print(drakvuf_trap_info* info, std::vector<uint64_t>& args
     );
 }
 
-event_response_t apimon::usermode_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info* info)
-{
-    auto params = libhook::GetTrapParams<ApimonReturnHookData>(info);
-
-    if (!params->verifyResultCallParams(drakvuf, info))
-        return VMI_EVENT_RESPONSE_NONE;
-
-    usermode_print(info, params->arguments, params->target);
-
-    auto hookID = make_hook_id(info, params->target_rsp);
-    ret_hooks.erase(hookID);
-
-    return VMI_EVENT_RESPONSE_NONE;
-}
-
 static event_response_t usermode_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info* info)
 {
     hook_target_entry_t* target = (hook_target_entry_t*)info->trap->data;
@@ -214,20 +197,16 @@ static event_response_t usermode_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info* i
     if (plugin->is_stopping())
         return VMI_EVENT_RESPONSE_NONE;
 
-    auto vmi = vmi_lock_guard(drakvuf);
-    vmi_v2pcache_flush(vmi, info->regs->cr3);
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+        vmi_v2pcache_flush(vmi, info->regs->cr3);
+    }
 
     addr_t ret_addr = drakvuf_get_function_return_address(drakvuf, info);
 
     if (!ret_addr)
     {
         PRINT_DEBUG("[APIMON-USER] Failed to read return address from the stack.\n");
-        return VMI_EVENT_RESPONSE_NONE;
-    }
-
-    addr_t ret_paddr;
-    if ( VMI_SUCCESS != vmi_pagetable_lookup(vmi, info->regs->cr3, ret_addr, &ret_paddr) )
-    {
         return VMI_EVENT_RESPONSE_NONE;
     }
 
@@ -242,19 +221,17 @@ static event_response_t usermode_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info* i
     if (target->no_retval)
     {
         plugin->usermode_print(info, arguments, target);
+        return VMI_EVENT_RESPONSE_NONE;
     }
-    else
-    {
-        auto hook = plugin->createReturnHook<ApimonReturnHookData>(info,
-                &apimon::usermode_return_hook_cb, target->target_name.data(), drakvuf_get_limited_traps_ttl(drakvuf));
-        auto params = libhook::GetTrapParams<ApimonReturnHookData>(hook->trap_);
-        auto hookID = make_hook_id(info, params->target_rsp);
 
-        params->arguments = std::move(arguments);
-        params->target = target;
-
-        plugin->ret_hooks[hookID] = std::move(hook);
-    }
+    // One breakpoint per return address, shared by the calls returning there.
+    // Kept between calls only in code mapped from a file: writing to the page
+    // of a breakpoint pauses the VM to copy it again, which JIT code does a lot.
+    bool transient = !plugin->resolve_module(drakvuf, info->proc_data.base_addr, ret_addr, info->proc_data.pid);
+    auto result = plugin->returns.track(drakvuf, info, ret_addr, apimon_call{ target, std::move(arguments) }, transient);
+    if (result != return_track_result::tracked)
+        PRINT_DEBUG("[APIMON-USER] pid %d: no return breakpoint for %s at 0x%lx, not reported\n",
+            info->proc_data.pid, target->target_name.c_str(), ret_addr);
 
     return VMI_EVENT_RESPONSE_NONE;
 }
@@ -384,6 +361,13 @@ std::optional<std::string> apimon::resolve_module(drakvuf_t drakvuf, addr_t proc
 
 apimon::apimon(drakvuf_t drakvuf, const apimon_config* c, output_format_t output)
     : pluginex(drakvuf, output)
+    , returns(*this, return_tracker_mode::user, "apimon return",
+          [this](drakvuf_t, drakvuf_trap_info_t* info, apimon_call& call)
+{
+    this->usermode_print(info, call.arguments, call.target);
+},
+// Serialized like the other callbacks of apimon, which share its state
+false)
 {
     if (!drakvuf_are_userhooks_supported(drakvuf))
     {
