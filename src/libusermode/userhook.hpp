@@ -139,6 +139,7 @@ struct hook_target_entry_t
     const std::vector < std::unique_ptr < ArgumentPrinter > >& argument_printers;
     target_hook_state state;
     drakvuf_trap_t* trap = nullptr;
+    bool shared{false};     // trap is a breakpoint of userhook::shared_images, not this process's
     void* plugin;
 
     hook_target_entry_t(std::string target_name,

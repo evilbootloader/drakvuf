@@ -356,6 +356,195 @@ bool make_trap(vmi_instance_t vmi, drakvuf_t drakvuf, addr_t process_dtb, hook_t
     return false;
 }
 
+static userhook::image_key_t image_key(const dll_t& dll)
+{
+    return { dll.v.mmvad.prototype_pte, dll.v.real_dll_base };
+}
+
+// The plugins and hook lists that fill a dll_t are the same in every process, but a
+// plugin may hook in some processes only
+static bool same_targets(const dll_t& a, const dll_t& b)
+{
+    if (a.targets.size() != b.targets.size())
+        return false;
+
+    for (size_t i = 0; i < a.targets.size(); i++)
+    {
+        const auto& x = a.targets[i];
+        const auto& y = b.targets[i];
+        if (x.target_name != y.target_name || x.callback != y.callback || x.plugin != y.plugin)
+            return false;
+    }
+    return true;
+}
+
+// A shared breakpoint: calls the target of the process that hit it
+static event_response_t shared_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    auto hook = static_cast<const userhook::shared_hook*>(info->trap->data);
+    auto& plugin = userhook::get_instance(drakvuf);
+
+    auto it = plugin.loaded_dlls.find(get_proc_data(drakvuf, info).pid);
+    if (it == plugin.loaded_dlls.end())
+        return VMI_EVENT_RESPONSE_NONE;
+
+    for (auto& dll : it->second)
+    {
+        if (!dll.shares_image || image_key(dll) != hook->image)
+            continue;
+
+        // After a copy-on-write of the page the process has its own breakpoint
+        auto& target = dll.targets[hook->slot];
+        if (!target.shared)
+            return VMI_EVENT_RESPONSE_NONE;
+
+        drakvuf_trap_t trap = *info->trap;
+        trap.data = &target;
+        drakvuf_trap_info_t target_info = *info;
+        target_info.trap = &trap;
+        return target.callback(drakvuf, &target_info);
+    }
+
+    // A process whose DLLs were not seen being loaded, not hooked before either
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+// The first process sharing an image whose processes are hooked
+static const dll_t* image_model(userhook* plugin, const userhook::image_key_t& key)
+{
+    for (const auto& [pid, dlls] : plugin->loaded_dlls)
+        for (const auto& dll : dlls)
+            if (dll.shares_image && image_key(dll) == key)
+                return &dll;
+    return nullptr;
+}
+
+static void notify_hooked(drakvuf_t drakvuf, userhook* plugin, dll_t* dll_meta)
+{
+    std::vector<hook_target_view_t> targets;
+
+    for (const auto& target : dll_meta->targets)
+    {
+        targets.emplace_back(target.target_name, target.offset, target.state);
+    }
+
+    for (const auto& reg : plugin->plugins)
+    {
+        reg.post_cb(drakvuf, (const dll_view_t*)dll_meta, targets, reg.extra);
+    }
+}
+
+/*
+ * A process done hooking a DLL: its breakpoints become the image's, or, when another
+ * process got there first, its breakpoints are replaced by the image's
+ */
+static void share_image(drakvuf_t drakvuf, userhook* plugin, dll_t* dll_meta)
+{
+    if (!dll_meta->v.mmvad.prototype_pte)
+        return;
+
+    auto key = image_key(*dll_meta);
+    auto it = plugin->shared_images.find(key);
+    if (it == plugin->shared_images.end())
+    {
+        auto& image = plugin->shared_images[key];
+        for (size_t i = 0; i < dll_meta->targets.size(); i++)
+        {
+            auto& target = dll_meta->targets[i];
+            if (target.state != HOOK_OK)
+                continue;
+
+            auto hook = std::make_unique<userhook::shared_hook>(userhook::shared_hook{ key, i, target.trap, target.offset });
+            target.trap->cb = shared_hook_cb;
+            target.trap->data = hook.get();
+            target.shared = true;
+            image.hooks.push_back(std::move(hook));
+        }
+        image.processes = 1;
+        dll_meta->shares_image = true;
+        PRINT_DEBUG("[USERHOOK] Shared image 0x%lx at 0x%lx: %zu hooks\n", key.first, key.second, image.hooks.size());
+        return;
+    }
+
+    auto model = image_model(plugin, key);
+    if (!model || !same_targets(*model, *dll_meta))
+    {
+        PRINT_DEBUG("[USERHOOK] Shared image 0x%lx at 0x%lx: other targets, %zu here and %zu there\n",
+            key.first, key.second, dll_meta->targets.size(), model ? model->targets.size() : 0);
+        return;
+    }
+    PRINT_DEBUG("[USERHOOK] Shared image 0x%lx at 0x%lx: joined after hooking\n", key.first, key.second);
+
+    for (const auto& hook : it->second.hooks)
+    {
+        auto& target = dll_meta->targets[hook->slot];
+        if (target.state == HOOK_OK && target.trap)
+            drakvuf_remove_trap(drakvuf, target.trap, wrap_delete);
+        target.trap = hook->trap;
+        target.state = HOOK_OK;
+        target.shared = true;
+    }
+    it->second.processes++;
+    dll_meta->shares_image = true;
+}
+
+/*
+ * A process maps an image that is hooked already: its targets use the image's
+ * breakpoints, without hooking anything. The targets that failed to hook in the
+ * first process fail here too.
+ */
+static bool join_shared_image(drakvuf_t drakvuf, userhook* plugin, dll_t* dll_meta, vmi_pid_t pid)
+{
+    auto key = image_key(*dll_meta);
+    auto it = plugin->shared_images.find(key);
+    if (!dll_meta->v.mmvad.prototype_pte || it == plugin->shared_images.end())
+        return false;
+
+    auto model = image_model(plugin, key);
+    if (!model || !same_targets(*model, *dll_meta))
+    {
+        PRINT_DEBUG("[USERHOOK] Shared image 0x%lx at 0x%lx: other targets, %zu here and %zu there\n",
+            key.first, key.second, dll_meta->targets.size(), model ? model->targets.size() : 0);
+        return false;
+    }
+
+    for (size_t i = 0; i < dll_meta->targets.size(); i++)
+    {
+        auto& target = dll_meta->targets[i];
+        target.state = HOOK_FAILED;
+        target.offset = model->targets[i].offset;
+        target.target_addr = model->targets[i].target_addr;
+    }
+
+    for (const auto& hook : it->second.hooks)
+    {
+        auto& target = dll_meta->targets[hook->slot];
+        target.pid = pid;
+        target.trap = hook->trap;
+        target.state = HOOK_OK;
+        target.shared = true;
+    }
+    it->second.processes++;
+    dll_meta->shares_image = true;
+    dll_meta->v.is_hooked = true;
+
+    PRINT_DEBUG("[USERHOOK] pid %d: DLL at 0x%lx shares the hooks of its image\n", pid, dll_meta->v.real_dll_base);
+    notify_hooked(drakvuf, plugin, dll_meta);
+    return true;
+}
+
+// A process sharing the image is gone: the image's breakpoints go with the last one
+static void release_shared_image(drakvuf_t drakvuf, userhook* plugin, const userhook::image_key_t& key)
+{
+    auto it = plugin->shared_images.find(key);
+    if (it == plugin->shared_images.end() || --it->second.processes)
+        return;
+
+    for (const auto& hook : it->second.hooks)
+        drakvuf_remove_trap(drakvuf, hook->trap, wrap_delete);
+    plugin->shared_images.erase(it);
+}
+
 bool is_pagetable_loaded(vmi_instance_t vmi, addr_t vaddr, addr_t process_dtb)
 {
     page_info_t pinfo;
@@ -439,17 +628,8 @@ static event_response_t perform_hooking(drakvuf_t drakvuf, drakvuf_trap_info* in
 
     if (!was_hooked && dll_meta->v.is_hooked)
     {
-        std::vector<hook_target_view_t> targets;
-
-        for (const auto& target : dll_meta->targets)
-        {
-            targets.emplace_back(target.target_name, target.offset, target.state);
-        }
-
-        for (const auto& reg : plugin->plugins)
-        {
-            reg.post_cb(drakvuf, (const dll_view_t*)dll_meta, targets, reg.extra);
-        }
+        share_image(drakvuf, plugin, dll_meta);
+        notify_hooked(drakvuf, plugin, dll_meta);
     }
 
     return ret;
@@ -478,6 +658,8 @@ static event_response_t hook_dll(drakvuf_t drakvuf, drakvuf_trap_info_t* info, a
         auto mmvad = get_module_mmvad(drakvuf, proc_data.base_addr, dll_base);
         if (mmvad)
             dll_meta = create_dll_meta(drakvuf, info, plugin, &*mmvad);
+        if (dll_meta && join_shared_image(drakvuf, plugin, dll_meta, proc_data.pid))
+            return VMI_EVENT_RESPONSE_NONE;
     }
 
     return dll_meta ? perform_hooking(drakvuf, info, plugin, dll_meta) : VMI_EVENT_RESPONSE_NONE;
@@ -545,7 +727,8 @@ static void try_hook_ntdll(drakvuf_t drakvuf, drakvuf_trap_info_t* info, userhoo
 
         if (auto dll_meta = create_dll_meta(drakvuf, info, plugin, mmvad); dll_meta)
         {
-            perform_hooking(drakvuf, info, plugin, dll_meta);
+            if (!join_shared_image(drakvuf, plugin, dll_meta, proc_data.pid))
+                perform_hooking(drakvuf, info, plugin, dll_meta);
             ctx->is_hooked = dll_meta->v.is_hooked;
         }
     }
@@ -716,13 +899,15 @@ static event_response_t clean_process_address_space_hook_cb(drakvuf_t drakvuf, d
     {
         for (auto& target : it.targets)
         {
-            if (target.state == HOOK_OK)
+            if (target.state == HOOK_OK && !target.shared)
             {
                 PRINT_DEBUG("[USERHOOK] Erased trap for pid %d %s\n", exit_pid,
                     target.target_name.c_str());
                 drakvuf_remove_trap(drakvuf, target.trap, wrap_delete);
             }
         }
+        if (it.shares_image)
+            release_shared_image(drakvuf, plugin, image_key(it));
     }
 
     plugin->loaded_dlls.erase(vec_it);
@@ -768,9 +953,12 @@ static event_response_t copy_on_write_ret_cb(drakvuf_t drakvuf, drakvuf_trap_inf
             addr_t hook_va = ((params->vaddr >> 12) << 12) + (hook->trap->breakpoint.addr & 0xFFF);
             PRINT_DEBUG("adding hook at %lx\n", hook_va);
 
-            drakvuf_remove_trap(drakvuf, hook->trap, wrap_delete);
+            // The page is this process's own now, the shared breakpoint stays for the others
+            if (!hook->shared)
+                drakvuf_remove_trap(drakvuf, hook->trap, wrap_delete);
             hook->state = HOOK_FAILED;
             hook->trap = nullptr;
+            hook->shared = false;
             hook->pid = proc_data.pid;
 
             make_trap(vmi, drakvuf, info->regs->cr3, hook, hook_va);
@@ -930,13 +1118,18 @@ userhook::~userhook()
         {
             for (auto& target : loaded_dll.targets)
             {
-                if (target.state == HOOK_OK)
+                if (target.state == HOOK_OK && !target.shared)
                 {
                     drakvuf_remove_trap(this->drakvuf, target.trap, wrap_delete);
                 }
             }
         }
     }
+
+    for (const auto& [key, image] : this->shared_images)
+        for (const auto& hook : image.hooks)
+            drakvuf_remove_trap(this->drakvuf, hook->trap, wrap_delete);
+    this->shared_images.clear();
 
     for (auto trap : running_traps)
         rh_data_t::free_trap(trap);

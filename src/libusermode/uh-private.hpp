@@ -187,6 +187,7 @@ struct dll_t
     addr_t pf_max_addr;
 
     bool in_progress{false};
+    bool shares_image{false};   // counted in userhook::shared_images
     x86_registers_t regs;
 
     uint64_t stack_marker()
@@ -251,6 +252,31 @@ public:
 
     // map pid -> list of loaded/hooked dlls
     std::map<vmi_pid_t, std::vector<dll_t>> loaded_dlls;
+
+    /*
+     * DLL images hooked once for all processes that map them at the same address.
+     * Windows maps an image section at one address per boot, onto the same physical
+     * pages until a process writes to one of them, so one breakpoint per hooked
+     * function serves them all, where each process had its own on the same physical
+     * address. A breakpoint calls the target of the process that hit it.
+     */
+    using image_key_t = std::pair<addr_t, addr_t>;   // first prototype PTE, base address
+
+    struct shared_hook
+    {
+        image_key_t image;
+        size_t slot;                // the target's index in the dll_t of each process
+        drakvuf_trap_t* trap;
+        addr_t offset;
+    };
+
+    struct shared_image
+    {
+        unsigned processes{0};      // the dll_t sharing it
+        std::vector<std::unique_ptr<shared_hook>> hooks;
+    };
+
+    std::map<image_key_t, shared_image> shared_images;
 
     struct module_context_t
     {
