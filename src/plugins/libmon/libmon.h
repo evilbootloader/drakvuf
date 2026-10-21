@@ -231,12 +231,6 @@ private:
     void count_return_page(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t ret_addr, bool transient);
     void print_return_pages() const;
 
-    // Calls whose [rsp] was no return address, per library and function
-    std::map<std::string, uint64_t> refused_returns;
-    // rsp and [rsp] when the hook callback started, before anything else ran
-    addr_t hit_rsp = 0, hit_ret = 0;
-    uint64_t hit_uid = 0;
-    void log_refused_return(drakvuf_trap_info_t* info, const hooked_function& target, addr_t ret_addr);
 #endif
 };
 

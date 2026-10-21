@@ -144,7 +144,6 @@ enum class return_track_result
 {
     tracked,
     untranslated,       // the return address is not mapped
-    not_executable,     // the return address is not in executable memory: the function wasn't called
     no_trap,            // the breakpoint could not be added
 };
 
@@ -181,14 +180,26 @@ public:
      * At the entry of a hooked call, which returns to ret_addr. The thread is
      * paused until the callback returns, so the call is recorded before it can
      * return. With parallel events this can run on several vCPU threads.
-     * User mode: transient for a return address outside file-backed code.
+     * User mode: transient for a return address outside file-backed code, and
+     * always for one in memory that is not executable.
      */
     return_track_result track(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t ret_addr, Payload payload,
         bool transient = false)
     {
         addr_t ret_pa = 0;
-        if (auto result = translate(drakvuf, info, ret_addr, &ret_pa); result != return_track_result::tracked)
+        bool executable = true;
+        if (auto result = translate(drakvuf, info, ret_addr, &ret_pa, &executable); result != return_track_result::tracked)
             return result;
+
+        // The call itself may make it executable, as a ROP chain does that has
+        // VirtualProtect or mprotect return into its shellcode. Or the function
+        // was not called and [rsp] is data, maybe on the stack: a breakpoint kept
+        // there would copy the page again on every write to it, with the VM paused.
+        if (!executable)
+        {
+            PRINT_DEBUG("[RETURN-TRACKER] Return address 0x%lx is not executable, tracked as transient\n", ret_addr);
+            transient = true;
+        }
 
         if (!reserve_trap(ret_pa, transient && mode == return_tracker_mode::user))
             return return_track_result::no_trap;
@@ -298,7 +309,7 @@ private:
     }
 
     // Kernel addresses translate the same in every process, so they are looked up once
-    return_track_result translate(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t va, addr_t* pa)
+    return_track_result translate(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t va, addr_t* pa, bool* executable)
     {
         if (mode == return_tracker_mode::kernel)
         {
@@ -321,14 +332,8 @@ private:
             }
             *pa = page.paddr;
 
-            // What a hooked function finds at [rsp] is no return address when it wasn't called,
-            // and then it may well be on the stack: a breakpoint there would never be hit and
-            // copy the page again on every write to the stack, with the VM paused.
-            if (mode == return_tracker_mode::user && !is_executable(drakvuf, page))
-            {
-                PRINT_DEBUG("[RETURN-TRACKER] Return address 0x%lx is not executable\n", va);
-                return return_track_result::not_executable;
-            }
+            if (mode == return_tracker_mode::user)
+                *executable = is_executable(drakvuf, page);
         }
 
         if (mode == return_tracker_mode::kernel)

@@ -490,8 +490,6 @@ void drakvuf_unhook_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap) NOEXCEPT;
 #ifdef DRAKVUF_DEBUG
 const char* drakvuf_trap_owner_enter(const char* owner) NOEXCEPT;
 void drakvuf_trap_owner_leave(const char* previous) NOEXCEPT;
-/* Debug builds: whether drakvuf remapped the guest frame for breakpoints, and how many are on it */
-bool drakvuf_debug_gfn_remapped(drakvuf_t drakvuf, addr_t gfn, unsigned int* breakpoints) NOEXCEPT;
 #else
 static inline const char* drakvuf_trap_owner_enter(const char* owner) NOEXCEPT
 {

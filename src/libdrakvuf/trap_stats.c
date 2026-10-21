@@ -171,16 +171,6 @@ void drakvuf_trap_owner_leave(const char* previous)
     current_owner = previous;
 }
 
-bool drakvuf_debug_gfn_remapped(drakvuf_t drakvuf, addr_t gfn, unsigned int* breakpoints)
-{
-    drakvuf_lock_and_get_vmi(drakvuf);
-    bool remapped = g_hash_table_lookup(drakvuf->remapped_gfns, GSIZE_TO_POINTER(gfn)) != NULL;
-    GSList* on_gfn = g_hash_table_lookup(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(gfn));
-    *breakpoints = g_slist_length(on_gfn);
-    drakvuf_release_vmi(drakvuf);
-    return remapped;
-}
-
 gint64 trap_stats_now(void)
 {
     struct timespec ts;

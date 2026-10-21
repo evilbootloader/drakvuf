@@ -165,149 +165,9 @@ void libmon::count_return_page(drakvuf_t drakvuf, drakvuf_trap_info_t* info, add
     page->second.calls++;
 }
 
-// The first ones in detail, all of them counted, on stderr with the trap statistics
-void libmon::log_refused_return(drakvuf_trap_info_t* info, const hooked_function& target, addr_t ret_addr)
-{
-    uint64_t& count = this->refused_returns[target.so_path + "!" + target.config->function_name];
-    uint64_t total = 0;
-    for (const auto& [function, calls] : this->refused_returns)
-        total += calls;
-    count++;
-
-    if (total >= 30)
-        return;
-
-    const x86_registers_t* regs = info->regs;
-    vmi_pid_t pid = info->proc_data.pid;
-
-    fprintf(stderr, "[TRAP-STATS] libmon refused return: pid %d tid %d %s, %s!%s hooked at 0x%" PRIx64
-        " (base 0x%" PRIx64 "), rip 0x%" PRIx64 " rsp 0x%" PRIx64 " [rsp] 0x%" PRIx64 " cr3 0x%" PRIx64 "\n",
-        pid, info->proc_data.tid, info->proc_data.name ? info->proc_data.name : "?",
-        target.so_path.c_str(), target.config->function_name.c_str(), (uint64_t)target.va,
-        (uint64_t)target.so_base, (uint64_t)regs->rip, (uint64_t)regs->rsp, (uint64_t)ret_addr, (uint64_t)regs->cr3);
-    fprintf(stderr, "[TRAP-STATS]   rax 0x%" PRIx64 " rbx 0x%" PRIx64 " rcx 0x%" PRIx64 " rdx 0x%" PRIx64
-        " rsi 0x%" PRIx64 " rdi 0x%" PRIx64 " rbp 0x%" PRIx64 "\n",
-        (uint64_t)regs->rax, (uint64_t)regs->rbx, (uint64_t)regs->rcx, (uint64_t)regs->rdx,
-        (uint64_t)regs->rsi, (uint64_t)regs->rdi, (uint64_t)regs->rbp);
-    fprintf(stderr, "[TRAP-STATS]   r8 0x%" PRIx64 " r9 0x%" PRIx64 " r10 0x%" PRIx64 " r11 0x%" PRIx64
-        " r12 0x%" PRIx64 " r13 0x%" PRIx64 " r14 0x%" PRIx64 " r15 0x%" PRIx64 " rflags 0x%" PRIx64 "\n",
-        (uint64_t)regs->r8, (uint64_t)regs->r9, (uint64_t)regs->r10, (uint64_t)regs->r11,
-        (uint64_t)regs->r12, (uint64_t)regs->r13, (uint64_t)regs->r14, (uint64_t)regs->r15, (uint64_t)regs->rflags);
-
-    // [rsp] again through the same API, and through a fresh page walk and the physical page
-    addr_t again = drakvuf_get_function_return_address(this->drakvuf, info);
-
-    fprintf(stderr, "[TRAP-STATS]   at the start of the hook callback: event %" PRIu64 " rsp 0x%" PRIx64
-        " [rsp] 0x%" PRIx64 ", now: event %" PRIu64 " rsp 0x%" PRIx64 "\n",
-        this->hit_uid, (uint64_t)this->hit_rsp, (uint64_t)this->hit_ret, info->event_uid, (uint64_t)regs->rsp);
-
-    // The vCPU's registers now: the same as the event's while it waits for the response
-    {
-        vmi_lock_guard main(this->drakvuf);
-        uint64_t live_rip = 0, live_rsp = 0;
-        vmi_get_vcpureg(main, &live_rip, RIP, info->vcpu);
-        vmi_get_vcpureg(main, &live_rsp, RSP, info->vcpu);
-        fprintf(stderr, "[TRAP-STATS]   vCPU %u now: rip 0x%" PRIx64 " rsp 0x%" PRIx64 "%s\n", info->vcpu,
-            live_rip, live_rsp, live_rip == regs->rip && live_rsp == regs->rsp ? " (paused at the event)" : " (moved on)");
-    }
-
-    vmi_reader_guard vmi(this->drakvuf);
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = regs->cr3);
-
-    addr_t cached_pa = 0, walked_pa = 0, physical = 0;
-    vmi_pagetable_lookup(vmi, regs->cr3, regs->rsp, &cached_pa);
-    page_info_t stack_page = {};
-    if (VMI_SUCCESS == vmi_pagetable_lookup_extended(vmi, regs->cr3, regs->rsp, &stack_page))
-    {
-        walked_pa = stack_page.paddr;
-        vmi_read_addr_pa(vmi, walked_pa, &physical);
-    }
-    addr_t after_walk = 0;
-    ctx.addr = regs->rsp;
-    vmi_read_addr(vmi, &ctx, &after_walk);
-    unsigned int breakpoints = 0;
-    bool remapped = walked_pa && drakvuf_debug_gfn_remapped(this->drakvuf, walked_pa >> 12, &breakpoints);
-    fprintf(stderr, "[TRAP-STATS]   stack frame 0x%" PRIx64 ": %s by drakvuf, %u breakpoint(s) on it\n",
-        (uint64_t)(walked_pa >> 12), remapped ? "remapped" : "not remapped", breakpoints);
-    fprintf(stderr, "[TRAP-STATS]   [rsp] again 0x%" PRIx64 ", stack page cached pa 0x%" PRIx64
-        " walked pa 0x%" PRIx64 ", [rsp] by walked pa 0x%" PRIx64 ", [rsp] after the walk 0x%" PRIx64
-        ", reader %p main %p\n",
-        (uint64_t)again, (uint64_t)cached_pa, (uint64_t)walked_pa, (uint64_t)physical, (uint64_t)after_walk,
-        (void*)(vmi_instance_t)vmi, (void*)drakvuf_lock_and_get_vmi(this->drakvuf));
-    drakvuf_release_vmi(this->drakvuf);
-
-    // Executable: no level of the page tables sets NX
-    auto executable = [&](addr_t va)
-    {
-        page_info_t page = {};
-        if (VMI_SUCCESS != vmi_pagetable_lookup_extended(vmi, regs->cr3, va, &page))
-            return false;
-        addr_t levels = page.x86_ia32e.pml4e_value | page.x86_ia32e.pdpte_value |
-            page.x86_ia32e.pgd_value | page.x86_ia32e.pte_value;
-        return !VMI_GET_BIT(levels, 63);
-    };
-
-    // A return address follows the call that pushed it: call rel32 (e8), call [rip+disp32]
-    // (ff 15), call reg (ff d0-d7, 41 ff d0-d7), call [reg+disp8] (ff 50-57 xx), call [reg+disp32]
-    auto after_call = [&](addr_t va) -> const char*
-    {
-        uint8_t code[8];
-        ctx.addr = va - sizeof(code);
-        if (VMI_SUCCESS != vmi_read(vmi, &ctx, sizeof(code), code, nullptr))
-            return "";
-        if (code[3] == 0xe8)
-            return " after call rel32";
-        if (code[2] == 0xff && code[3] == 0x15)
-            return " after call [rip+disp32]";
-        if (code[6] == 0xff && code[7] >= 0xd0 && code[7] <= 0xd7)
-            return " after call reg";
-        if (code[5] == 0xff && code[6] >= 0x50 && code[6] <= 0x57)
-            return " after call [reg+disp8]";
-        if (code[2] == 0xff && code[3] >= 0x90 && code[3] <= 0x97)
-            return " after call [reg+disp32]";
-        if (code[4] == 0xff && code[5] == 0x14)
-            return " after call [sib]";
-        return "";
-    };
-
-    for (int i = -8; i < 24; i++)
-    {
-        addr_t slot = regs->rsp + i * 8;
-        addr_t value = 0;
-        ctx.addr = slot;
-        if (VMI_SUCCESS != vmi_read_addr(vmi, &ctx, &value))
-        {
-            fprintf(stderr, "[TRAP-STATS]   rsp%+4d 0x%" PRIx64 ": unreadable\n", i * 8, (uint64_t)slot);
-            continue;
-        }
-
-        std::string what;
-        if (value >= 0x1000 && value < 0x800000000000ULL && executable(value))
-        {
-            auto proc = this->libs.find(pid);
-            if (auto module = this->resolve_module(pid, value))
-                what = " code in " + *module;
-            else if (proc != this->libs.end() && value >= proc->second.exe_start && value < proc->second.exe_end)
-                what = " code in the executable";
-            else
-                what = " code, anonymous";
-            what += after_call(value);
-        }
-        fprintf(stderr, "[TRAP-STATS]   rsp%+4d 0x%" PRIx64 ": 0x%016" PRIx64 "%s\n",
-            i * 8, (uint64_t)slot, (uint64_t)value, what.c_str());
-    }
-}
-
 // On stderr with the trap statistics, which name the same pages
 void libmon::print_return_pages() const
 {
-    fprintf(stderr, "[TRAP-STATS] libmon refused returns, [rsp] not executable:%s\n",
-        this->refused_returns.empty() ? " none" : "");
-    for (const auto& [function, calls] : this->refused_returns)
-        fprintf(stderr, "[TRAP-STATS] %10" PRIu64 "  %s\n", calls, function.c_str());
-
     std::vector<std::pair<addr_t, const return_page*>> pages;
     for (const auto& [page, info] : this->return_pages)
         pages.emplace_back(page, &info);
@@ -845,12 +705,6 @@ event_response_t libmon::function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
 {
     auto plugin = get_trap_plugin<libmon>(info);
 
-#ifdef DRAKVUF_DEBUG
-    plugin->hit_rsp = info->regs->rsp;
-    plugin->hit_ret = drakvuf_get_function_return_address(drakvuf, info);
-    plugin->hit_uid = info->event_uid;
-#endif
-
     auto it = plugin->pa_hooks.find(info->trap_pa);
     if (it == plugin->pa_hooks.end() || it->second.trap != info->trap)
     {
@@ -914,10 +768,6 @@ void libmon::on_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const hooked_
     auto result = ret_addr
         ? this->returns.track(drakvuf, info, ret_addr, pending_call{ &config, target.so_path, arguments }, transient)
         : return_track_result::untranslated;
-#ifdef DRAKVUF_DEBUG
-    if (result == return_track_result::not_executable)
-        this->log_refused_return(info, target, ret_addr);
-#endif
     if (result != return_track_result::tracked)
     {
         // Report the call anyway, without a return value: losing one field
