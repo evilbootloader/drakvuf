@@ -1726,14 +1726,14 @@ bool win_find_mmvad(drakvuf_t drakvuf, addr_t eprocess, addr_t vaddr, mmvad_info
 
                         if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &segment) == VMI_SUCCESS)
                         {
-                            ctx.addr = control_area + drakvuf->offsets[SEGMENT_TOTALNUMBEROFPTES];
+                            ctx.addr = segment + drakvuf->offsets[SEGMENT_TOTALNUMBEROFPTES];
 
                             if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &ptes) == VMI_SUCCESS)
                             {
                                 out_mmvad->total_number_of_ptes = ptes;
                             }
 
-                            ctx.addr = control_area + drakvuf->offsets[SEGMENT_PROTOTYPEPTE];
+                            ctx.addr = segment + drakvuf->offsets[SEGMENT_PROTOTYPEPTE];
 
                             if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &prototype_pte) == VMI_SUCCESS)
                             {
