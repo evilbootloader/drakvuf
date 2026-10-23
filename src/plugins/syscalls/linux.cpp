@@ -322,7 +322,7 @@ event_response_t linux_syscalls::linux_ret_cb(drakvuf_t drakvuf, drakvuf_trap_in
     if (params->sc)
         info->trap->name = params->sc->display_name;
 
-    this->print_sysret(drakvuf, info, (uint64_t)params->num);
+    this->print_sysret(drakvuf, info, (uint64_t)params->num, this->syscall_result(drakvuf, info, params->result_va));
 
     auto hookID = make_hook_id(info, params->target_rsp);
     this->ret_hooks.erase(hookID);
@@ -366,9 +366,45 @@ bool linux_syscalls::hooks_mt_safe() const
     return this->disable_sysret || this->sysret_mode == sysret_mode_t::KERNEL;
 }
 
-void linux_syscalls::print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint16_t num)
+void linux_syscalls::print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call)
 {
-    this->print_sysret(drakvuf, info, num);
+    this->print_sysret(drakvuf, info, call.num, this->syscall_result(drakvuf, info, call.result_va));
+}
+
+/*
+ * do_syscall_64 and do_int80_syscall_32 store the result in pt_regs->ax and
+ * return void (or a bool on newer kernels), so rax where they return is not
+ * the result. x64_sys_call and the __x64_sys_* functions return it in rax, and
+ * their caller stores it after they return.
+ */
+addr_t linux_syscalls::result_va_of(drakvuf_trap_info_t* info, addr_t pt_regs_addr)
+{
+    const char* hooked = info->trap->name;
+    if (!pt_regs_addr || !hooked)
+        return 0;
+    if (strcmp(hooked, "do_syscall_64") && strcmp(hooked, "do_int80_syscall_32"))
+        return 0;
+    return pt_regs_addr + this->regs[PT_REGS_RAX];
+}
+
+uint64_t linux_syscalls::syscall_result(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t result_va)
+{
+    if (!result_va)
+        return info->regs->rax;
+
+    auto vmi = vmi_reader_guard(drakvuf);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = result_va
+    );
+    uint64_t result = 0;
+    if (VMI_FAILURE == vmi_read_64(vmi, &ctx, &result))
+    {
+        PRINT_DEBUG("[SYSCALLS] Failed to read the result at 0x%lx\n", result_va);
+        return info->regs->rax;
+    }
+    return result;
 }
 
 // Runs on several vCPU threads at once when hooks_mt_safe(): the hook params are shared by all
@@ -429,7 +465,8 @@ event_response_t linux_syscalls::linux_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
             addr_t ret_addr = drakvuf_get_function_return_address(drakvuf, info);
             if (ret_addr)
                 this->track_syscall_return(drakvuf, info, ret_addr, syscall_num,
-                    info->trap->breakpoint.module, syscall_def->display_name);
+                    info->trap->breakpoint.module, syscall_def->display_name,
+                    this->result_va_of(info, pt_regs_addr));
         }
         return VMI_EVENT_RESPONSE_NONE;
     }
@@ -443,6 +480,7 @@ event_response_t linux_syscalls::linux_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
     ret_params->num = syscall_num;
     ret_params->type = syscall_type;
     ret_params->sc = syscall_def;
+    ret_params->result_va = this->result_va_of(info, pt_regs_addr);
 
     auto hookID = make_hook_id(info, ret_params->target_rsp);
     this->ret_hooks[hookID] = std::move(hook);

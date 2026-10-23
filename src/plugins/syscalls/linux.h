@@ -123,7 +123,11 @@ public:
 
     // Print information
     void print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::syscall_t* sc, uint16_t syscall_num, const char* syscall_type, std::vector<uint64_t> arguments);
-    void print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint16_t num) override;
+    void print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call) override;
+    // The syscall's result when the hooked function returns: read from result_va, or rax when 0
+    uint64_t syscall_result(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t result_va);
+    // pt_regs->ax for the dispatchers that store the result there and return void
+    addr_t result_va_of(drakvuf_trap_info_t* info, addr_t pt_regs_addr);
 
     // The syscall hooks don't create per-call return hooks, so they can run on several vCPU threads at once
     bool hooks_mt_safe() const;

@@ -164,7 +164,7 @@ static event_response_t ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     if (!exit_status_str)
         exit_status_str = ntstatus_format_string(ntstatus_t(info->regs->rax), exit_status_buf, sizeof(exit_status_buf));
 
-    s->print_sysret(drakvuf, info, wr->num, exit_status_str);
+    s->print_sysret(drakvuf, info, wr->num, info->regs->rax, exit_status_str);
 
     //Destroys this return trap, because it is specific for the RIP and not usable anymore. This was the trap being called when the physical address got computed.
     //Deletes this trap from the list of existing traps traps
@@ -175,14 +175,14 @@ static event_response_t ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     return 0;
 }
 
-void win_syscalls::print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint16_t num)
+void win_syscalls::print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call)
 {
     char exit_status_buf[NTSTATUS_MAX_FORMAT_STR_SIZE] = {0};
     const char* exit_status_str = ntstatus_to_string(ntstatus_t(info->regs->rax));
     if (!exit_status_str)
         exit_status_str = ntstatus_format_string(ntstatus_t(info->regs->rax), exit_status_buf, sizeof(exit_status_buf));
 
-    this->print_sysret(drakvuf, info, num, exit_status_str);
+    this->print_sysret(drakvuf, info, call.num, info->regs->rax, exit_status_str);
 }
 
 static std::vector<uint64_t> extract_args(drakvuf_t drakvuf, drakvuf_trap_info_t const* info, size_t reg_size, size_t nargs)

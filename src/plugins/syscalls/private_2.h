@@ -149,7 +149,8 @@ public:
 
     std::unordered_set<std::string> filter;
 
-    void print_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int nr, const char* extra_info = nullptr);
+    // `ret` is the syscall's result, which is not always in rax where the hooked function returns
+    void print_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int nr, uint64_t ret, const char* extra_info = nullptr);
     std::string parse_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::arg_t& arg, addr_t val);
     uint64_t mask_value(const syscalls_ns::arg_t& arg, uint64_t val);
     uint64_t transform_value(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::arg_t& arg, uint64_t val);
@@ -170,17 +171,20 @@ public:
         uint16_t num;
         const char* module;
         const char* name;
+        // Where the result is when the hooked function returns, if not in rax:
+        // pt_regs->ax for the Linux dispatchers, which return void
+        addr_t result_va;
     };
     return_tracker<pending_syscall> sysret_tracker;
 
     bool track_syscall_return(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t ret_addr,
-        uint16_t num, const char* module, const char* name);
+        uint16_t num, const char* module, const char* name, addr_t result_va = 0);
     // Drops the calls of a process' threads that never returned
     void forget_process_syscalls(vmi_pid_t pid);
     void kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call);
 
     // Prints the sysret of a call caught in sysret mode kernel, info->trap carries its name and module
-    virtual void print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint16_t num) = 0;
+    virtual void print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call) = 0;
 
     syscalls_base(drakvuf_t drakvuf, const syscalls_config* config, output_format_t output);
     syscalls_base(const syscalls_base&) = delete;

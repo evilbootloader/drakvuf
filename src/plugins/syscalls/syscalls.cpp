@@ -118,14 +118,14 @@
 
 using namespace syscalls_ns;
 
-void syscalls_base::print_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int nr, const char* extra_info)
+void syscalls_base::print_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int nr, uint64_t ret, const char* extra_info)
 {
     fmt::print(this->m_output_format, "sysret", drakvuf, info,
         keyval("Module", fmt::Qstr(std::move(info->trap->breakpoint.module))),
         keyval("vCPU", fmt::Nval(info->vcpu)),
         keyval("CR3", fmt::Xval(info->regs->cr3)),
         keyval("Syscall", fmt::Nval(nr)),
-        keyval("Ret", fmt::Xval(info->regs->rax)),
+        keyval("Ret", fmt::Xval(ret)),
         keyval("Info", fmt::Rstr(extra_info ?: ""))
     );
 }
@@ -229,15 +229,15 @@ void syscalls_base::kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
     drakvuf_trap_info_t ret_info = *info;
     ret_info.trap = &trap;
 
-    this->print_kernel_sysret(drakvuf, &ret_info, call.num);
+    this->print_kernel_sysret(drakvuf, &ret_info, call);
 }
 
 // The call returns to ret_addr, the caller of the hooked function
 bool syscalls_base::track_syscall_return(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t ret_addr,
-    uint16_t num, const char* module, const char* name)
+    uint16_t num, const char* module, const char* name, addr_t result_va)
 {
     return return_track_result::tracked ==
-        this->sysret_tracker.track(drakvuf, info, ret_addr, pending_syscall{ num, module, name });
+        this->sysret_tracker.track(drakvuf, info, ret_addr, pending_syscall{ num, module, name, result_va });
 }
 
 void syscalls_base::forget_process_syscalls(vmi_pid_t pid)
