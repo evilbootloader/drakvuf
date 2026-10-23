@@ -109,6 +109,9 @@
 #include "private.h"
 #include "plugins/output_format.h"
 
+// After private.h, whose enum socket_family names the AF_* constants these define as macros
+#include <arpa/inet.h>
+
 static bool is_printable_string(const std::vector<uint8_t>& message)
 {
     if (message.empty() || message.front() == 0x00)
@@ -242,6 +245,196 @@ std::vector<uint8_t> unixsocketmon::get_socket_message(drakvuf_t drakvuf, drakvu
     return data;
 }
 
+/*
+ * struct sock_common begins with two anonymous unions the JSON profile does
+ * not name: the address pair (skc_daddr, skc_rcv_saddr) at 0 and, after the
+ * 4-byte hash, the port pair (skc_dport in network order, skc_num in host
+ * order) at 12. That layout has not changed since 2.6; it is trusted only
+ * when the named skc_family sits where it puts it, at 16, and struct sock
+ * starts with its sock_common.
+ */
+#define SKC_DADDR       0
+#define SKC_RCV_SADDR   4
+#define SKC_DPORT       12
+#define SKC_NUM         14
+#define SKC_FAMILY      16
+#define UNIX_PATH_MAX   108
+
+std::vector<std::pair<std::string, socket_endpoints::value_t>> socket_endpoints::keyvals() const
+{
+    std::vector<std::pair<std::string, value_t>> out;
+    if (!protocol.empty())
+        out.emplace_back("Protocol", fmt::Estr(protocol));
+    if (!local_ip.empty())
+        out.emplace_back("LocalIp", fmt::Estr(local_ip));
+    if (local_port >= 0)
+        out.emplace_back("LocalPort", fmt::Nval(local_port));
+    if (!remote_ip.empty())
+        out.emplace_back("RemoteIp", fmt::Estr(remote_ip));
+    if (remote_port >= 0)
+        out.emplace_back("RemotePort", fmt::Nval(remote_port));
+    // An unnamed end has no path, and no key: an empty string prints as "(null)"
+    if (!local_path.empty())
+        out.emplace_back("LocalPath", fmt::Estr(local_path));
+    if (!remote_path.empty())
+        out.emplace_back("RemotePath", fmt::Estr(remote_path));
+    if (connected >= 0)
+        out.emplace_back("Connected", fmt::Nval(connected));
+    return out;
+}
+
+static std::string ip_string(int family, const void* addr)
+{
+    char buf[INET6_ADDRSTRLEN] = {0};
+    if (!inet_ntop(family, addr, buf, sizeof(buf)))
+        return {};
+    return buf;
+}
+
+static std::string protocol_string(uint16_t protocol)
+{
+    switch (protocol)
+    {
+        case IPPROTO_TCP:
+            return "TCP";
+        case IPPROTO_UDP:
+            return "UDP";
+        case IPPROTO_ICMP:
+            return "ICMP";
+        case IPPROTO_ICMPV6:
+            return "ICMPv6";
+        default:
+            return std::to_string(protocol);
+    }
+}
+
+/*
+ * sun_path as a string. A pathname ends at its NUL: connect() is commonly
+ * given the whole sizeof(struct sockaddr_un), with whatever was on the stack
+ * after it. An abstract name starts with a NUL and is exactly as long as the
+ * address says, NULs included, which are printed as '@' like ss(8) does.
+ */
+static std::string unix_path_string(const uint8_t* path, size_t len)
+{
+    if (!len)
+        return {};
+    if (path[0] != 0)
+        return std::string((const char*)path, strnlen((const char*)path, len));
+    std::string out = "@";
+    for (size_t i = 1; i < len; i++)
+        out += path[i] ? (char)path[i] : '@';
+    return out;
+}
+
+std::string unixsocketmon::read_unix_path(vmi_instance_t vmi, access_context_t* ctx, addr_t unix_sock)
+{
+    addr_t address = 0;
+    ctx->addr = unix_sock + this->unix_sock_addr;
+    if (VMI_FAILURE == vmi_read_addr(vmi, ctx, &address) || !address)
+        return {};
+    int32_t len = 0;
+    ctx->addr = address + this->unix_address_len;
+    if (VMI_FAILURE == vmi_read_32(vmi, ctx, (uint32_t*)&len) || len <= (int32_t)sizeof(uint16_t))
+        return {};
+    uint8_t path[UNIX_PATH_MAX] = {0};
+    size_t n = std::min<size_t>(len - sizeof(uint16_t), UNIX_PATH_MAX);
+    size_t bytes_read = 0;
+    ctx->addr = address + this->unix_address_name + sizeof(uint16_t);
+    vmi_read(vmi, ctx, n, path, &bytes_read);
+    return unix_path_string(path, bytes_read);
+}
+
+void unixsocketmon::read_sockaddr(vmi_instance_t vmi, access_context_t* ctx, addr_t addr, uint32_t len, socket_endpoints& ep)
+{
+    uint8_t buf[sizeof(uint16_t) + UNIX_PATH_MAX] = {0};
+    size_t bytes_read = 0;
+    ctx->addr = addr;
+    if (VMI_FAILURE == vmi_read(vmi, ctx, std::min<size_t>(len, sizeof(buf)), buf, &bytes_read) || bytes_read < 2)
+        return;
+    uint16_t family = 0;
+    memcpy(&family, buf, sizeof(family));
+    uint16_t port = 0;
+    memcpy(&port, buf + 2, sizeof(port));
+    if (family == AF_INET && bytes_read >= 8)
+    {
+        ep.remote_ip = ip_string(AF_INET, buf + 4);
+        ep.remote_port = ntohs(port);
+    }
+    else if (family == AF_INET6 && bytes_read >= 24)
+    {
+        ep.remote_ip = ip_string(AF_INET6, buf + 8);
+        ep.remote_port = ntohs(port);
+    }
+    else if (family == AF_LOCAL)
+        ep.remote_path = unix_path_string(buf + 2, bytes_read - 2);
+}
+
+socket_endpoints unixsocketmon::read_endpoints(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t socket, uint32_t family)
+{
+    socket_endpoints ep;
+    bool inet = family == AF_INET || family == AF_INET6;
+    if (!(inet && this->have_inet) && !(family == AF_LOCAL && this->have_unix))
+        return ep;
+
+    auto vmi = vmi_lock_guard(drakvuf);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3
+    );
+
+    addr_t sk = 0;
+    ctx.addr = socket + this->socket_sk;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &sk) || !sk)
+        return ep;
+
+    if (family == AF_LOCAL)
+    {
+        // struct unix_sock begins with its struct sock
+        ep.unix_socket = true;
+        ep.local_path = read_unix_path(vmi, &ctx, sk);
+        addr_t peer = 0;
+        ctx.addr = sk + this->unix_sock_peer;
+        if (VMI_SUCCESS == vmi_read_addr(vmi, &ctx, &peer))
+        {
+            ep.connected = peer != 0;
+            if (peer)
+                ep.remote_path = read_unix_path(vmi, &ctx, peer);
+        }
+        return ep;
+    }
+
+    ep.inet = true;
+    uint16_t protocol = 0;
+    ctx.addr = sk + this->sock_protocol;
+    if (VMI_SUCCESS == vmi_read_16(vmi, &ctx, &protocol))
+        ep.protocol = protocol_string(protocol);
+
+    uint16_t dport = 0, num = 0;
+    ctx.addr = sk + SKC_DPORT;
+    vmi_read_16(vmi, &ctx, &dport);
+    ctx.addr = sk + SKC_NUM;
+    vmi_read_16(vmi, &ctx, &num);
+    ep.local_port = num;
+
+    uint8_t remote[16] = {0}, local[16] = {0};
+    size_t len = family == AF_INET ? 4 : 16;
+    size_t bytes_read = 0;
+    ctx.addr = sk + (family == AF_INET ? SKC_DADDR : this->skc_v6_daddr);
+    vmi_read(vmi, &ctx, len, remote, &bytes_read);
+    ctx.addr = sk + (family == AF_INET ? SKC_RCV_SADDR : this->skc_v6_rcv_saddr);
+    vmi_read(vmi, &ctx, len, local, &bytes_read);
+
+    bool has_peer = dport != 0 || std::any_of(remote, remote + len, [](uint8_t c) { return c != 0; });
+    ep.connected = has_peer;
+    ep.local_ip = ip_string(family, local);
+    if (has_peer)
+    {
+        ep.remote_ip = ip_string(family, remote);
+        ep.remote_port = ntohs(dport);
+    }
+    return ep;
+}
+
 event_response_t unixsocketmon::sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     uint32_t family_type;
@@ -251,6 +444,28 @@ event_response_t unixsocketmon::sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap
 
     uint64_t size = 0;
     auto message = get_socket_message(drakvuf, info, &size);
+
+    addr_t sock = drakvuf_get_function_argument(drakvuf, info, 1);
+    socket_endpoints ep = read_endpoints(drakvuf, info, sock, family_type);
+    // An unconnected socket names its destination per message (sendto)
+    if ((ep.inet || ep.unix_socket) && ep.connected != 1 && this->have_msg_name)
+    {
+        addr_t msghdr = drakvuf_get_function_argument(drakvuf, info, 2);
+        auto vmi = vmi_lock_guard(drakvuf);
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3
+        );
+        addr_t name = 0;
+        uint32_t namelen = 0;
+        ctx.addr = msghdr + this->msghdr_msg_name;
+        if (VMI_SUCCESS == vmi_read_addr(vmi, &ctx, &name) && name)
+        {
+            ctx.addr = msghdr + this->msghdr_msg_namelen;
+            if (VMI_SUCCESS == vmi_read_32(vmi, &ctx, &namelen) && namelen)
+                read_sockaddr(vmi, &ctx, name, namelen, ep);
+        }
+    }
 
     unicode_string_t msg =
     {
@@ -266,6 +481,7 @@ event_response_t unixsocketmon::sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap
     {
         fmt::print(this->m_output_format, "unixsocketmon", drakvuf, info,
             keyval("Type", fmt::Rstr(socket_family_str)),
+            ep.keyvals(),
             keyval("Size", fmt::Nval(size)),
             keyval("Value", fmt::BinaryString(message.data(), message.size()))
         );
@@ -274,6 +490,7 @@ event_response_t unixsocketmon::sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap
     {
         fmt::print(this->m_output_format, "unixsocketmon", drakvuf, info,
             keyval("Type", fmt::Rstr(socket_family_str)),
+            ep.keyvals(),
             keyval("Size", fmt::Nval(size)),
             keyval("Value", fmt::Estr(reinterpret_cast<char*>(out.contents)))
         );
@@ -282,6 +499,76 @@ event_response_t unixsocketmon::sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap
     g_free(out.contents);
 
     return VMI_EVENT_RESPONSE_NONE;
+}
+
+/*
+ * int security_socket_connect(struct socket *sock, struct sockaddr *address, int addrlen)
+ *
+ * Every connect() passes here with the destination copied into the kernel,
+ * before the protocol starts connecting. The result is the syscall's, in its
+ * sysret record; the local end is in the sends that follow, once bound.
+ */
+event_response_t unixsocketmon::connect_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    uint32_t family_type;
+    if (!get_socket_family_type(drakvuf, info, &family_type))
+        return VMI_EVENT_RESPONSE_NONE;
+    if (family_type != AF_INET && family_type != AF_INET6 && family_type != AF_LOCAL)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    addr_t sock = drakvuf_get_function_argument(drakvuf, info, 1);
+    addr_t address = drakvuf_get_function_argument(drakvuf, info, 2);
+    uint32_t addrlen = (uint32_t)drakvuf_get_function_argument(drakvuf, info, 3);
+
+    socket_endpoints ep = read_endpoints(drakvuf, info, sock, family_type);
+    ep.remote_ip.clear();
+    ep.remote_port = -1;
+    ep.remote_path.clear();
+    ep.connected = -1;
+    // Not bound yet, as for most connects: the local end is chosen by the connect
+    if (ep.local_port == 0)
+    {
+        ep.local_ip.clear();
+        ep.local_port = -1;
+    }
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3
+        );
+        if (address && addrlen)
+            read_sockaddr(vmi, &ctx, address, addrlen, ep);
+    }
+
+    fmt::print(this->m_output_format, "unixsocketmon", drakvuf, info,
+        keyval("Type", fmt::Rstr(socket_family_to_str((socket_family_t)family_type))),
+        ep.keyvals()
+    );
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+void unixsocketmon::find_endpoint_layout(drakvuf_t drakvuf)
+{
+    addr_t family = 0, common = 0;
+    bool have_sk = drakvuf_get_kernel_struct_member_rva(drakvuf, "socket", "sk", &socket_sk);
+    this->have_inet = have_sk
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "sock", "sk_protocol", &sock_protocol)
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "sock", "__sk_common", &common) && common == 0
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "sock_common", "skc_family", &family) && family == SKC_FAMILY
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "sock_common", "skc_v6_daddr", &skc_v6_daddr)
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "sock_common", "skc_v6_rcv_saddr", &skc_v6_rcv_saddr);
+    this->have_unix = have_sk
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "unix_sock", "addr", &unix_sock_addr)
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "unix_sock", "peer", &unix_sock_peer)
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "unix_address", "len", &unix_address_len)
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "unix_address", "name", &unix_address_name);
+    this->have_msg_name = drakvuf_get_kernel_struct_member_rva(drakvuf, "msghdr", "msg_name", &msghdr_msg_name)
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "msghdr", "msg_namelen", &msghdr_msg_namelen);
+    if (!this->have_inet)
+        fprintf(stderr, "[UNIXSOCKETMON] Cannot read struct sock from this profile, IP sockets have no addresses\n");
+    if (!this->have_unix)
+        fprintf(stderr, "[UNIXSOCKETMON] Cannot read struct unix_sock from this profile, Unix sockets have no paths\n");
 }
 
 // A constant of an enum in the kernel's JSON profile
@@ -367,6 +654,12 @@ unixsocketmon::unixsocketmon(drakvuf_t drakvuf, const unixsocketmon_config* conf
         && this->find_iov_iter_layout(drakvuf);
     if (!this->have_message)
         fprintf(stderr, "[UNIXSOCKETMON] Cannot read struct iov_iter from this profile, messages have no size or payload\n");
+    this->find_endpoint_layout(drakvuf);
+
+    // The same reason as security_socket_sendmsg below: __sys_connect_file is inlined into __sys_connect
+    connecthook = createSyscallHook("security_socket_connect", &unixsocketmon::connect_cb, "connect");
+    if (!connecthook)
+        fprintf(stderr, "[UNIXSOCKETMON] Failed to hook security_socket_connect, connects are not recorded\n");
 
     /*
      * Not sock_sendmsg itself: net/socket.c inlines it into __sys_sendto,
