@@ -108,6 +108,7 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <optional>
 
@@ -140,6 +141,8 @@ class apimon: public pluginex
 {
 public:
     wanted_hooks_t wanted_hooks;
+    // Modules per process, resolved on demand: the hook callbacks run on several vCPU threads at once
+    std::mutex procs_mtx;
     std::unordered_map<vmi_pid_t, std::vector<apimon_module>> procs;
 
     apimon(drakvuf_t drakvuf, const apimon_config* config, output_format_t output);
