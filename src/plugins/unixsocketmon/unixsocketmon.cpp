@@ -158,9 +158,22 @@ bool unixsocketmon::get_socket_family_type(drakvuf_t drakvuf, drakvuf_trap_info_
     return true;
 }
 
+// Segments read from one message, beyond which the payload is cut even under the size limit
+#define MAX_SEGMENTS 64
+
+/*
+ * The message's size is the iterator's count, which covers every segment: a
+ * sendmsg() with several buffers, as D-Bus sends, is one request. Its first
+ * print_max_size bytes are read across the segments, from an array of iovecs
+ * or kvecs, or from the single user buffer of an ITER_UBUF (6.x kernels).
+ * Other iterator types (pages, pipes) have a size and no payload here.
+ */
 std::vector<uint8_t> unixsocketmon::get_socket_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t* ret_size)
 {
-    addr_t msghdr = drakvuf_get_function_argument(drakvuf, info, 2);
+    if (!this->have_message)
+        return {};
+
+    addr_t iter = drakvuf_get_function_argument(drakvuf, info, 2) + this->msghdr_msg_iter;
 
     auto vmi = vmi_lock_guard(drakvuf);
     ACCESS_CONTEXT(ctx,
@@ -168,43 +181,64 @@ std::vector<uint8_t> unixsocketmon::get_socket_message(drakvuf_t drakvuf, drakvu
         .dtb = info->regs->cr3
     );
 
-    addr_t iovec;
-    ctx.addr = msghdr + this->msghdr_msg_iter + this->iov_iter_iov;
-    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &iovec))
-    {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to get iovec from msghdr\n");
+    uint8_t type = 0;
+    uint64_t count = 0;
+    addr_t ptr = 0;
+    ctx.addr = iter + this->iov_iter_type;
+    if (VMI_FAILURE == vmi_read_8(vmi, &ctx, &type))
         return {};
-    }
-
-    addr_t buf;
-    ctx.addr = iovec + this->iovec_iov_base;
-    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &buf))
-    {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to get buffer from iovec struct\n");
+    ctx.addr = iter + this->iov_iter_count;
+    if (VMI_FAILURE == vmi_read_64(vmi, &ctx, &count))
         return {};
-    }
-
-    uint64_t size;
-    ctx.addr = iovec + this->iovec_iov_len;
-    if (VMI_FAILURE == vmi_read_64(vmi, &ctx, &size))
-    {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to get size of buffer\n");
+    ctx.addr = iter + this->iov_iter_iov;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &ptr))
         return {};
-    }
+    if (ret_size)
+        *ret_size = count;
 
-    auto print_size = std::min(size, this->print_max_size);
-
-    std::vector<uint8_t> data(print_size, 0);
-    ctx.addr = buf;
-    size_t bytes_read;
-    if (VMI_FAILURE == vmi_read(vmi, &ctx, print_size, data.data(), &bytes_read))
+    uint64_t wanted = std::min(count, this->print_max_size);
+    std::vector<uint8_t> data;
+    auto append = [&](addr_t buf, uint64_t len) -> bool
     {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to read data\n");
-        return {};
-    }
+        size_t old = data.size();
+        data.resize(old + len);
+        size_t bytes_read = 0;
+        ctx.addr = buf;
+        vmi_read(vmi, &ctx, len, data.data() + old, &bytes_read);
+        data.resize(old + bytes_read);
+        return bytes_read == len;
+    };
 
-    data.resize(bytes_read);
-    if (ret_size) *ret_size = size;
+    if (wanted == 0)
+        return data;
+
+    if (type == this->iter_ubuf)
+    {
+        append(ptr, wanted);
+        return data;
+    }
+    if (type != this->iter_iovec && type != this->iter_kvec)
+        return data;
+
+    uint64_t nr_segs = 0;
+    ctx.addr = iter + this->iov_iter_nr_segs;
+    if (VMI_FAILURE == vmi_read_64(vmi, &ctx, &nr_segs))
+        return data;
+
+    for (uint64_t i = 0; i < nr_segs && i < MAX_SEGMENTS && data.size() < wanted; i++)
+    {
+        addr_t seg = ptr + i * this->iovec_size;
+        addr_t base = 0;
+        uint64_t len = 0;
+        ctx.addr = seg + this->iovec_iov_base;
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &base))
+            break;
+        ctx.addr = seg + this->iovec_iov_len;
+        if (VMI_FAILURE == vmi_read_64(vmi, &ctx, &len))
+            break;
+        if (len && !append(base, std::min(len, wanted - data.size())))
+            break;
+    }
     return data;
 }
 
@@ -250,44 +284,101 @@ event_response_t unixsocketmon::sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap
     return VMI_EVENT_RESPONSE_NONE;
 }
 
+// A constant of an enum in the kernel's JSON profile
+static bool kernel_enum_value(drakvuf_t drakvuf, const char* enum_name, const char* constant, int64_t* value)
+{
+    auto vmi = vmi_lock_guard(drakvuf);
+    json_object* profile = vmi_get_kernel_json(vmi);
+    json_object* enums = nullptr;
+    json_object* type = nullptr;
+    json_object* constants = nullptr;
+    json_object* found = nullptr;
+    if (!profile
+        || !json_object_object_get_ex(profile, "enums", &enums)
+        || !json_object_object_get_ex(enums, enum_name, &type)
+        || !json_object_object_get_ex(type, "constants", &constants)
+        || !json_object_object_get_ex(constants, constant, &found))
+        return false;
+    *value = json_object_get_int64(found);
+    return true;
+}
+
+/*
+ * Where struct iov_iter keeps its count and its buffers. The pointer to the
+ * buffers is in an anonymous union, which dwarf2json names only
+ * "unnamed_field_N", so it is found from the members around it:
+ *   5.x  iter_type, ..., iov_offset, count, union { iov, kvec, ... }, union { nr_segs, ... }
+ *   6.x  iter_type, ..., iov_offset, union { ..., struct { union { __iov, kvec, ..., ubuf }, count } }, union { nr_segs, ... }
+ * A profile that names the pointer (`iov`, `__iov`) is taken at its word.
+ */
+bool unixsocketmon::find_iov_iter_layout(drakvuf_t drakvuf)
+{
+    addr_t iov_offset = 0;
+    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "iov_iter", "iter_type", &iov_iter_type)
+        || !drakvuf_get_kernel_struct_member_rva(drakvuf, "iov_iter", "iov_offset", &iov_offset))
+        return false;
+
+    if (drakvuf_get_kernel_struct_member_rva(drakvuf, "iov_iter", "count", &iov_iter_count))
+        iov_iter_iov = iov_iter_count + sizeof(uint64_t);
+    else
+    {
+        iov_iter_iov = iov_offset + sizeof(uint64_t);
+        iov_iter_count = iov_iter_iov + sizeof(addr_t);
+    }
+    addr_t named = 0;
+    if (drakvuf_get_kernel_struct_member_rva(drakvuf, "iov_iter", "iov", &named)
+        || drakvuf_get_kernel_struct_member_rva(drakvuf, "iov_iter", "__iov", &named))
+        iov_iter_iov = named;
+    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "iov_iter", "nr_segs", &iov_iter_nr_segs))
+        iov_iter_nr_segs = std::max(iov_iter_iov, iov_iter_count) + sizeof(uint64_t);
+
+    // Their values differ between kernels: ITER_IOVEC is 0 on 5.15 and 1 on 6.x, where ITER_UBUF is 0
+    kernel_enum_value(drakvuf, "iter_type", "ITER_IOVEC", &iter_iovec);
+    kernel_enum_value(drakvuf, "iter_type", "ITER_KVEC", &iter_kvec);
+    kernel_enum_value(drakvuf, "iter_type", "ITER_UBUF", &iter_ubuf);
+    if (iter_iovec < 0 && iter_kvec < 0 && iter_ubuf < 0)
+        return false;
+
+    size_t size = 0;
+    if (drakvuf_get_kernel_struct_size(drakvuf, "iovec", &size) && size)
+        iovec_size = size;
+    return drakvuf_get_kernel_struct_member_rva(drakvuf, "iovec", "iov_base", &iovec_iov_base)
+        && drakvuf_get_kernel_struct_member_rva(drakvuf, "iovec", "iov_len", &iovec_iov_len);
+}
+
+/*
+ * The family is required: without it there is nothing to print. The message
+ * is not: a profile this cannot read the iterator from still gets one record
+ * per message, without size or payload. Either failure is said on stderr --
+ * printed only to the debug log, the iterator lookup failed silently on
+ * Ubuntu 22.04's kernel and the plugin hooked nothing at all.
+ */
 unixsocketmon::unixsocketmon(drakvuf_t drakvuf, const unixsocketmon_config* config, output_format_t output)
     :pluginex(drakvuf, output), print_max_size{config->print_max_size}
 {
-    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "socket", "ops", &socket_ops))
+    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "socket", "ops", &socket_ops)
+        || !drakvuf_get_kernel_struct_member_rva(drakvuf, "proto_ops", "family", &proto_ops_family))
     {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to get struct member\n");
+        fprintf(stderr, "[UNIXSOCKETMON] The kernel profile lacks socket.ops or proto_ops.family, not hooking\n");
         return;
     }
 
-    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "proto_ops", "family", &proto_ops_family))
-    {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to get proto_ops family\n");
-        return;
-    }
+    this->have_message = drakvuf_get_kernel_struct_member_rva(drakvuf, "msghdr", "msg_iter", &msghdr_msg_iter)
+        && this->find_iov_iter_layout(drakvuf);
+    if (!this->have_message)
+        fprintf(stderr, "[UNIXSOCKETMON] Cannot read struct iov_iter from this profile, messages have no size or payload\n");
 
-    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "msghdr", "msg_iter", &msghdr_msg_iter))
-    {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to get msg_iter\n");
-        return;
-    }
-
-    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "iov_iter", "iov", &iov_iter_iov))
-    {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to get iov_iter\n");
-        return;
-    }
-
-    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "iovec", "iov_base", &iovec_iov_base))
-    {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to get iov_base\n");
-        return;
-    }
-
-    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "iovec", "iov_len", &iovec_iov_len))
-    {
-        PRINT_DEBUG("[UNIXSOCKETMON] Failed to get iov_base\n");
-        return;
-    }
-
-    sockethook = createSyscallHook("sock_sendmsg", &unixsocketmon::sock_send_msg_cb);
+    /*
+     * Not sock_sendmsg itself: net/socket.c inlines it into __sys_sendto,
+     * ____sys_sendmsg and sock_write_iter, so a breakpoint on the exported
+     * copy saw no send at all on Ubuntu 22.04's 5.15 kernel. The LSM hook it
+     * calls first is in another file, takes the same socket and message,
+     * and runs for every send. A kernel built without LSM hooks has no such
+     * function, and there sock_sendmsg is the next best place.
+     */
+    sockethook = createSyscallHook("security_socket_sendmsg", &unixsocketmon::sock_send_msg_cb, "sock_sendmsg");
+    if (!sockethook)
+        sockethook = createSyscallHook("sock_sendmsg", &unixsocketmon::sock_send_msg_cb);
+    if (!sockethook)
+        fprintf(stderr, "[UNIXSOCKETMON] Failed to hook security_socket_sendmsg and sock_sendmsg\n");
 }

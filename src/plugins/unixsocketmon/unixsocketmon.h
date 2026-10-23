@@ -119,9 +119,18 @@ public:
     addr_t socket_ops;
     addr_t proto_ops_family;
     addr_t msghdr_msg_iter;
-    addr_t iov_iter_iov;
+    addr_t iov_iter_iov;            // the iovec array, or the buffer itself for ITER_UBUF
     addr_t iovec_iov_base;
     addr_t iovec_iov_len;
+    addr_t iov_iter_type = 0;
+    addr_t iov_iter_count = 0;      // the whole request, every segment
+    addr_t iov_iter_nr_segs = 0;
+    size_t iovec_size = 16;
+    // enum iter_type from the profile, -1 when this kernel has no such type
+    int64_t iter_iovec = -1;
+    int64_t iter_kvec = -1;
+    int64_t iter_ubuf = -1;
+    bool have_message = false;
 
     std::unique_ptr<libhook::SyscallHook> sockethook;
 
@@ -129,6 +138,7 @@ public:
     event_response_t sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
     std::vector<uint8_t> get_socket_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t* size);
     bool get_socket_family_type(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint32_t* family_type);
+    bool find_iov_iter_layout(drakvuf_t drakvuf);
 };
 
 #endif
