@@ -163,7 +163,7 @@ public:
     // Calls a thread can have in progress, more are only left behind by calls that never return
     static constexpr size_t max_pending_per_thread = 64;
     // User mode: how long a breakpoint no call returns through stays, and how many there can be
-    static constexpr gint64 idle_us = 2 * G_USEC_PER_SEC;
+    static constexpr gint64 idle_us = 30 * G_USEC_PER_SEC;
     static constexpr size_t max_user_traps = 4096;
 
     // mt_safe: cb may run on several vCPU threads at once, otherwise it is serialized like other callbacks
