@@ -133,6 +133,7 @@
 #include "userhook.hpp"
 #include "utils.hpp"
 #include "uh-private.hpp"
+#include "plugins/helpers/trap_owner_scope.h"
 
 static bool g_injection_mode_enabled = false;
 
@@ -149,6 +150,14 @@ userhook& userhook::get_instance(drakvuf_t drakvuf)
 
 static void wrap_delete(drakvuf_trap_t* trap)
 {
+    g_slice_free(drakvuf_trap_t, trap);
+}
+
+// The data of a shared breakpoint is freed with it: removing it defers the free
+// until no vCPU thread runs its callback any more
+static void free_shared_trap(drakvuf_trap_t* trap)
+{
+    delete static_cast<userhook::shared_hook*>(trap->data);
     g_slice_free(drakvuf_trap_t, trap);
 }
 
@@ -312,12 +321,26 @@ bool make_trap(vmi_instance_t vmi, drakvuf_t drakvuf, addr_t process_dtb, hook_t
 
     // during CoW we need to find all traps placed on the same physical page
     // that's why we'll manually resolve vaddr and store paddr under trap->breakpoint.addr
-    addr_t pa;
+    page_info_t page = {};
 
-    if (vmi_pagetable_lookup(vmi, process_dtb, exec_func, &pa) != VMI_SUCCESS)
+    if (vmi_pagetable_lookup_extended(vmi, process_dtb, exec_func, &page) != VMI_SUCCESS)
     {
         PRINT_DEBUG("[USERHOOK] Failed to lookup paddr in make_trap\n");
         return false;
+    }
+    addr_t pa = page.paddr;
+
+    // An export that is data, such as msvcrt's _pgmptr, is never called. Its breakpoint
+    // would only copy the page again on every write to it, with the VM paused.
+    if (vmi_get_page_mode(vmi, 0) == VMI_PM_IA32E)
+    {
+        const auto& entries = page.x86_ia32e;
+        addr_t levels = entries.pml4e_value | entries.pdpte_value | entries.pgd_value | entries.pte_value;
+        if (VMI_GET_BIT(levels, 63))
+        {
+            PRINT_DEBUG("[USERHOOK] %s is not in executable memory, not hooked\n", target->target_name.c_str());
+            return false;
+        }
     }
 
     drakvuf_trap_t* trap = g_slice_new0(drakvuf_trap_t);
@@ -339,6 +362,207 @@ bool make_trap(vmi_instance_t vmi, drakvuf_t drakvuf, addr_t process_dtb, hook_t
     PRINT_DEBUG("[USERHOOK] Failed to add trap :(\n");
     g_slice_free(drakvuf_trap_t, trap);
     return false;
+}
+
+static userhook::image_key_t image_key(const dll_t& dll)
+{
+    return { dll.v.mmvad.prototype_pte, dll.v.real_dll_base };
+}
+
+// The plugins and hook lists that fill a dll_t are the same in every process, but a
+// plugin may hook in some processes only
+static bool same_targets(const dll_t& a, const dll_t& b)
+{
+    if (a.targets.size() != b.targets.size())
+        return false;
+
+    for (size_t i = 0; i < a.targets.size(); i++)
+    {
+        const auto& x = a.targets[i];
+        const auto& y = b.targets[i];
+        if (x.target_name != y.target_name || x.callback != y.callback || x.plugin != y.plugin)
+            return false;
+    }
+    return true;
+}
+
+// A shared breakpoint: calls the target of the process that hit it
+static event_response_t shared_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    auto hook = static_cast<const userhook::shared_hook*>(info->trap->data);
+    auto& plugin = userhook::get_instance(drakvuf);
+
+    // The target stays while the callback runs without the lock: it is the calling
+    // thread's process's, which is not cleaned up while the thread waits here
+    hook_target_entry_t* target = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lock(plugin.dlls_mtx);
+        auto it = plugin.loaded_dlls.find(get_proc_data(drakvuf, info).pid);
+        if (it == plugin.loaded_dlls.end())
+            return VMI_EVENT_RESPONSE_NONE;
+
+        for (auto& dll : it->second)
+        {
+            if (!dll.shares_image || image_key(dll) != hook->image)
+                continue;
+
+            // After a copy-on-write of the page the process has its own breakpoint
+            if (dll.targets[hook->slot].shared)
+                target = &dll.targets[hook->slot];
+            break;
+        }
+    }
+
+    // A process whose DLLs were not seen being loaded, not hooked before either
+    if (!target)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    drakvuf_trap_t trap = *info->trap;
+    trap.data = target;
+    drakvuf_trap_info_t target_info = *info;
+    target_info.trap = &trap;
+    return target->callback(drakvuf, &target_info);
+}
+
+// The first process sharing an image whose processes are hooked
+static const dll_t* image_model(userhook* plugin, const userhook::image_key_t& key)
+{
+    for (const auto& [pid, dlls] : plugin->loaded_dlls)
+        for (const auto& dll : dlls)
+            if (dll.shares_image && image_key(dll) == key)
+                return &dll;
+    return nullptr;
+}
+
+static void notify_hooked(drakvuf_t drakvuf, userhook* plugin, dll_t* dll_meta)
+{
+    std::vector<hook_target_view_t> targets;
+
+    for (const auto& target : dll_meta->targets)
+    {
+        targets.emplace_back(target.target_name, target.offset, target.state);
+    }
+
+    for (const auto& reg : plugin->plugins)
+    {
+        reg.post_cb(drakvuf, (const dll_view_t*)dll_meta, targets, reg.extra);
+    }
+}
+
+/*
+ * A process done hooking a DLL: its breakpoints become the image's, or, when another
+ * process got there first, its breakpoints are replaced by the image's
+ */
+static void share_image(drakvuf_t drakvuf, userhook* plugin, dll_t* dll_meta)
+{
+    if (!dll_meta->v.mmvad.prototype_pte)
+        return;
+
+    auto key = image_key(*dll_meta);
+    auto it = plugin->shared_images.find(key);
+    if (it == plugin->shared_images.end())
+    {
+        auto& image = plugin->shared_images[key];
+        for (size_t i = 0; i < dll_meta->targets.size(); i++)
+        {
+            auto& target = dll_meta->targets[i];
+            if (target.state != HOOK_OK)
+                continue;
+
+            auto hook = std::make_unique<userhook::shared_hook>(userhook::shared_hook{ key, i, target.trap, target.offset, target.target_name });
+            target.trap->name = hook->name.c_str();
+            target.trap->cb = shared_hook_cb;
+            target.trap->data = hook.get();
+            target.trap->mt_safe = target.mt_safe;
+            target.shared = true;
+            image.hooks.push_back(std::move(hook));
+        }
+        image.processes = 1;
+        dll_meta->shares_image = true;
+        PRINT_DEBUG("[USERHOOK] Shared image 0x%lx at 0x%lx: %zu hooks\n", key.first, key.second, image.hooks.size());
+        return;
+    }
+
+    auto model = image_model(plugin, key);
+    if (!model || !same_targets(*model, *dll_meta))
+    {
+        PRINT_DEBUG("[USERHOOK] Shared image 0x%lx at 0x%lx: other targets, %zu here and %zu there\n",
+            key.first, key.second, dll_meta->targets.size(), model ? model->targets.size() : 0);
+        return;
+    }
+    PRINT_DEBUG("[USERHOOK] Shared image 0x%lx at 0x%lx: joined after hooking\n", key.first, key.second);
+
+    for (const auto& hook : it->second.hooks)
+    {
+        auto& target = dll_meta->targets[hook->slot];
+        if (target.state == HOOK_OK && target.trap)
+            drakvuf_remove_trap(drakvuf, target.trap, wrap_delete);
+        target.trap = hook->trap;
+        target.state = HOOK_OK;
+        target.shared = true;
+    }
+    it->second.processes++;
+    dll_meta->shares_image = true;
+}
+
+/*
+ * A process maps an image that is hooked already: its targets use the image's
+ * breakpoints, without hooking anything. The targets that failed to hook in the
+ * first process fail here too.
+ */
+static bool join_shared_image(drakvuf_t drakvuf, userhook* plugin, dll_t* dll_meta, vmi_pid_t pid)
+{
+    auto key = image_key(*dll_meta);
+    auto it = plugin->shared_images.find(key);
+    if (!dll_meta->v.mmvad.prototype_pte || it == plugin->shared_images.end())
+        return false;
+
+    auto model = image_model(plugin, key);
+    if (!model || !same_targets(*model, *dll_meta))
+    {
+        PRINT_DEBUG("[USERHOOK] Shared image 0x%lx at 0x%lx: other targets, %zu here and %zu there\n",
+            key.first, key.second, dll_meta->targets.size(), model ? model->targets.size() : 0);
+        return false;
+    }
+
+    for (size_t i = 0; i < dll_meta->targets.size(); i++)
+    {
+        auto& target = dll_meta->targets[i];
+        target.state = HOOK_FAILED;
+        target.offset = model->targets[i].offset;
+        target.target_addr = model->targets[i].target_addr;
+    }
+
+    for (const auto& hook : it->second.hooks)
+    {
+        auto& target = dll_meta->targets[hook->slot];
+        target.pid = pid;
+        target.trap = hook->trap;
+        target.state = HOOK_OK;
+        target.shared = true;
+    }
+    it->second.processes++;
+    dll_meta->shares_image = true;
+    dll_meta->v.is_hooked = true;
+
+    PRINT_DEBUG("[USERHOOK] pid %d: DLL at 0x%lx shares the hooks of its image\n", pid, dll_meta->v.real_dll_base);
+    notify_hooked(drakvuf, plugin, dll_meta);
+    return true;
+}
+
+// A process sharing the image is gone: the image's breakpoints go with the last one
+static void release_shared_image(drakvuf_t drakvuf, userhook* plugin, const userhook::image_key_t& key)
+{
+    auto it = plugin->shared_images.find(key);
+    if (it == plugin->shared_images.end() || --it->second.processes)
+        return;
+
+    for (auto& hook : it->second.hooks)
+    {
+        auto data = hook.release();
+        drakvuf_remove_trap(drakvuf, data->trap, free_shared_trap);
+    }
+    plugin->shared_images.erase(it);
 }
 
 bool is_pagetable_loaded(vmi_instance_t vmi, addr_t vaddr, addr_t process_dtb)
@@ -424,17 +648,8 @@ static event_response_t perform_hooking(drakvuf_t drakvuf, drakvuf_trap_info* in
 
     if (!was_hooked && dll_meta->v.is_hooked)
     {
-        std::vector<hook_target_view_t> targets;
-
-        for (const auto& target : dll_meta->targets)
-        {
-            targets.emplace_back(target.target_name, target.offset, target.state);
-        }
-
-        for (const auto& reg : plugin->plugins)
-        {
-            reg.post_cb(drakvuf, (const dll_view_t*)dll_meta, targets, reg.extra);
-        }
+        share_image(drakvuf, plugin, dll_meta);
+        notify_hooked(drakvuf, plugin, dll_meta);
     }
 
     return ret;
@@ -463,6 +678,8 @@ static event_response_t hook_dll(drakvuf_t drakvuf, drakvuf_trap_info_t* info, a
         auto mmvad = get_module_mmvad(drakvuf, proc_data.base_addr, dll_base);
         if (mmvad)
             dll_meta = create_dll_meta(drakvuf, info, plugin, &*mmvad);
+        if (dll_meta && join_shared_image(drakvuf, plugin, dll_meta, proc_data.pid))
+            return VMI_EVENT_RESPONSE_NONE;
     }
 
     return dll_meta ? perform_hooking(drakvuf, info, plugin, dll_meta) : VMI_EVENT_RESPONSE_NONE;
@@ -530,7 +747,8 @@ static void try_hook_ntdll(drakvuf_t drakvuf, drakvuf_trap_info_t* info, userhoo
 
         if (auto dll_meta = create_dll_meta(drakvuf, info, plugin, mmvad); dll_meta)
         {
-            perform_hooking(drakvuf, info, plugin, dll_meta);
+            if (!join_shared_image(drakvuf, plugin, dll_meta, proc_data.pid))
+                perform_hooking(drakvuf, info, plugin, dll_meta);
             ctx->is_hooked = dll_meta->v.is_hooked;
         }
     }
@@ -543,6 +761,7 @@ static void try_hook_ntdll(drakvuf_t drakvuf, drakvuf_trap_info_t* info, userhoo
 static event_response_t protect_virtual_memory_hook_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     auto plugin = get_trap_plugin<userhook>(info);
+    std::unique_lock<std::shared_mutex> lock(plugin->dlls_mtx);
     auto params = get_trap_params<protect_virtual_memory_result_t>(info);
 
     if (!params->verify_result_call_params(drakvuf, info))
@@ -559,6 +778,7 @@ static event_response_t protect_virtual_memory_hook_ret_cb(drakvuf_t drakvuf, dr
 static event_response_t protect_virtual_memory_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     auto plugin = get_trap_plugin<userhook>(info);
+    std::unique_lock<std::shared_mutex> lock(plugin->dlls_mtx);
     auto dll_meta = get_pending_dll(drakvuf, info, plugin);
     if (dll_meta)
         return perform_hooking(drakvuf, info, plugin, dll_meta);
@@ -616,6 +836,7 @@ static event_response_t protect_virtual_memory_hook_cb(drakvuf_t drakvuf, drakvu
 static event_response_t map_view_of_section_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     auto plugin = get_trap_plugin<userhook>(info);
+    std::unique_lock<std::shared_mutex> lock(plugin->dlls_mtx);
     auto params = get_trap_params<map_view_of_section_result_t>(info);
 
     if (!params->verify_result_call_params(drakvuf, info))
@@ -639,6 +860,7 @@ static event_response_t map_view_of_section_ret_cb(drakvuf_t drakvuf, drakvuf_tr
 static event_response_t map_view_of_section_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     auto plugin = get_trap_plugin<userhook>(info);
+    std::unique_lock<std::shared_mutex> lock(plugin->dlls_mtx);
     auto dll_meta = get_pending_dll(drakvuf, info, plugin);
     if (dll_meta)
         return perform_hooking(drakvuf, info, plugin, dll_meta);
@@ -685,6 +907,7 @@ static event_response_t map_view_of_section_hook_cb(drakvuf_t drakvuf, drakvuf_t
 static event_response_t clean_process_address_space_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     auto plugin = get_trap_plugin<userhook>(info);
+    std::unique_lock<std::shared_mutex> lock(plugin->dlls_mtx);
 
     addr_t cleaned_process_base = drakvuf_get_function_argument(drakvuf, info, 1);
 
@@ -701,13 +924,15 @@ static event_response_t clean_process_address_space_hook_cb(drakvuf_t drakvuf, d
     {
         for (auto& target : it.targets)
         {
-            if (target.state == HOOK_OK)
+            if (target.state == HOOK_OK && !target.shared)
             {
                 PRINT_DEBUG("[USERHOOK] Erased trap for pid %d %s\n", exit_pid,
                     target.target_name.c_str());
                 drakvuf_remove_trap(drakvuf, target.trap, wrap_delete);
             }
         }
+        if (it.shares_image)
+            release_shared_image(drakvuf, plugin, image_key(it));
     }
 
     plugin->loaded_dlls.erase(vec_it);
@@ -717,6 +942,7 @@ static event_response_t clean_process_address_space_hook_cb(drakvuf_t drakvuf, d
 static event_response_t copy_on_write_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     auto plugin = get_trap_plugin<userhook>(info);
+    std::unique_lock<std::shared_mutex> lock(plugin->dlls_mtx);
     auto params = get_trap_params<copy_on_write_result_t>(info);
 
     if (!params->verify_result_call_params(drakvuf, info))
@@ -753,9 +979,12 @@ static event_response_t copy_on_write_ret_cb(drakvuf_t drakvuf, drakvuf_trap_inf
             addr_t hook_va = ((params->vaddr >> 12) << 12) + (hook->trap->breakpoint.addr & 0xFFF);
             PRINT_DEBUG("adding hook at %lx\n", hook_va);
 
-            drakvuf_remove_trap(drakvuf, hook->trap, wrap_delete);
+            // The page is this process's own now, the shared breakpoint stays for the others
+            if (!hook->shared)
+                drakvuf_remove_trap(drakvuf, hook->trap, wrap_delete);
             hook->state = HOOK_FAILED;
             hook->trap = nullptr;
+            hook->shared = false;
             hook->pid = proc_data.pid;
 
             make_trap(vmi, drakvuf, info->regs->cr3, hook, hook_va);
@@ -768,6 +997,7 @@ static event_response_t copy_on_write_ret_cb(drakvuf_t drakvuf, drakvuf_trap_inf
 static event_response_t copy_on_write_handler(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     auto plugin = get_trap_plugin<userhook>(info);
+    std::unique_lock<std::shared_mutex> lock(plugin->dlls_mtx);
 
     if (plugin->is_stopping())
         return VMI_EVENT_RESPONSE_NONE;
@@ -832,7 +1062,7 @@ static event_response_t copy_on_write_handler(drakvuf_t drakvuf, drakvuf_trap_in
 }
 
 
-void userhook::request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, const plugin_target_config_entry_t* target, callback_t callback, void* extra)
+void userhook::request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, const plugin_target_config_entry_t* target, callback_t callback, void* extra, bool mt_safe)
 {
     dll_t* p_dll = reinterpret_cast<dll_t*>(const_cast<dll_view_t*>(dll));
 
@@ -840,6 +1070,7 @@ void userhook::request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, c
         p_dll->targets.emplace_back(target->function_name, target->clsid, target->no_retval, callback, target->argument_printers, extra);
     else // HOOK_BY_OFFSET
         p_dll->targets.emplace_back(target->function_name, target->clsid, target->offset, target->no_retval, callback, target->argument_printers, extra);
+    p_dll->targets.back().mt_safe = mt_safe;
 }
 
 void userhook::register_plugin(drakvuf_t drakvuf, usermode_cb_registration reg)
@@ -874,6 +1105,9 @@ bool userhook::is_supported(drakvuf_t drakvuf)
 
 userhook::userhook(drakvuf_t drakvuf, bool injection_mode_enabled): pluginex(drakvuf, OUTPUT_DEFAULT), injection_mode(injection_mode_enabled)
 {
+    // Shared by the plugins hooking user mode, its traps and the ones its callbacks add count for libusermode
+    trap_owner_scope owner("libusermode");
+
     if (!is_supported(drakvuf))
         throw -1;
 
@@ -906,19 +1140,28 @@ userhook::userhook(drakvuf_t drakvuf, bool injection_mode_enabled): pluginex(dra
 
 userhook::~userhook()
 {
+    std::unique_lock<std::shared_mutex> lock(this->dlls_mtx);
     for (auto& it : this->loaded_dlls)
     {
         for (auto& loaded_dll : it.second)
         {
             for (auto& target : loaded_dll.targets)
             {
-                if (target.state == HOOK_OK)
+                if (target.state == HOOK_OK && !target.shared)
                 {
                     drakvuf_remove_trap(this->drakvuf, target.trap, wrap_delete);
                 }
             }
         }
     }
+
+    for (auto& [key, image] : this->shared_images)
+        for (auto& hook : image.hooks)
+        {
+            auto data = hook.release();
+            drakvuf_remove_trap(this->drakvuf, data->trap, free_shared_trap);
+        }
+    this->shared_images.clear();
 
     for (auto trap : running_traps)
         rh_data_t::free_trap(trap);
@@ -978,9 +1221,9 @@ void drakvuf_register_usermode_callback(drakvuf_t drakvuf, usermode_cb_registrat
     userhook::get_instance(drakvuf).register_plugin(drakvuf, *reg);
 }
 
-bool drakvuf_request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, const plugin_target_config_entry_t* target, callback_t callback, void* extra)
+bool drakvuf_request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, const plugin_target_config_entry_t* target, callback_t callback, void* extra, bool mt_safe)
 {
-    userhook::get_instance(drakvuf).request_usermode_hook(drakvuf, dll, target, callback, extra);
+    userhook::get_instance(drakvuf).request_usermode_hook(drakvuf, dll, target, callback, extra, mt_safe);
     return true;
 }
 

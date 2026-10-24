@@ -150,6 +150,7 @@
 #include "etwmon/etwmon.h"
 #include "rebootmon/rebootmon.h"
 #include "linkmon/linkmon.h"
+#include "helpers/trap_owner_scope.h"
 
 drakvuf_plugins::drakvuf_plugins(const drakvuf_t _drakvuf, output_format_t _output, os_t _os)
     : drakvuf{ _drakvuf }, output{ _output }, os{ _os }
@@ -170,6 +171,8 @@ int drakvuf_plugins::start(const drakvuf_plugin_t plugin_id,
         if ( !drakvuf_plugin_os_support[plugin_id][this->os] )
             return 0;
 
+        trap_owner_scope owner(drakvuf_plugin_names[plugin_id]);
+
         try
         {
             switch (plugin_id)
@@ -182,6 +185,7 @@ int drakvuf_plugins::start(const drakvuf_plugin_t plugin_id,
                         .syscalls_filter_file = options->syscalls_filter_file,
                         .win32k_profile = options->win32k_profile,
                         .disable_sysret = options->disable_sysret,
+                        .sysret_mode = options->sysret_mode,
                     };
                     this->plugins[plugin_id] = std::make_unique<syscalls>(this->drakvuf, &config, this->output);
                     break;
@@ -686,6 +690,7 @@ int drakvuf_plugins::stop(const drakvuf_plugin_t plugin_id)
         PRINT_DEBUG("Stopping plugin %s\n", drakvuf_plugin_names[plugin_id]);
 
         bool is_stopped = false;
+        trap_owner_scope owner(drakvuf_plugin_names[plugin_id]);
 
         try
         {

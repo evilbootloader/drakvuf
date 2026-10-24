@@ -6,10 +6,12 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "plugins/plugins_ex.h"
+#include "plugins/helpers/return_tracker.h"
 #include "libusermode-linux/dl_rendezvous.hpp"
 #include "libusermode-linux/utils.hpp"
 #include "module_map.hpp"
@@ -42,6 +44,7 @@ public:
     bool stop_impl() override;
 
 private:
+    // One process's hook on a function
     struct hooked_function
     {
         // Points into wanted_hooks, which is populated once at construction
@@ -53,9 +56,18 @@ private:
         // can be unloaded and another mapped at a different base under the
         // same path before we observe either.
         addr_t so_base;
-        vmi_pid_t pid;
         addr_t va;
+    };
+
+    // The breakpoint on one physical address and the hooks every process has
+    // there. Library text is shared, so one breakpoint fires for all the
+    // processes mapping the library, and the callback picks the hooks of the
+    // process that hit it. A breakpoint per process would run as many
+    // callbacks on every call, all but one of them for nothing.
+    struct pa_hook
+    {
         drakvuf_trap_t* trap;
+        std::unordered_map<vmi_pid_t, std::vector<hooked_function>> by_pid;
     };
 
     // What is mapped in one process, and enough context to read it while a
@@ -65,6 +77,10 @@ private:
         addr_t proc_base = 0;   // task_struct
         addr_t dtb = 0;         // its page tables
         so_map_t loaded;        // load address -> library
+        std::map<addr_t, std::string> build_ids;   // load address -> GNU build ID, empty if unknown
+        // The executable, which the dynamic linker lists without a name
+        addr_t exe_start = 0;
+        addr_t exe_end = 0;
     };
 
     // A hook that could not be completed yet, either because the symbol was
@@ -79,15 +95,16 @@ private:
         addr_t dtb;             // to test residency without the process running
         addr_t va;              // 0 until resolved
         unsigned attempts;
+        std::string build_id;   // of the library, empty if unknown
     };
 
-    // Carries the call's arguments from the function's entry, where they are
-    // readable, to its return, where the result is.
-    struct return_data : public PluginResult
+    // A call in progress: its arguments, read at entry, and what to report
+    // with its return value.
+    struct pending_call
     {
-        std::vector<uint64_t> arguments;
         const plugin_target_config_entry_t* config;
         std::string so_path;
+        std::vector<uint64_t> arguments;
     };
 
     void on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so);
@@ -99,6 +116,9 @@ private:
 
     void on_process_reset(vmi_pid_t pid);
 
+    // A call to a hooked function: reports it at entry, or tracks it to its return
+    void on_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const hooked_function& target);
+
     void print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
         const plugin_target_config_entry_t& config, const std::string& so_path,
         const std::vector<uint64_t>& arguments, std::optional<uint64_t> return_value);
@@ -108,40 +128,50 @@ private:
     // an anonymous mapping above the last library is not claimed by it.
     std::optional<std::string> resolve_module(vmi_pid_t pid, addr_t addr) const;
 
-    // Not static, unlike function_hook_cb: this goes through the RAII hook
-    // API, which binds `this` itself. Recovering the plugin by hand here
-    // would reach for trap->data, which for a RAII hook holds the Params
-    // object rather than the legacy plugin_data.
-    event_response_t function_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    // Whether an address lies in a library or the executable, i.e. in code
+    // mapped from a file rather than in memory written at run time (JIT code)
+    bool in_mapped_file(vmi_pid_t pid, addr_t addr) const;
+
+    // The GNU build ID of a library as a hex string, empty if it has none or it can't be read
+    std::string read_build_id(drakvuf_t drakvuf, addr_t proc_base, addr_t so_base);
+
+    /*
+     * The addresses of entries in one mapping of a library, in one pass over
+     * its symbol table, or none if a library with the same build ID was
+     * resolved before. 0: not resolvable yet, the symbol table could not be
+     * read; ~0: the library doesn't define the symbol.
+     */
+    std::vector<addr_t> resolve_symbols(drakvuf_t drakvuf, addr_t proc_base, addr_t so_base,
+        const std::string& build_id, const std::vector<const plugin_target_config_entry_t*>& entries);
 
     // Returns false if the page is not resident, in which case the caller
     // should defer the hook rather than treat it as failed. Pass a physical
     // address to breakpoint that frame directly, for a page the target itself
     // has not faulted in; the VA is still recorded, being where the target
     // will execute it and what the callback compares against.
-    bool place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+    bool place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, addr_t dtb,
         const plugin_target_config_entry_t& entry, const std::string& so_path,
         addr_t so_base, addr_t va, std::optional<addr_t> pa = std::nullopt);
 
     // Find the physical frame backing a library page through some other
     // process that has it resident. Library text is file-backed and shared,
-    // so any process mapping the same library maps the same frames, even
-    // though each faults them in separately.
+    // so any process mapping the same file maps the same frames, even though
+    // each faults them in separately. The same file: the same build ID.
     //
     // Returns nothing if no other process has that page, which is the case a
     // hook on a genuinely untouched library still cannot be placed in.
     std::optional<addr_t> find_shared_pa(drakvuf_t drakvuf, vmi_pid_t pid,
         const deferred_hook& target) const;
 
-    // Remove one hook and forget it. Returns the iterator past it, so callers
-    // sweeping `hooked` can erase as they go.
-    std::map<const drakvuf_trap_t*, hooked_function>::iterator
-    drop_hook(std::map<const drakvuf_trap_t*, hooked_function>::iterator it);
+    // Remove the hooks of a process accepted by drop, and the breakpoints
+    // with them once no process has a hook on them.
+    template<typename Drop>
+    void drop_hooks(vmi_pid_t pid, Drop drop);
 
-    // Retry whatever could not be completed earlier. Resolution and trap
-    // insertion both go through the target's own page tables, so this does
-    // not require that process to be the one running.
-    void flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid);
+    // Retry whatever could not be completed earlier, at most budget hooks.
+    // Resolution and trap insertion both go through the target's own page
+    // tables, so this does not require that process to be the one running.
+    void flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid, unsigned& budget);
 
     // Drives the retries: without it a process whose every symbol failed
     // would never hook anything, having no hook left to fire.
@@ -152,25 +182,29 @@ private:
     wanted_so_hooks_t wanted_hooks;
     std::unique_ptr<dl_rendezvous> rendezvous;
 
-    // Keyed by the trap itself, which info->trap identifies exactly. Keying
-    // on (pid, info->regs->rip) instead would depend on rip being the
-    // breakpoint address rather than the instruction after it.
-    std::map<const drakvuf_trap_t*, hooked_function> hooked;
+    std::unordered_map<addr_t, pa_hook> pa_hooks;   // key: physical address
 
     // Which (pid, va) pairs are already hooked, to avoid placing a second
-    // breakpoint on one and to find a process's hooks when it goes away.
+    // hook on one.
     std::set<std::pair<vmi_pid_t, addr_t>> hooked_keys;
 
     std::map<vmi_pid_t, std::vector<deferred_hook>> deferred;
+    // When the retry tick last looked up symbols for a process, which is the expensive part
+    std::map<vmi_pid_t, gint64> last_resolve;
+    // The process the retry tick goes on with, so a long list is worked through in turns
+    vmi_pid_t next_deferred = 0;
 
     // What every tracked process has mapped, so an address can be attributed
     // back to the library it lies in, and so a library's pages can be reached
     // through a process that has them resident.
     std::map<vmi_pid_t, process_libs> libs;
 
-    // Calls currently in flight, keyed by (pid, tid, rsp) so that recursive
-    // or concurrent calls to the same function do not collide.
-    std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
+    // Symbol offsets from the load address per GNU build ID, so every other
+    // mapping of the same file skips the symbol table. 0: not defined there.
+    std::map<std::string, std::map<const plugin_target_config_entry_t*, addr_t>> symbol_offsets;
+
+    // The calls in progress, matched to their returns
+    return_tracker<pending_call> returns;
 
     bool no_retval;
 
@@ -181,6 +215,23 @@ private:
     // Held only while something is deferred; a CR3 hook fires on every
     // context switch.
     std::unique_ptr<libhook::Cr3Hook> cr3_hook;
+
+#ifdef DRAKVUF_DEBUG
+    // Debug builds: the pages return breakpoints were placed on, to match the
+    // pages libdrakvuf copies again after guest writes (see trap_stats.c)
+    struct return_page
+    {
+        vmi_pid_t pid;          // the first call returning there
+        addr_t va;
+        std::string where;      // library, executable or anonymous memory
+        bool transient;
+        uint64_t calls;
+    };
+    std::map<addr_t, return_page> return_pages;   // key: physical page
+    void count_return_page(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t ret_addr, bool transient);
+    void print_return_pages() const;
+
+#endif
 };
 
 #endif

@@ -134,6 +134,7 @@ static bool enum_modules_cb(drakvuf_t dravkuf, const module_info_t* module_info,
         return true;
 
     auto plugin   = static_cast<win_syscalls*>(ctx);
+    std::lock_guard<std::mutex> lock(plugin->procs_mtx);
     auto& modules = plugin->procs[module_info->pid];
     modules.push_back(
     {
@@ -153,6 +154,8 @@ static event_response_t ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     auto wr = get_trap_params<wrapper_t>(info);
 
     //Verifies that the params we got above (preset by the previous trap) match the trap_information this cb got called with.
+    //The return trap is shared by all threads returning to the same address and may hit on any vCPU, so this is what
+    //selects the trap of the current thread.
     if (!wr->verify_result_call_params(drakvuf, info))
         return VMI_EVENT_RESPONSE_NONE;
 
@@ -161,16 +164,25 @@ static event_response_t ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     if (!exit_status_str)
         exit_status_str = ntstatus_format_string(ntstatus_t(info->regs->rax), exit_status_buf, sizeof(exit_status_buf));
 
-    if (wr->sc)
-        info->trap->name = wr->sc->name;
-    s->print_sysret(drakvuf, info, wr->num, exit_status_str);
+    s->print_sysret(drakvuf, info, wr->num, info->regs->rax, exit_status_str);
 
     //Destroys this return trap, because it is specific for the RIP and not usable anymore. This was the trap being called when the physical address got computed.
     //Deletes this trap from the list of existing traps traps
     //Additionally removes the trap and frees the memory
+    //With parallel events it is skipped from now on, so it can't match the next return of this thread
     s->destroy_trap(info->trap);
 
     return 0;
+}
+
+void win_syscalls::print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call)
+{
+    char exit_status_buf[NTSTATUS_MAX_FORMAT_STR_SIZE] = {0};
+    const char* exit_status_str = ntstatus_to_string(ntstatus_t(info->regs->rax));
+    if (!exit_status_str)
+        exit_status_str = ntstatus_format_string(ntstatus_t(info->regs->rax), exit_status_buf, sizeof(exit_status_buf));
+
+    this->print_sysret(drakvuf, info, call.num, info->regs->rax, exit_status_str);
 }
 
 static std::vector<uint64_t> extract_args(drakvuf_t drakvuf, drakvuf_trap_info_t const* info, size_t reg_size, size_t nargs)
@@ -183,7 +195,7 @@ static std::vector<uint64_t> extract_args(drakvuf_t drakvuf, drakvuf_trap_info_t
 
     if (nargs)
     {
-        auto vmi = vmi_lock_guard(drakvuf);
+        auto vmi = vmi_reader_guard(drakvuf);
 
         // get arguments only if we know how many to get
 
@@ -231,8 +243,11 @@ static std::vector<uint64_t> extract_args(drakvuf_t drakvuf, drakvuf_trap_info_t
 
 static std::optional<std::string> resolve_module(drakvuf_t drakvuf, addr_t addr, addr_t process, vmi_pid_t pid, win_syscalls* s)
 {
+    // The cache is shared by all vCPU threads. It isn't locked while resolving,
+    // the drakvuf functions take the VMI lock and enum_modules_cb takes procs_mtx.
     auto lookup = [&]() -> std::optional<std::string>
     {
+        std::lock_guard<std::mutex> lock(s->procs_mtx);
         const auto& mods = s->procs.find(pid);
         if (mods != s->procs.end())
         {
@@ -262,20 +277,21 @@ static std::optional<std::string> resolve_module(drakvuf_t drakvuf, addr_t addr,
     }
     else if (mmvad_info_t mmvad{}; drakvuf_find_mmvad(drakvuf, process, addr, &mmvad))
     {
-        auto& mods = s->procs[pid];
         if (mmvad.file_name_ptr)
         {
             if (auto u_name = drakvuf_read_unicode_va(drakvuf, mmvad.file_name_ptr, 0))
             {
                 std::string name = (const char*)u_name->contents;
-                mods.push_back(
-                {
-                    .name = std::move(name),
-                    .base = mmvad.starting_vpn << 12,
-                        .size = (mmvad.ending_vpn - mmvad.starting_vpn) << 12
-                });
                 vmi_free_unicode_str(u_name);
-                return mods.back().name;
+
+                std::lock_guard<std::mutex> lock(s->procs_mtx);
+                s->procs[pid].push_back(
+                {
+                    .name = name,
+                    .base = mmvad.starting_vpn << 12,
+                    .size = (mmvad.ending_vpn - mmvad.starting_vpn) << 12
+                });
+                return name;
             }
         }
     }
@@ -284,7 +300,7 @@ static std::optional<std::string> resolve_module(drakvuf_t drakvuf, addr_t addr,
 
 static std::optional<std::string> resolve_parent_module(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s)
 {
-    vmi_lock_guard vmi(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     addr_t rsp, top;
     if (VMI_SUCCESS != vmi_read_addr_va(vmi, drakvuf_get_rspbase(drakvuf, info) - 0x10, 0, &rsp) ||
         VMI_SUCCESS != vmi_read_addr_va(vmi, rsp, info->attached_proc_data.pid, &top))
@@ -340,6 +356,17 @@ static std::tuple<privilege_mode_t, std::optional<std::string>, std::optional<st
     return { MAXIMUM_MODE, {}, {} };
 }
 
+// Where the syscall returns to: ntdll for calls from user mode, the caller of the Nt function otherwise.
+// 0 if unknown, the return address of the hooked function is used then.
+static addr_t syscall_return_address(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    privilege_mode_t mode;
+    if (!drakvuf_get_current_thread_previous_mode(drakvuf, info, &mode))
+        return 0;
+
+    return drakvuf_get_syscall_retaddr(drakvuf, info, mode);
+}
+
 drakvuf_trap_t* init_syscall_return_bp(drakvuf_t drakvuf, drakvuf_trap_info_t* info, drakvuf_trap_t* trap)
 {
     if (!trap)
@@ -347,14 +374,8 @@ drakvuf_trap_t* init_syscall_return_bp(drakvuf_t drakvuf, drakvuf_trap_info_t* i
         return nullptr;
     }
 
-    privilege_mode_t mode;
-    addr_t ret_addr = 0;
-
-    if (drakvuf_get_current_thread_previous_mode(drakvuf, info, &mode))
-    {
-        ret_addr = drakvuf_get_syscall_retaddr(drakvuf, info, mode);
-        PRINT_DEBUG("Setting syscall return breakpoint at %lx\n", ret_addr);
-    }
+    addr_t ret_addr = syscall_return_address(drakvuf, info);
+    PRINT_DEBUG("Setting syscall return breakpoint at %lx\n", ret_addr);
 
     return breakpoint_by_dtb_searcher()
         .for_virt_addr(ret_addr)
@@ -379,40 +400,46 @@ static event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     if (!ret_addr)
         return VMI_EVENT_RESPONSE_NONE;
 
-    auto trap = s->register_trap<wrapper_t>(info, ret_cb, init_syscall_return_bp);
+    if (s->sysret_mode == sysret_mode_t::KERNEL)
+    {
+        //Every syscall returns to the caller of the Nt function, the system service dispatcher for most
+        s->track_syscall_return(drakvuf, info, ret_addr, w->num, w->type, info->trap->name);
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    //Save the address of the target thread, address of the rsp (this was the rip-address, which we used for construction) and the value of the CR3 register to the params.
+    addr_t user_rsp = 0;
+    bool has_user_rsp = mode == USER_MODE && drakvuf_get_user_rsp(drakvuf, info, &user_rsp);
+
+    //wrapper extends from call_result_t which extends from plugin_params
+    //The params are filled in before the trap is added: other threads returning to the same address may hit it
+    //right away, on any vCPU, and the thread itself may return on another vCPU than it entered the syscall on.
+    auto trap = s->register_prepared_trap<wrapper_t>(info, ret_cb, init_syscall_return_bp, nullptr,
+            [&](drakvuf_trap_t* ret_trap, wrapper_t* wr)
+    {
+        if (has_user_rsp)
+            wr->set_result_call_params(info, user_rsp);
+        else
+            wr->set_result_call_params(info);
+
+        //enrich the params of the new/next trap. This information is used later.
+        wr->num = w->num;
+        wr->type = w->type;
+        wr->sc = w->sc;
+
+        ret_trap->breakpoint.module = w->type;
+        ret_trap->mt_safe = true;
+    });
     if (!trap)
     {
         PRINT_DEBUG("Failed to trap syscall return %hu\n", w->num);
         return VMI_EVENT_RESPONSE_NONE;
     }
-    trap->breakpoint.module = w->type;
 
-    //After the trap got constructed, enrich its details already with some information we already (and just) know here (at this point).
-
-    //wrapper extends from call_result_t which extends from plugin_params
-    //get_trap_params reinterprets the pointer of trap->data as a pointer to wrapper
-    //Load the information that is saved by hitting the first trap.
-    //With params we can preset the params that the newly risen second breakpoint will receive.
-    auto wr = get_trap_params<wrapper_t>(trap);
-
-    //Save the address of the target thread, address of the rsp (this was the rip-address, which we used for construction) and the value of the CR3 register to the params.
-    addr_t user_rsp = 0;
-
-    if (mode == USER_MODE && drakvuf_get_user_rsp(drakvuf, info, &user_rsp))
-    {
-        wr->set_result_call_params(info, user_rsp);
+    if (has_user_rsp)
         PRINT_DEBUG("[SYSCALLS] set trap with user rsp: %lx, module: %s\n", user_rsp, w->type);
-    }
     else
-    {
-        wr->set_result_call_params(info);
         PRINT_DEBUG("[SYSCALLS] set trap with kernel rsp: %lx, module %s\n", info->regs->rsp, w->type);
-    }
-
-    //enrich the params of the new/next trap. This information is used later.
-    wr->num = w->num;
-    wr->type = w->type;
-    wr->sc = w->sc;
 
     return VMI_EVENT_RESPONSE_NONE;
 }
@@ -508,31 +535,30 @@ bool win_syscalls::trap_syscall_table_entries(drakvuf_t drakvuf, vmi_instance_t 
             continue;
         }
 
+        //wrapper extends from call_result_t which extends from plugin_params
+        //The params are filled in before the trap is added, the win32k table may be trapped while other vCPUs run.
         breakpoint_by_dtb_searcher bp;
-        auto trap = this->register_trap<wrapper_t>(
+        auto trap = this->register_prepared_trap<wrapper_t>(
                 nullptr,
                 syscall_cb,
                 bp.for_virt_addr(syscall_va).for_dtb(cr3),
-                symbol_name);
+                symbol_name,
+                [&](drakvuf_trap_t* entry_trap, wrapper_t* w)
+        {
+            //enrich the params of the new/next trap. This information is used later.
+            w->num = syscall_num;
+            w->type = ntos ? "nt" : "win32k";
+            w->sc = definition;
+
+            //syscall_cb only shares the plugin's module cache and output, which are locked
+            entry_trap->mt_safe = true;
+        });
 
         if (!trap)
         {
             PRINT_DEBUG("Failed to trap syscall %lu @ 0x%lx\n", syscall_num, syscall_va);
             continue;
         }
-
-        //After the trap got constructed, enrich its details already with some information we already (and just) know here (at this point).
-
-        //wrapper extends from call_result_t which extends from plugin_params
-        //get_trap_params reinterprets the pointer of trap->data as a pointer to wrapper
-        //Load the information that is saved by hitting the first trap.
-        //With params we can preset the params that the newly risen second breakpoint will receive.
-        auto w = get_trap_params<wrapper_t>(trap);
-
-        //enrich the params of the new/next trap. This information is used later.
-        w->num = syscall_num;
-        w->type = ntos ? "nt" : "win32k";
-        w->sc = definition;
     }
 
     drakvuf_free_symbols(symbols);
@@ -778,7 +804,12 @@ event_response_t win_syscalls::delete_process_cb(drakvuf_t drakvuf, drakvuf_trap
 
     if (vmi_pid_t pid; drakvuf_get_process_pid(drakvuf, process, &pid))
     {
-        this->procs.erase(pid);
+        {
+            std::lock_guard<std::mutex> lock(this->procs_mtx);
+            this->procs.erase(pid);
+        }
+
+        this->forget_process_syscalls(pid);
     }
     return VMI_EVENT_RESPONSE_NONE;
 }
@@ -791,10 +822,8 @@ void win_syscalls::print_syscall(
     std::optional<std::string> from_parent_dll
 )
 {
-    if (sc)
-        info->trap->name = sc->name;
-
-    this->fmt_args.clear();
+    // The trap is already named after the syscall when it is known
+    std::vector<std::pair<char const*, fmt::Aarg>> fmt_args;
 
     if (sc)
     {
@@ -802,11 +831,11 @@ void win_syscalls::print_syscall(
         {
             auto str = this->parse_argument(drakvuf, info, sc->args[i], args[i]);
             if ( !str.empty() )
-                this->fmt_args.push_back(keyval(sc->args[i].name, fmt::Estr(str)));
+                fmt_args.push_back(keyval(sc->args[i].name, fmt::Estr(str)));
             else
             {
                 uint64_t val = transform_value(drakvuf, info, sc->args[i], args[i]);
-                this->fmt_args.push_back(keyval(sc->args[i].name, fmt::Xval(val)));
+                fmt_args.push_back(keyval(sc->args[i].name, fmt::Xval(val)));
             }
         }
     }
@@ -818,7 +847,7 @@ void win_syscalls::print_syscall(
         from_dll_opt = fmt::Estr(std::move(*from_dll));
 
     if (from_parent_dll.has_value())
-        from_dll_opt = fmt::Estr(std::move(*from_parent_dll));
+        from_parent_dll_opt = fmt::Estr(std::move(*from_parent_dll));
 
     if (mode != MAXIMUM_MODE)
         priv_mode_opt = fmt::Rstr(mode == USER_MODE ? "User" : "Kernel");

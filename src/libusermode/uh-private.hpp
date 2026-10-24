@@ -107,6 +107,7 @@
 
 #include <vector>
 #include <memory>
+#include <shared_mutex>
 #include <set>
 #include <map>
 
@@ -187,6 +188,7 @@ struct dll_t
     addr_t pf_max_addr;
 
     bool in_progress{false};
+    bool shares_image{false};   // counted in userhook::shared_images
     x86_registers_t regs;
 
     uint64_t stack_marker()
@@ -252,6 +254,36 @@ public:
     // map pid -> list of loaded/hooked dlls
     std::map<vmi_pid_t, std::vector<dll_t>> loaded_dlls;
 
+    /*
+     * DLL images hooked once for all processes that map them at the same address.
+     * Windows maps an image section at one address per boot, onto the same physical
+     * pages until a process writes to one of them, so one breakpoint per hooked
+     * function serves them all, where each process had its own on the same physical
+     * address. A breakpoint calls the target of the process that hit it.
+     */
+    using image_key_t = std::pair<addr_t, addr_t>;   // first prototype PTE, base address
+
+    struct shared_hook
+    {
+        image_key_t image;
+        size_t slot;                // the target's index in the dll_t of each process
+        drakvuf_trap_t* trap;
+        addr_t offset;
+        std::string name;           // the trap's: the process that hooked it first can go first
+    };
+
+    struct shared_image
+    {
+        unsigned processes{0};      // the dll_t sharing it
+        std::vector<std::unique_ptr<shared_hook>> hooks;
+    };
+
+    std::map<image_key_t, shared_image> shared_images;
+
+    // loaded_dlls and shared_images: shared by the shared breakpoints' dispatch, which
+    // can run on several vCPU threads at once, exclusive in the callbacks changing them
+    std::shared_mutex dlls_mtx;
+
     struct module_context_t
     {
         std::optional<mmvad_info_t> mmvad;
@@ -273,7 +305,7 @@ public:
 
     static bool is_supported(drakvuf_t drakvuf);
     void register_plugin(drakvuf_t drakvuf, usermode_cb_registration reg);
-    void request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, const plugin_target_config_entry_t* target, callback_t callback, void* extra);
+    void request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, const plugin_target_config_entry_t* target, callback_t callback, void* extra, bool mt_safe = false);
     void request_userhook_on_running_process(drakvuf_t drakvuf, addr_t target_process, const std::string& dll_name, const std::string& func_name, callback_t cb, void* extra);
 
     bool add_running_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap);

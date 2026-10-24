@@ -103,6 +103,7 @@
  ***************************************************************************/
 
 #include <libvmi/libvmi.h>
+#include <atomic>
 #include <map>
 #include <string>
 #include <glib.h>
@@ -1176,7 +1177,7 @@ bool linux_filetracer::get_pt_regs_and_nr(drakvuf_t drakvuf, drakvuf_trap_info_t
         }
 
         // Fallback: read orig_rax from pt_regs
-        auto vmi = vmi_lock_guard(drakvuf);
+        vmi_reader_guard vmi(drakvuf);
         return VMI_SUCCESS == vmi_read_addr_va(vmi, *pt_regs_addr + this->regs[PT_REGS_ORIG_RAX], 0, nr);
     }
 
@@ -1197,7 +1198,7 @@ bool linux_filetracer::read_pt_regs_arg(drakvuf_t drakvuf, addr_t pt_regs_addr, 
     if (arg_index < 0 || arg_index >= 6)
         return false;
 
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     return VMI_SUCCESS == vmi_read_addr_va(vmi, pt_regs_addr + this->regs[arg_offsets[arg_index]], 0, value);
 }
 
@@ -1206,7 +1207,7 @@ char* linux_filetracer::read_user_string(drakvuf_t drakvuf, drakvuf_trap_info_t*
     if (!user_addr)
         return nullptr;
 
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB,
         .dtb = info->regs->cr3,
@@ -1225,7 +1226,7 @@ std::string linux_filetracer::get_filename_from_fd(drakvuf_t drakvuf, drakvuf_tr
     if (!task)
         return "";
 
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
 
     // task_struct->files (struct files_struct *)
     addr_t files_struct;
@@ -1289,21 +1290,22 @@ void linux_filetracer::print_syscall_info(drakvuf_t drakvuf, drakvuf_trap_info_t
     g_free(const_cast<char*>(thread_name));
 }
 
+// Runs on several vCPU threads at once: it only reads guest memory and the offsets found at startup
 event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    static int cb_count = 0;
-    if (cb_count < 3)
+    static std::atomic<int> cb_count{0};
+    if (int count = ++cb_count; count <= 3)
         fprintf(stderr, "[FILETRACER] syscall_cb fired (count=%d) rdi=0x%lx rsi=0x%lx\n",
-            ++cb_count, (unsigned long)info->regs->rdi, (unsigned long)info->regs->rsi);
+            count, (unsigned long)info->regs->rdi, (unsigned long)info->regs->rsi);
 
     addr_t pt_regs_addr = 0;
     uint64_t nr = 0;
 
     if (!get_pt_regs_and_nr(drakvuf, info, &pt_regs_addr, &nr))
     {
-        static int fail_count = 0;
-        if (fail_count < 3)
-            fprintf(stderr, "[FILETRACER] get_pt_regs_and_nr failed (count=%d)\n", ++fail_count);
+        static std::atomic<int> fail_count{0};
+        if (int count = ++fail_count; count <= 3)
+            fprintf(stderr, "[FILETRACER] get_pt_regs_and_nr failed (count=%d)\n", count);
         return VMI_EVENT_RESPONSE_NONE;
     }
 
@@ -1563,7 +1565,7 @@ linux_filetracer::linux_filetracer(drakvuf_t drakvuf, output_format_t output) : 
 
     // Try do_syscall_64 first - reliable on kernel 6.x+ with FRED where
     // x64_sys_call may be called via static_call (bypassing INT3 at entry)
-    syscall_hook = createSyscallHook("do_syscall_64", &linux_filetracer::syscall_cb, "do_syscall_64");
+    syscall_hook = createSyscallHook("do_syscall_64", &linux_filetracer::syscall_cb, "do_syscall_64", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
         fprintf(stderr, "[FILETRACER] Hooked do_syscall_64\n");
@@ -1572,7 +1574,7 @@ linux_filetracer::linux_filetracer(drakvuf_t drakvuf, output_format_t output) : 
     fprintf(stderr, "[FILETRACER] do_syscall_64 hook failed, trying x64_sys_call\n");
 
     // Fallback to x64_sys_call
-    syscall_hook = createSyscallHook("x64_sys_call", &linux_filetracer::syscall_cb, "x64_sys_call");
+    syscall_hook = createSyscallHook("x64_sys_call", &linux_filetracer::syscall_cb, "x64_sys_call", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
         fprintf(stderr, "[FILETRACER] Hooked x64_sys_call\n");

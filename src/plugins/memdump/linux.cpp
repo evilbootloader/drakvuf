@@ -106,6 +106,7 @@
 #include <assert.h>
 #include <libvmi/libvmi.h>
 #include <map>
+#include <mutex>
 #include <string>
 
 #include "plugins/plugins.h"
@@ -135,7 +136,7 @@ bool linux_memdump::get_pt_regs_and_nr(drakvuf_t drakvuf, drakvuf_trap_info_t* i
         }
 
         // Fallback: read orig_rax from pt_regs
-        auto vmi = vmi_lock_guard(drakvuf);
+        vmi_reader_guard vmi(drakvuf);
         return VMI_SUCCESS == vmi_read_addr_va(vmi, *pt_regs_addr + this->regs[PT_REGS_ORIG_RAX], 0, nr);
     }
 
@@ -156,7 +157,7 @@ bool linux_memdump::read_pt_regs_arg(drakvuf_t drakvuf, addr_t pt_regs_addr, int
     if (arg_index < 0 || arg_index >= 6)
         return false;
 
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     return VMI_SUCCESS == vmi_read_addr_va(vmi, pt_regs_addr + this->regs[arg_offsets[arg_index]], 0, value);
 }
 
@@ -232,9 +233,11 @@ event_response_t linux_memdump::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_
     if (!get_pt_regs_and_nr(drakvuf, info, &pt_regs_addr, &nr))
         return VMI_EVENT_RESPONSE_NONE;
 
-    // Filter for memory-related syscalls only
+    // Filter for memory-related syscalls only, the others return without the lock
     if (!is_memory_syscall(nr))
         return VMI_EVENT_RESPONSE_NONE;
+
+    std::lock_guard<std::mutex> lock(this->syscall_mtx);
 
     const char* syscall_name = get_memory_syscall_name(nr);
 
@@ -467,7 +470,7 @@ linux_memdump::linux_memdump(drakvuf_t drakvuf, const memdump_config* c, output_
 
     // Try do_syscall_64 first - reliable on kernel 6.x+ with FRED where
     // x64_sys_call may be called via static_call (bypassing INT3 at entry)
-    syscall_hook = createSyscallHook("do_syscall_64", &linux_memdump::syscall_cb, "do_syscall_64");
+    syscall_hook = createSyscallHook("do_syscall_64", &linux_memdump::syscall_cb, "do_syscall_64", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
         PRINT_DEBUG("[MEMDUMP] Hooked do_syscall_64\n");
@@ -476,7 +479,7 @@ linux_memdump::linux_memdump(drakvuf_t drakvuf, const memdump_config* c, output_
     PRINT_DEBUG("[MEMDUMP] do_syscall_64 hook failed, trying x64_sys_call\n");
 
     // Fallback to x64_sys_call
-    syscall_hook = createSyscallHook("x64_sys_call", &linux_memdump::syscall_cb, "x64_sys_call");
+    syscall_hook = createSyscallHook("x64_sys_call", &linux_memdump::syscall_cb, "x64_sys_call", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
         PRINT_DEBUG("[MEMDUMP] Hooked x64_sys_call\n");

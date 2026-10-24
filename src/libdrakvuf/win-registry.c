@@ -133,7 +133,7 @@ static char* win_reg_keycontrolblock_path( drakvuf_t drakvuf, drakvuf_trap_info_
 {
     status_t vmi_status ;
     addr_t p_name_control_block = 0 ;
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     ACCESS_CONTEXT(ctx,
         .addr = p_key_control_block + drakvuf->offsets[ CM_KEY_NAMEBLOCK ],
         .translate_mechanism = VMI_TM_PROCESS_DTB,
@@ -191,7 +191,7 @@ static gchar* win_reg_keybody_path( drakvuf_t drakvuf, drakvuf_trap_info_t* info
 {
     gchar* buf_ret = NULL ;
     status_t vmi_status ;
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     addr_t p_key_control_block = 0 ;
     ACCESS_CONTEXT(ctx,
         .addr = p_key_body + drakvuf->offsets[ CM_KEY_CONTROL_BLOCK ],

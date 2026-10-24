@@ -149,6 +149,8 @@ enum offset
     FILE_OBJECT_FILENAME,
     FILE_OBJECT_SECTIONOBJECTPOINTER,
     FILE_OBJECT_CURRENTBYTEOFFSET,
+    FILE_OBJECT_DEVICEOBJECT,
+    DEVICE_OBJECT_DEVICETYPE,
     SECTIONOBJECTPOINTER_DATASECTIONOBJECT,
     SECTIONOBJECTPOINTER_SHAREDCACHEMAP,
     SECTIONOBJECTPOINTER_IMAGESECTIONOBJECT,
@@ -206,6 +208,8 @@ static const char* offset_names[__OFFSET_MAX][2] =
     [FILE_OBJECT_FILENAME] = {"_FILE_OBJECT", "FileName"},
     [FILE_OBJECT_SECTIONOBJECTPOINTER] = {"_FILE_OBJECT", "SectionObjectPointer"},
     [FILE_OBJECT_CURRENTBYTEOFFSET] = {"_FILE_OBJECT", "CurrentByteOffset"},
+    [FILE_OBJECT_DEVICEOBJECT] = {"_FILE_OBJECT", "DeviceObject"},
+    [DEVICE_OBJECT_DEVICETYPE] = {"_DEVICE_OBJECT", "DeviceType"},
     [SECTIONOBJECTPOINTER_DATASECTIONOBJECT] = {"_SECTION_OBJECT_POINTERS", "DataSectionObject"},
     [SECTIONOBJECTPOINTER_SHAREDCACHEMAP] = {"_SECTION_OBJECT_POINTERS", "SharedCacheMap"},
     [SECTIONOBJECTPOINTER_IMAGESECTIONOBJECT] = {"_SECTION_OBJECT_POINTERS", "ImageSectionObject"},
@@ -329,6 +333,16 @@ public:
     bool closed{false};    // indicates whether the file handle was closed.
     bool error{false};    // indicates whether error occurred.
 
+    // Other threads' operations on the handle while an injected call of the task is in
+    // flight, applied once the extraction is done: the file offset and the data of the
+    // writes that returned, in their order, and a close of the handle.
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> deferred_writes;
+    bool close_deferred{false};
+
+    // The event being dispatched is the return of the task's injected call: only then
+    // do the thread's registers belong to the injection and get restored.
+    bool on_return{false};
+
     union
     {
         struct
@@ -408,6 +422,13 @@ public:
         }
     }
 
+    // Every stage but pending and finished waits for the return of the call
+    // injected on the task's thread (target)
+    bool injection_in_flight()
+    {
+        return m_stage != stage_t::pending && m_stage != stage_t::finished;
+    }
+
     std::string to_str(const stage_t stage)
     {
 
@@ -461,7 +482,9 @@ struct writefile_result_t : public PluginResult
           len(),
           str(),
           byteoffset(),
-          idx()
+          idx(),
+          task_id(),
+          file_obj()
     {
     }
 
@@ -469,6 +492,9 @@ struct writefile_result_t : public PluginResult
     uint64_t str;
     uint64_t byteoffset;
     int idx;
+    // The task when the call was made, it may extract the file at the return
+    uint64_t task_id;
+    addr_t file_obj;
 };
 
 struct IO_STATUS_BLOCK_32
@@ -512,6 +538,11 @@ struct FILE_FS_DEVICE_INFORMATION
 } __attribute__((packed));
 
 // TODO Move into "task_t" as "MAX_READ_BYTES"
-static const uint64_t BYTES_TO_READ = 0x10000;
+// The bytes copied per chunk, each costs three injected calls: map, copy, unmap.
+// A multiple of the 64 KiB allocation granularity, which view offsets must keep.
+static const uint64_t BYTES_TO_READ = 0x100000;
+
+// FILE_FS_DEVICE_INFORMATION.DeviceType of a file on a disk, the only one extracted
+static const uint32_t FILE_DEVICE_DISK = 7;
 }
 #endif // FILEDELETE_PRIVATE_H

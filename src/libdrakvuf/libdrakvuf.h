@@ -307,6 +307,20 @@ struct drakvuf_trap
     // Callback invoked when the trap hits api-hammering limit. If not set (NULL),
     // the trap will be simply unhooked (not deleted).
     void(*ah_cb)(drakvuf_t, drakvuf_trap_t*);
+
+    // With parallel event processing, a breakpoint callback marked mt_safe may
+    // run concurrently on several vCPU threads. All other callbacks are
+    // serialized. Must be set before the trap is added.
+    bool mt_safe;
+    // Set atomically when the trap is removed. With parallel event processing
+    // removed traps stay listed until all vCPU threads are idle and are
+    // skipped meanwhile. Owned by libdrakvuf.
+    gint removed;
+
+    // Trap statistics of debug builds: the plugin that added the trap and its
+    // counters. Set by drakvuf_add_trap, owned by libdrakvuf.
+    const char* owner;
+    void* stats;
 };
 
 
@@ -341,6 +355,15 @@ typedef enum object_manager_object
 
 vmi_instance_t drakvuf_lock_and_get_vmi(drakvuf_t drakvuf) NOEXCEPT;
 void drakvuf_release_vmi(drakvuf_t drakvuf) NOEXCEPT;
+
+/*
+ * Instance for reading guest memory only. On a vCPU event thread with parallel
+ * event processing this is the thread's own LibVMI instance and no lock is
+ * taken, otherwise it behaves like drakvuf_lock_and_get_vmi. Do not use it to
+ * write memory or to change events, SLAT views or registers.
+ */
+vmi_instance_t drakvuf_lock_and_get_reader_vmi(drakvuf_t drakvuf) NOEXCEPT;
+void drakvuf_release_reader_vmi(drakvuf_t drakvuf) NOEXCEPT;
 
 ////////////////////////////////////////////////////////////////////////////
 
@@ -441,6 +464,14 @@ bool drakvuf_init (drakvuf_t* drakvuf,
     bool get_userid,
     bool enable_active_callback_check) NOEXCEPT;
 bool drakvuf_init_os (drakvuf_t drakvuf) NOEXCEPT;
+/*
+ * Process events of each vCPU on its own thread. Breakpoint callbacks of traps
+ * marked mt_safe run concurrently, all other callbacks stay serialized.
+ * Requires a build with --enable-threadsafety and Xen vm_event interface 7.
+ * Must be called from the thread running drakvuf_loop, outside of callbacks.
+ */
+bool drakvuf_enable_parallel_events(drakvuf_t drakvuf) NOEXCEPT;
+bool drakvuf_is_parallel_events(drakvuf_t drakvuf) NOEXCEPT;
 void drakvuf_close (drakvuf_t drakvuf, const bool pause) NOEXCEPT;
 int drakvuf_send_qemu_monitor_command(drakvuf_t drakvuf, const char* in, char** out);
 bool drakvuf_add_trap(drakvuf_t drakvuf,
@@ -449,6 +480,28 @@ void drakvuf_remove_trap (drakvuf_t drakvuf,
     drakvuf_trap_t* trap,
     drakvuf_trap_free_t free_routine) NOEXCEPT;
 void drakvuf_unhook_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap) NOEXCEPT;
+
+/*
+ * Trap statistics of debug builds: the traps added on the calling thread until
+ * drakvuf_trap_owner_leave count for owner, a string that lives until
+ * DRAKVUF exits. Returns the previous owner to pass to drakvuf_trap_owner_leave.
+ * Callbacks run with the owner of their trap. Does nothing in release builds.
+ */
+#ifdef DRAKVUF_DEBUG
+const char* drakvuf_trap_owner_enter(const char* owner) NOEXCEPT;
+void drakvuf_trap_owner_leave(const char* previous) NOEXCEPT;
+#else
+static inline const char* drakvuf_trap_owner_enter(const char* owner) NOEXCEPT
+{
+    (void)owner;
+    return NULL;
+}
+static inline void drakvuf_trap_owner_leave(const char* previous) NOEXCEPT
+{
+    (void)previous;
+}
+#endif
+
 void drakvuf_loop (drakvuf_t drakvuf, bool (*is_interrupted)(drakvuf_t, void*), void* data) NOEXCEPT;
 void drakvuf_interrupt (drakvuf_t drakvuf,
     int sig) NOEXCEPT;
@@ -641,9 +694,25 @@ addr_t drakvuf_export_lib_address(drakvuf_t drakvuf, addr_t process_addr, const 
  * against a real range. The dynamic linker reports each library's base but no
  * extent, and guessing one from the next library up claims every anonymous
  * mapping between them.
+ *
+ * drakvuf_exportsyms_to_va_at_base resolves several symbols in one pass over
+ * the symbol table, which drakvuf_exportsym_to_va_at_base reads once per
+ * symbol: vas[i] is the address of syms[i], 0 if the module doesn't define it.
+ * Returns false if the tables could not be read, with the addresses found
+ * until then set.
+ *
+ * drakvuf_get_module_build_id copies the module's GNU build ID, which tells
+ * whether two mappings are of the same file, into id: returns its length, 0
+ * if there is none, it can't be read or is longer than size.
  */
 addr_t drakvuf_exportsym_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr,
     addr_t module_base, const char* sym) NOEXCEPT;
+
+bool drakvuf_exportsyms_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base,
+    const char* const* syms, size_t count, addr_t* vas) NOEXCEPT;
+
+size_t drakvuf_get_module_build_id(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base,
+    uint8_t* id, size_t size) NOEXCEPT;
 
 addr_t drakvuf_get_auxv_value(drakvuf_t drakvuf, addr_t process_addr, uint64_t type) NOEXCEPT;
 

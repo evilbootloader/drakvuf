@@ -153,7 +153,7 @@ std::string StringPrinterInterface::print(drakvuf_t drakvuf, drakvuf_trap_info* 
 
 std::string AsciiPrinter::getBuffer(drakvuf_t drakvuf, const access_context_t* ctx) const
 {
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     char* str = vmi_read_str(vmi, ctx);
     std::string ret = str ? str : "";
     g_free(str);
@@ -162,7 +162,7 @@ std::string AsciiPrinter::getBuffer(drakvuf_t drakvuf, const access_context_t* c
 
 std::string WideStringPrinter::getBuffer(drakvuf_t drakvuf, const access_context_t* ctx) const
 {
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     auto str_obj = drakvuf_read_wchar_string(drakvuf, ctx);
     std::string ret = str_obj == NULL ? "" : (char*)str_obj->contents;
     if (str_obj)
@@ -172,7 +172,7 @@ std::string WideStringPrinter::getBuffer(drakvuf_t drakvuf, const access_context
 
 std::string Binary16StringPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
 {
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB,
         .dtb = info->regs->cr3,
@@ -220,7 +220,7 @@ std::string UlongPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint
         .dtb = info->regs->cr3,
         .addr = argument
     );
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     uint32_t value;
     if (vmi_read_32(vmi, &ctx, &value) != VMI_SUCCESS)
         value = 0;
@@ -234,7 +234,7 @@ std::string UlongLongPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, 
         .dtb = info->regs->cr3,
         .addr = argument
     );
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     uint64_t value;
     if (vmi_read_64(vmi, &ctx, &value) != VMI_SUCCESS)
         value = 0;
@@ -273,7 +273,7 @@ std::string GuidPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint6
         uint8_t Data4[8];
     } __attribute__((packed, aligned(4))) guid;
 
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     if (vmi_read(vmi, &ctx, sizeof(guid), &guid, nullptr) != VMI_SUCCESS)
         memset(&guid, 0, sizeof(guid));
 

@@ -149,9 +149,9 @@ bool drakvuf_get_current_irql(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint
 
     if ( drakvuf->osi.get_current_irql )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_irql(drakvuf, info, irql);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
     return ret;
 }
@@ -162,9 +162,9 @@ addr_t drakvuf_get_current_thread(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
     if ( drakvuf->osi.get_current_thread )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_thread(drakvuf, info);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
     return ret;
 }
@@ -175,9 +175,9 @@ addr_t drakvuf_get_current_thread_teb(drakvuf_t drakvuf, drakvuf_trap_info_t* in
 
     if ( drakvuf->osi.get_current_thread_teb )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_thread_teb(drakvuf, info);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -189,9 +189,9 @@ addr_t drakvuf_get_current_thread_stackbase(drakvuf_t drakvuf, drakvuf_trap_info
 
     if ( drakvuf->osi.get_current_thread_stackbase )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_thread_stackbase(drakvuf, info);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -203,9 +203,9 @@ bool drakvuf_get_last_error(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint32
 
     if ( drakvuf->osi.get_last_error )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_last_error(drakvuf, info, err, err_str);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -217,9 +217,9 @@ addr_t drakvuf_export_lib_address(drakvuf_t drakvuf, addr_t process_addr, const 
 
     if (drakvuf->osi.export_lib_address)
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.export_lib_address(drakvuf, process_addr, lib);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -231,9 +231,9 @@ addr_t drakvuf_get_current_process(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
     if ( drakvuf->osi.get_current_process )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_process(drakvuf, info);
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -245,9 +245,9 @@ addr_t drakvuf_get_current_attached_process(drakvuf_t drakvuf, drakvuf_trap_info
 
     if ( drakvuf->osi.get_current_attached_process )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_attached_process(drakvuf, info);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -259,9 +259,9 @@ char* drakvuf_get_process_name(drakvuf_t drakvuf, addr_t process_base, bool full
 
     if ( drakvuf->osi.get_process_name )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_name(drakvuf, process_base, fullpath);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -273,9 +273,9 @@ char* drakvuf_get_process_commandline(drakvuf_t drakvuf, drakvuf_trap_info_t* in
 
     if ( drakvuf->osi.get_process_commandline )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_commandline(drakvuf, info, eprocess_base);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -287,9 +287,9 @@ bool drakvuf_get_process_pid(drakvuf_t drakvuf, addr_t process_base, vmi_pid_t* 
 
     if ( drakvuf->osi.get_process_pid )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_pid(drakvuf, process_base, pid);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -375,9 +375,9 @@ bool drakvuf_get_process_thread_id(drakvuf_t drakvuf, addr_t process_base, uint3
 
     if ( drakvuf->osi.get_process_tid )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_tid(drakvuf, process_base, tid);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -389,9 +389,9 @@ bool drakvuf_get_process_group_id(drakvuf_t drakvuf, addr_t process_base, uint32
 
     if ( drakvuf->osi.get_process_pgid )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_pgid(drakvuf, process_base, pgid);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -403,9 +403,9 @@ char* drakvuf_get_current_process_name(drakvuf_t drakvuf, drakvuf_trap_info_t* i
 
     if ( drakvuf->osi.get_current_process_name )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_process_name(drakvuf, info, fullpath);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -417,9 +417,9 @@ int64_t drakvuf_get_process_userid(drakvuf_t drakvuf, addr_t process_base)
 
     if ( drakvuf->osi.get_process_userid )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_userid(drakvuf, process_base);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -431,9 +431,9 @@ unicode_string_t* drakvuf_get_process_csdversion(drakvuf_t drakvuf, addr_t proce
 
     if ( drakvuf->osi.get_process_csdversion )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_csdversion(drakvuf, process_base);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -445,9 +445,9 @@ int64_t drakvuf_get_current_process_userid(drakvuf_t drakvuf, drakvuf_trap_info_
 
     if ( drakvuf->osi.get_current_process_userid )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_process_userid(drakvuf, info);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -459,9 +459,9 @@ bool drakvuf_get_process_dtb(drakvuf_t drakvuf, addr_t process_base, addr_t* dtb
 
     if ( drakvuf->osi.get_process_dtb )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_dtb(drakvuf, process_base, dtb);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -473,9 +473,9 @@ bool drakvuf_get_process_arguments(drakvuf_t drakvuf, addr_t process_base, addr_
 
     if ( drakvuf->osi.get_process_arguments )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_arguments(drakvuf, process_base, argv);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -487,9 +487,9 @@ bool drakvuf_get_current_process_environ(drakvuf_t drakvuf, drakvuf_trap_info_t*
 
     if ( drakvuf->osi.get_current_process_environ )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_process_environ(drakvuf, info, environ);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -500,9 +500,9 @@ bool drakvuf_get_current_thread_id( drakvuf_t drakvuf, drakvuf_trap_info_t* info
     bool ret = false;
     if ( drakvuf->osi.get_current_thread_id )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_thread_id(drakvuf, info, thread_id);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -515,9 +515,9 @@ bool drakvuf_get_thread_previous_mode( drakvuf_t drakvuf, addr_t kthread, privil
 
     if ( drakvuf->osi.get_thread_previous_mode )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_thread_previous_mode(drakvuf, kthread, previous_mode);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -531,9 +531,9 @@ bool drakvuf_get_current_thread_previous_mode( drakvuf_t drakvuf,
 
     if ( drakvuf->osi.get_current_thread_previous_mode )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_current_thread_previous_mode(drakvuf, info, previous_mode);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -545,9 +545,9 @@ bool drakvuf_is_thread( drakvuf_t drakvuf, addr_t dtb, addr_t thread_addr )
 
     if ( drakvuf->osi.is_thread )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.is_thread(drakvuf, dtb, thread_addr);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -559,9 +559,9 @@ bool drakvuf_is_process( drakvuf_t drakvuf, addr_t dtb, addr_t process_addr )
 
     if ( drakvuf->osi.is_process )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.is_process(drakvuf, dtb, process_addr);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -573,9 +573,9 @@ bool drakvuf_is_process_suspended(drakvuf_t drakvuf, addr_t process, bool* statu
 
     if ( drakvuf->osi.is_process_suspended )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.is_process_suspended(drakvuf, process, status);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -587,9 +587,9 @@ GHashTable* drakvuf_enum_threads(drakvuf_t drakvuf, addr_t process)
 
     if ( drakvuf->osi.enum_threads )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.enum_threads(drakvuf, process);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -613,9 +613,9 @@ bool drakvuf_get_module_list(drakvuf_t drakvuf, addr_t process_base, addr_t* mod
 
     if ( drakvuf->osi.get_module_list )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_module_list(drakvuf, process_base, module_list);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -627,9 +627,9 @@ bool drakvuf_get_module_list_wow( drakvuf_t drakvuf, access_context_t* ctx, addr
 
     if ( drakvuf->osi.get_module_list_wow )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_module_list_wow(drakvuf, ctx, wow_peb, module_list);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -641,9 +641,9 @@ bool drakvuf_find_process(drakvuf_t drakvuf, vmi_pid_t find_pid, const char* fin
 
     if ( drakvuf->osi.find_process )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.find_process(drakvuf, find_pid, find_procname, process_addr);
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -655,6 +655,7 @@ bool inject_traps_modules(drakvuf_t drakvuf, drakvuf_trap_t* trap, addr_t list_h
 
     if ( drakvuf->osi.inject_traps_modules )
     {
+        // Adds traps
         drakvuf_lock_and_get_vmi(drakvuf);
         ret = drakvuf->osi.inject_traps_modules(drakvuf, trap, list_head, pid);
         drakvuf_release_vmi(drakvuf);
@@ -669,9 +670,9 @@ bool drakvuf_get_module_base_addr(drakvuf_t drakvuf, addr_t module_list_head, co
 
     if ( drakvuf->osi.get_module_base_addr )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_module_base_addr(drakvuf, module_list_head, module_name, base_addr_out);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -683,9 +684,9 @@ bool drakvuf_get_module_base_addr_ctx(drakvuf_t drakvuf, addr_t module_list_head
 
     if ( drakvuf->osi.get_module_base_addr_ctx )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_module_base_addr_ctx(drakvuf, module_list_head, ctx, module_name, base_addr_out);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -698,9 +699,9 @@ addr_t drakvuf_exportksym_to_va(drakvuf_t drakvuf, const vmi_pid_t pid, const ch
 
     if ( drakvuf->osi.exportksym_to_va )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.exportksym_to_va(drakvuf, pid, proc_name, mod_name, rva);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -712,9 +713,9 @@ addr_t drakvuf_kernel_symbol_to_va(drakvuf_t drakvuf, const char* func)
 
     if ( drakvuf->osi.kernel_symbol_to_va )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.kernel_symbol_to_va(drakvuf, func);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -727,9 +728,9 @@ addr_t drakvuf_exportsym_to_va(drakvuf_t drakvuf, addr_t process_addr,
 
     if ( drakvuf->osi.exportsym_to_va )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.exportsym_to_va(drakvuf, process_addr, module, sym);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -742,9 +743,9 @@ addr_t drakvuf_exportsym_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr,
 
     if ( drakvuf->osi.exportsym_to_va_at_base )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.exportsym_to_va_at_base(drakvuf, process_addr, module_base, sym);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -756,9 +757,38 @@ addr_t drakvuf_get_auxv_value(drakvuf_t drakvuf, addr_t process_addr, uint64_t t
 
     if ( drakvuf->osi.get_auxv_value )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_auxv_value(drakvuf, process_addr, type);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
+    }
+
+    return ret;
+}
+
+bool drakvuf_exportsyms_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base,
+    const char* const* syms, size_t count, addr_t* vas)
+{
+    bool ret = false;
+
+    if ( drakvuf->osi.exportsyms_to_va_at_base )
+    {
+        drakvuf_reader_lock(drakvuf);
+        ret = drakvuf->osi.exportsyms_to_va_at_base(drakvuf, process_addr, module_base, syms, count, vas);
+        drakvuf_reader_unlock(drakvuf);
+    }
+
+    return ret;
+}
+
+size_t drakvuf_get_module_build_id(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base, uint8_t* id, size_t size)
+{
+    size_t ret = 0;
+
+    if ( drakvuf->osi.module_build_id )
+    {
+        drakvuf_reader_lock(drakvuf);
+        ret = drakvuf->osi.module_build_id(drakvuf, process_addr, module_base, id, size);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -770,9 +800,9 @@ addr_t drakvuf_get_module_span(drakvuf_t drakvuf, addr_t process_addr, addr_t mo
 
     if ( drakvuf->osi.module_span )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.module_span(drakvuf, process_addr, module_base);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -784,8 +814,9 @@ bool drakvuf_get_process_ppid(drakvuf_t drakvuf, addr_t process_base, vmi_pid_t*
 
     if ( drakvuf->osi.get_process_ppid )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_ppid( drakvuf, process_base, ppid );
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -797,8 +828,9 @@ bool drakvuf_get_process_data_priv(drakvuf_t drakvuf, addr_t process_base, proc_
 
     if ( drakvuf->osi.get_process_data )
     {
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_process_data( drakvuf, process_base, proc_data );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -810,9 +842,9 @@ char* drakvuf_reg_keyhandle_path(drakvuf_t drakvuf, drakvuf_trap_info_t* info, u
 
     if ( drakvuf->osi.get_registry_keyhandle_path )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_registry_keyhandle_path( drakvuf, info, key_handle );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -824,9 +856,9 @@ char* drakvuf_get_filename_from_handle(drakvuf_t drakvuf, drakvuf_trap_info_t* i
 
     if ( drakvuf->osi.get_filename_from_handle )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_filename_from_handle( drakvuf, info, handle );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -838,9 +870,9 @@ char* drakvuf_get_filename_from_object_attributes(drakvuf_t drakvuf, drakvuf_tra
 
     if ( drakvuf->osi.get_filename_from_object_attributes )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_filename_from_object_attributes( drakvuf, info, attrs );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -852,9 +884,9 @@ char* drakvuf_get_filepath_from_dentry(drakvuf_t drakvuf, addr_t dentry_addr)
 
     if (drakvuf->osi.get_filepath_from_dentry)
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_filepath_from_dentry(drakvuf, dentry_addr);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -866,9 +898,9 @@ bool drakvuf_is_wow64(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
     if (drakvuf->osi.is_wow64)
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.is_wow64(drakvuf, info);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -880,9 +912,9 @@ addr_t drakvuf_get_function_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* inf
 
     if ( drakvuf->osi.get_function_argument )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_function_argument( drakvuf, info, narg );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -894,9 +926,9 @@ addr_t drakvuf_get_function_argument_ex(drakvuf_t drakvuf, drakvuf_trap_info_t* 
 
     if ( drakvuf->osi.get_function_argument_ex )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_function_argument_ex( drakvuf, info, narg, conv );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -908,9 +940,9 @@ addr_t drakvuf_get_function_return_address(drakvuf_t drakvuf, drakvuf_trap_info_
 
     if ( drakvuf->osi.get_function_return_address )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_function_return_address( drakvuf, info );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -922,9 +954,9 @@ bool drakvuf_enumerate_processes(drakvuf_t drakvuf, void (*visitor_func)(drakvuf
 
     if ( drakvuf->osi.enumerate_processes )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.enumerate_processes(drakvuf, visitor_func, visitor_ctx);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -936,9 +968,9 @@ bool drakvuf_enumerate_processes_with_module(drakvuf_t drakvuf, const char* modu
 
     if ( drakvuf->osi.enumerate_processes_with_module )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.enumerate_processes_with_module( drakvuf, module_name, visitor_func, visitor_ctx );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -950,9 +982,9 @@ bool drakvuf_enumerate_drivers(drakvuf_t drakvuf, bool (*visitor_func)(drakvuf_t
 
     if ( drakvuf->osi.enumerate_drivers )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.enumerate_drivers(drakvuf, visitor_func, visitor_ctx);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -964,9 +996,9 @@ bool drakvuf_enumerate_process_modules(drakvuf_t drakvuf, addr_t eprocess, bool 
 
     if ( drakvuf->osi.enumerate_process_modules )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.enumerate_process_modules( drakvuf, eprocess, visitor_func, visitor_ctx );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -978,9 +1010,9 @@ bool drakvuf_enumerate_object_directory(drakvuf_t drakvuf, void (*visitor_func)(
 
     if (drakvuf->osi.enumerate_object_directory)
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.enumerate_object_directory(drakvuf, visitor_func, visitor_ctx);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -993,9 +1025,9 @@ bool drakvuf_is_crashreporter(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_
 
     if ( drakvuf->osi.is_crashreporter )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.is_crashreporter( drakvuf, info, pid );
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1007,9 +1039,9 @@ bool drakvuf_find_mmvad(drakvuf_t drakvuf, addr_t eprocess, addr_t vaddr, mmvad_
 
     if ( drakvuf->osi.find_mmvad )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.find_mmvad(drakvuf, eprocess, vaddr, out_mmvad);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1021,9 +1053,9 @@ bool drakvuf_traverse_mmvad(drakvuf_t drakvuf, addr_t eprocess, mmvad_callback c
 
     if ( drakvuf->osi.traverse_mmvad )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.traverse_mmvad(drakvuf, eprocess, callback, callback_data);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1035,9 +1067,9 @@ bool drakvuf_is_mmvad_commited(drakvuf_t drakvuf, mmvad_info_t* mmvad)
 
     if ( drakvuf->osi.is_mmvad_commited )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.is_mmvad_commited(drakvuf, mmvad);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1049,9 +1081,9 @@ uint32_t drakvuf_mmvad_type(drakvuf_t drakvuf, mmvad_info_t* mmvad)
 
     if ( drakvuf->osi.mmvad_type )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.mmvad_type(drakvuf, mmvad);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1063,9 +1095,9 @@ uint64_t drakvuf_mmvad_commit_charge(drakvuf_t drakvuf, mmvad_info_t* mmvad, uin
 
     if ( drakvuf->osi.mmvad_commit_charge )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.mmvad_commit_charge(drakvuf, mmvad, width);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1077,9 +1109,9 @@ bool drakvuf_mmvad_private_memory(drakvuf_t drakvuf, mmvad_info_t* mmvad)
 
     if ( drakvuf->osi.mmvad_private_memory )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.mmvad_private_memory(drakvuf, mmvad);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1091,9 +1123,9 @@ uint64_t drakvuf_mmvad_protection(drakvuf_t drakvuf, mmvad_info_t* mmvad)
 
     if ( drakvuf->osi.mmvad_protection )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.mmvad_protection(drakvuf, mmvad);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1105,9 +1137,9 @@ bool drakvuf_get_pid_from_handle(drakvuf_t drakvuf, drakvuf_trap_info_t* info, a
 
     if ( drakvuf->osi.get_pid_from_handle )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_pid_from_handle(drakvuf, info, handle, pid);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1119,9 +1151,9 @@ bool drakvuf_get_tid_from_handle(drakvuf_t drakvuf, drakvuf_trap_info_t* info, a
 
     if ( drakvuf->osi.get_tid_from_handle )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_tid_from_handle(drakvuf, info, handle, tid);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1133,9 +1165,9 @@ bool drakvuf_get_wow_context(drakvuf_t drakvuf, addr_t ethread, addr_t* wow_ctx)
 
     if ( drakvuf->osi.get_wow_context )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_wow_context(drakvuf, ethread, wow_ctx);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1147,9 +1179,9 @@ bool drakvuf_get_user_stack32(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr
 
     if ( drakvuf->osi.get_user_stack32 )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_user_stack32(drakvuf, info, stack_ptr, frame_ptr);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1161,9 +1193,9 @@ bool drakvuf_get_user_stack64(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr
 
     if ( drakvuf->osi.get_user_stack64 )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_user_stack64(drakvuf, info, stack_ptr);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1175,9 +1207,9 @@ addr_t drakvuf_get_wow_peb(drakvuf_t drakvuf, access_context_t* ctx, addr_t epro
 
     if ( drakvuf->osi.get_wow_peb )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_wow_peb(drakvuf, ctx, eprocess);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1187,9 +1219,9 @@ void drakvuf_set_return_context(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vm
 {
     if ( drakvuf->osi.set_return_context )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         drakvuf->osi.set_return_context(drakvuf, info, pid, tid, rsp);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 }
 
@@ -1199,9 +1231,9 @@ bool drakvuf_check_return_context(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
 
     if ( drakvuf->osi.check_return_context )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.check_return_context(info, pid, tid, rsp);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1213,9 +1245,9 @@ addr_t drakvuf_get_rspbase(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
     if (drakvuf->osi.get_rspbase)
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_rspbase(drakvuf, info);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1227,9 +1259,9 @@ bool drakvuf_get_kernel_symbol_rva(drakvuf_t drakvuf, const char* function, addr
 
     if (drakvuf->osi.get_kernel_symbol_rva)
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_kernel_symbol_rva(drakvuf, function, rva);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1241,9 +1273,9 @@ bool drakvuf_get_kernel_symbol_va(drakvuf_t drakvuf, const char* function, addr_
 
     if (drakvuf->osi.get_kernel_symbol_rva)
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_kernel_symbol_va(drakvuf, function, rva);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1255,6 +1287,7 @@ const kernel_version_t* drakvuf_get_kernel_version(drakvuf_t drakvuf, drakvuf_tr
 
     if (drakvuf->osi.get_kernel_version)
     {
+        // Fills a cache in drakvuf_t on first use
         drakvuf_lock_and_get_vmi(drakvuf);
         ret = drakvuf->osi.get_kernel_version(drakvuf, info);
         drakvuf_release_vmi(drakvuf);
@@ -1269,9 +1302,9 @@ unicode_string_t* drakvuf_get_object_name(drakvuf_t drakvuf, addr_t object)
 
     if (drakvuf->osi.get_object_name)
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_object_name(drakvuf, object);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1283,9 +1316,9 @@ unicode_string_t* drakvuf_get_object_type_name(drakvuf_t drakvuf, addr_t object)
 
     if (drakvuf->osi.get_object_type_name)
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_object_type_name(drakvuf, object);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1298,9 +1331,9 @@ bool drakvuf_get_user_rsp(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* 
 
     if ( drakvuf->osi.get_user_rsp )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_user_rsp(drakvuf, info, user_rsp);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;
@@ -1312,9 +1345,9 @@ addr_t drakvuf_get_syscall_retaddr(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
 
     if ( drakvuf->osi.get_syscall_retaddr )
     {
-        drakvuf_lock_and_get_vmi(drakvuf);
+        drakvuf_reader_lock(drakvuf);
         ret = drakvuf->osi.get_syscall_retaddr(drakvuf, info, mode);
-        drakvuf_release_vmi(drakvuf);
+        drakvuf_reader_unlock(drakvuf);
     }
 
     return ret;

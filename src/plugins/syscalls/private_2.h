@@ -105,11 +105,16 @@
 #ifndef SYSCALLS_PRIVATE_2_H
 #define SYSCALLS_PRIVATE_2_H
 
+#include <mutex>
+#include <optional>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "plugins/plugin_utils.h"
 #include "plugins/plugins_ex.h"
 #include "plugins/output_format.h"
+#include "plugins/helpers/return_tracker.h"
 
 #include "private.h"
 
@@ -118,6 +123,17 @@ struct syscalls_config
     const char* syscalls_filter_file;
     const char* win32k_profile;
     bool disable_sysret;
+    const char* sysret_mode;
+};
+
+// How syscall returns are caught, see --sysret-mode
+enum class sysret_mode_t
+{
+    // A breakpoint at the return address of each syscall, removed when it returns
+    PER_CALL,
+    // Every syscall is caught where it returns to its caller in the kernel. The return
+    // breakpoints stay in place, the calls in progress are kept per thread.
+    KERNEL,
 };
 
 // internal syscalls class
@@ -129,11 +145,12 @@ public:
     addr_t register_size;
     bool is32bit;
     bool disable_sysret;
+    sysret_mode_t sysret_mode;
 
     std::unordered_set<std::string> filter;
-    std::vector<std::pair<char const*, fmt::Aarg>> fmt_args;
 
-    void print_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int nr, const char* extra_info = nullptr);
+    // `ret` is the syscall's result, which is not always in rax where the hooked function returns
+    void print_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int nr, uint64_t ret, const char* extra_info = nullptr);
     std::string parse_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::arg_t& arg, addr_t val);
     uint64_t mask_value(const syscalls_ns::arg_t& arg, uint64_t val);
     uint64_t transform_value(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::arg_t& arg, uint64_t val);
@@ -143,6 +160,31 @@ public:
     {
         return NULL;
     }
+
+    /*
+     * Sysret mode kernel: every syscall is caught where the hooked function
+     * returns to its caller in the kernel, through a return breakpoint that
+     * stays in place, see return_tracker.
+     */
+    struct pending_syscall
+    {
+        uint16_t num;
+        const char* module;
+        const char* name;
+        // Where the result is when the hooked function returns, if not in rax:
+        // pt_regs->ax for the Linux dispatchers, which return void
+        addr_t result_va;
+    };
+    return_tracker<pending_syscall> sysret_tracker;
+
+    bool track_syscall_return(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t ret_addr,
+        uint16_t num, const char* module, const char* name, addr_t result_va = 0);
+    // Drops the calls of a process' threads that never returned
+    void forget_process_syscalls(vmi_pid_t pid);
+    void kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call);
+
+    // Prints the sysret of a call caught in sysret mode kernel, info->trap carries its name and module
+    virtual void print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call) = 0;
 
     syscalls_base(drakvuf_t drakvuf, const syscalls_config* config, output_format_t output);
     syscalls_base(const syscalls_base&) = delete;

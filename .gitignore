@@ -61,6 +61,9 @@ src/librepl/libdrakvuf.py
 build/*
 clang_output*
 build-meson/
+build-release/
+samples/
+.vscode/
 
 .devcontainer
 

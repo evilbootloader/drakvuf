@@ -276,8 +276,56 @@ struct drakvuf
     bool vmi_response_set_registers[MAX_DRAKVUF_VCPU];
     x86_registers_t regs_modified[MAX_DRAKVUF_VCPU];
     GHashTable* injections_in_progress; // key: <pid:tid>
+    gint injections_count; // entries in injections_in_progress, read without the VMI lock
     bool enable_active_callback_check;
+
+    /*
+     * Parallel event processing: LibVMI runs the events of each vCPU on its
+     * own thread. Breakpoint callbacks of mt_safe traps run concurrently,
+     * all other callbacks hold serial_cb_lock. Lock order is serial_cb_lock,
+     * then vmi_lock. Traps removed meanwhile are freed by the thread running
+     * drakvuf_loop once vmi_events_listen returned and no callback runs.
+     */
+    bool parallel_events;
+    gint listening; // vmi_events_listen is running, callbacks may run on other threads
+    GMutex serial_cb_lock;
+    // Per vCPU LibVMI instance used to read guest memory on its event thread
+    vmi_instance_t reader_vmi[MAX_DRAKVUF_VCPU];
+    unsigned long reader_flush_counter[MAX_DRAKVUF_VCPU];
 };
+
+/*
+ * Reader instance of the vCPU whose event the current thread processes, NULL
+ * outside of parallel event callbacks.
+ */
+extern __thread vmi_instance_t drakvuf_tls_reader;
+
+/*
+ * Instance to read guest memory with. Use drakvuf->vmi for everything that
+ * changes state: writes, events, SLAT views, registers, pausing.
+ */
+static inline vmi_instance_t drakvuf_vmi(drakvuf_t drakvuf)
+{
+    return drakvuf_tls_reader ? drakvuf_tls_reader : drakvuf->vmi;
+}
+
+/*
+ * Guard for functions that only read guest memory through drakvuf_vmi and
+ * only read the drakvuf state that is set up at init. A reader instance is
+ * private to its thread, so no lock is needed while one is in use.
+ */
+static inline vmi_instance_t drakvuf_reader_lock(drakvuf_t drakvuf)
+{
+    if (drakvuf_tls_reader)
+        return drakvuf_tls_reader;
+    return drakvuf_lock_and_get_vmi(drakvuf);
+}
+
+static inline void drakvuf_reader_unlock(drakvuf_t drakvuf)
+{
+    if (!drakvuf_tls_reader)
+        drakvuf_release_vmi(drakvuf);
+}
 
 struct breakpoint
 {

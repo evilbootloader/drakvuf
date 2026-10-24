@@ -105,11 +105,35 @@
 #ifndef UNIXSOCKETMON_H
 #define UNIXSOCKETMON_H
 
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+
 #include "plugins/plugins_ex.h"
+#include "plugins/output_format.h"
 
 struct unixsocketmon_config
 {
     uint64_t print_max_size;
+};
+
+// The two ends of a socket, as far as the kernel's structures say
+struct socket_endpoints
+{
+    std::string protocol;           // TCP, UDP or the protocol number; empty for Unix sockets
+    std::string local_ip;
+    std::string remote_ip;
+    int local_port = -1;
+    int remote_port = -1;
+    std::string local_path;         // Unix sockets: "" when unnamed, "@name" when abstract
+    std::string remote_path;
+    bool inet = false;
+    bool unix_socket = false;
+    int connected = -1;             // -1 unknown, else whether the socket has a peer
+
+    using value_t = std::variant<fmt::Nval<int>, fmt::Estr<std::string>>;
+    std::vector<std::pair<std::string, value_t>> keyvals() const;
 };
 
 class unixsocketmon: public pluginex
@@ -119,16 +143,51 @@ public:
     addr_t socket_ops;
     addr_t proto_ops_family;
     addr_t msghdr_msg_iter;
-    addr_t iov_iter_iov;
+    addr_t iov_iter_iov;            // the iovec array, or the buffer itself for ITER_UBUF
     addr_t iovec_iov_base;
     addr_t iovec_iov_len;
+    addr_t iov_iter_type = 0;
+    addr_t iov_iter_count = 0;      // the whole request, every segment
+    addr_t iov_iter_nr_segs = 0;
+    size_t iovec_size = 16;
+    // enum iter_type from the profile, -1 when this kernel has no such type
+    int64_t iter_iovec = -1;
+    int64_t iter_kvec = -1;
+    int64_t iter_ubuf = -1;
+    bool have_message = false;
+
+    // For the endpoints; a flag is false when the profile lacks a member, and those are not printed
+    bool have_inet = false;
+    bool have_unix = false;
+    bool have_msg_name = false;
+    addr_t socket_sk = 0;
+    addr_t sock_protocol = 0;
+    addr_t skc_v6_daddr = 0;
+    addr_t skc_v6_rcv_saddr = 0;
+    addr_t unix_sock_addr = 0;
+    addr_t unix_sock_peer = 0;
+    addr_t unix_address_len = 0;
+    addr_t unix_address_name = 0;
+    addr_t msghdr_msg_name = 0;
+    addr_t msghdr_msg_namelen = 0;
 
     std::unique_ptr<libhook::SyscallHook> sockethook;
+    std::unique_ptr<libhook::SyscallHook> connecthook;
 
     unixsocketmon(drakvuf_t drakvuf, const unixsocketmon_config* config, output_format_t output);
     event_response_t sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t connect_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
     std::vector<uint8_t> get_socket_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t* size);
     bool get_socket_family_type(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint32_t* family_type);
+    bool find_iov_iter_layout(drakvuf_t drakvuf);
+    void find_endpoint_layout(drakvuf_t drakvuf);
+
+    // Both ends of a socket from its struct sock, and the protocol
+    socket_endpoints read_endpoints(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t socket, uint32_t family);
+    // A struct sockaddr, as the remote end
+    void read_sockaddr(vmi_instance_t vmi, access_context_t* ctx, addr_t addr, uint32_t len, socket_endpoints& ep);
+    // The path a Unix socket is bound to
+    std::string read_unix_path(vmi_instance_t vmi, access_context_t* ctx, addr_t unix_sock);
 };
 
 #endif
