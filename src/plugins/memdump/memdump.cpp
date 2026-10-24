@@ -115,7 +115,7 @@
 
 #define DUMP_NAME_PLACEHOLDER "(not configured)"
 
-static void save_file_metadata(const drakvuf_trap_info_t* info,
+static void save_file_metadata(const proc_data_t* proc,
     const char* file_path,
     const char* data_file_name,
     size_t dump_size,
@@ -139,9 +139,9 @@ static void save_file_metadata(const drakvuf_trap_info_t* info,
     json_object_object_add(jobj, "DumpReason", json_object_new_string(dump_reason ? dump_reason : ""));
     json_object_object_add(jobj, "DumpAddress", json_object_new_string_fmt("0x%" PRIx64, dump_address));
     json_object_object_add(jobj, "DumpSize", json_object_new_string_fmt("0x%" PRIx64, dump_size));
-    json_object_object_add(jobj, "PID", json_object_new_int(info->attached_proc_data.pid));
-    json_object_object_add(jobj, "PPID", json_object_new_int(info->attached_proc_data.ppid));
-    json_object_object_add(jobj, "ProcessName", json_object_new_string(info->attached_proc_data.name ? info->attached_proc_data.name : ""));
+    json_object_object_add(jobj, "PID", json_object_new_int(proc->pid));
+    json_object_object_add(jobj, "PPID", json_object_new_int(proc->ppid));
+    json_object_object_add(jobj, "ProcessName", json_object_new_string(proc->name ? proc->name : ""));
 
     if (extras && extras->type == WriteVirtualMemoryExtras)
     {
@@ -194,6 +194,11 @@ bool dump_memory_region(
     std::optional<fmt::Xval<decltype(extras->write_virtual_memory_extras.base_address)>> write_addr;
 
     int sequence_number = ++plugin->dumps_count;
+
+    // The process the memory belongs to: on Windows the one the thread is
+    // attached to, on Linux the thread's own, as there is no attached process
+    const proc_data_t* proc = drakvuf_get_os_type(drakvuf) == VMI_OS_WINDOWS ?
+        &info->attached_proc_data : &info->proc_data;
 
     if (!plugin->memdump_dir)
     {
@@ -273,7 +278,7 @@ bool dump_memory_region(
     if (asprintf(&metafile, "%s/memdump.%06d", plugin->memdump_dir, sequence_number) < 0)
         goto done;
 
-    save_file_metadata(info, metafile, file, len_bytes, dump_addr, info->trap->name, reason, sequence_number, extras);
+    save_file_metadata(proc, metafile, file, len_bytes, dump_addr, info->trap->name, reason, sequence_number, extras);
 
     ret = true;
 
@@ -281,7 +286,7 @@ printout:
     {
         auto default_print = std::make_tuple(
                 keyval("DumpReason", fmt::Qstr(reason)),
-                keyval("DumpPID", fmt::Nval(info->attached_proc_data.pid)),
+                keyval("DumpPID", fmt::Nval(proc->pid)),
                 keyval("DumpAddr", fmt::Xval(dump_addr, false)),
                 keyval("DumpSize", fmt::Xval(len_bytes)),
                 keyval("DumpFilename", fmt::Qstr(display_file)),
