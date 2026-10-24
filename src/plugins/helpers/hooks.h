@@ -144,7 +144,10 @@ Plugin* GetTrapPlugin(const drakvuf_trap_info_t* info)
 
 inline std::pair<uint64_t, addr_t> make_hook_id(const drakvuf_trap_info_t* info, addr_t target_rsp)
 {
-    uint64_t u64_pid = info->attached_proc_data.pid;
-    uint64_t u64_tid = info->attached_proc_data.tid;
+    // Linux has no attached process: attached_proc_data is left empty, TID
+    // included, and the thread is only in proc_data. Windows always fills it
+    const proc_data_t& proc = info->attached_proc_data.tid ? info->attached_proc_data : info->proc_data;
+    uint64_t u64_pid = proc.pid;
+    uint64_t u64_tid = proc.tid;
     return std::make_pair((u64_pid << 32) | u64_tid, target_rsp);
 }
