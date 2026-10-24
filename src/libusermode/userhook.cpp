@@ -469,7 +469,8 @@ static void share_image(drakvuf_t drakvuf, userhook* plugin, dll_t* dll_meta)
             if (target.state != HOOK_OK)
                 continue;
 
-            auto hook = std::make_unique<userhook::shared_hook>(userhook::shared_hook{ key, i, target.trap, target.offset });
+            auto hook = std::make_unique<userhook::shared_hook>(userhook::shared_hook{ key, i, target.trap, target.offset, target.target_name });
+            target.trap->name = hook->name.c_str();
             target.trap->cb = shared_hook_cb;
             target.trap->data = hook.get();
             target.trap->mt_safe = target.mt_safe;

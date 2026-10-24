@@ -269,6 +269,7 @@ public:
         size_t slot;                // the target's index in the dll_t of each process
         drakvuf_trap_t* trap;
         addr_t offset;
+        std::string name;           // the trap's: the process that hooked it first can go first
     };
 
     struct shared_image
