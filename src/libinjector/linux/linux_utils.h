@@ -188,6 +188,8 @@ struct linux_injector
     bool fork;
     bool execve;
     proc_data_t child_data;
+    // CR3 of the target when it calls vfork, without the PCID bits
+    addr_t child_dtb;
 
     // Results:
     injector_status_t rc;

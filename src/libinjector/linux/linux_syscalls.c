@@ -244,6 +244,8 @@ void setup_vfork_syscall(linux_injector_t injector, x86_registers_t* regs, char*
     // ( to be used in check_userspace_int3_trap )
     injector->child_data.name = proc_name;
     injector->child_data.ppid = parent_pid;
+    // the child shares the address space, only the PCID differs between vCPUs
+    injector->child_dtb = regs->cr3 & ~0xfffull;
 
     // this will loosen the checks in check_userspace_int3_trap
     // till we get the pid of the child in the next step
