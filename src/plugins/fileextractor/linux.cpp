@@ -441,7 +441,7 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
         uint64_t fd_val = 0;
         if (read_pt_regs_arg(drakvuf, pt_regs_addr, 0, &fd_val))
         {
-            auto key = std::make_pair(static_cast<uint64_t>(info->attached_proc_data.pid), (int)fd_val);
+            auto key = std::make_pair(static_cast<uint64_t>(info->proc_data.pid), (int)fd_val);
             std::lock_guard<std::mutex> lock(this->write_mtx);
             this->tracked_files.erase(key);
             this->ignored_fds.erase(key);
@@ -476,8 +476,9 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
     if (extract_size > 0 && count > extract_size)
         count = extract_size;
 
-    /* Get process info */
-    vmi_pid_t pid = info->attached_proc_data.pid;
+    /* Descriptors are per process. Not attached_proc_data, which only Windows
+     * fills in: it is empty here, and every process would share one table */
+    vmi_pid_t pid = info->proc_data.pid;
     auto file_key = std::make_pair(static_cast<uint64_t>(pid), fd);
 
     std::lock_guard<std::mutex> lock(this->write_mtx);
