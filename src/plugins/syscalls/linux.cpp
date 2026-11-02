@@ -170,8 +170,10 @@ std::vector<uint64_t> linux_syscalls::build_arguments_buffer(drakvuf_t drakvuf, 
 {
     std::vector<uint64_t> arguments;
 
-    // unknown syscall, so skip
-    if ((this->is32bit && nr > NUM_SYSCALLS_LINUX_X32) || (!this->is32bit && nr > NUM_SYSCALLS_LINUX_X64))
+    // unknown syscall, so skip. A 32-bit syscall of a 64-bit kernel has an i386 number, which goes higher.
+    bool ia32 = !this->is32bit && !strcmp(syscall_type, SYSCALL_TYPE_LINUX_X32);
+    if ((this->is32bit && nr > NUM_SYSCALLS_LINUX_X32) ||
+        (!this->is32bit && nr > (ia32 ? NUM_SYSCALLS_LINUX_IA32 : NUM_SYSCALLS_LINUX_X64)))
         return arguments;
 
     int nargs = sc->num_args;
@@ -220,20 +222,22 @@ std::vector<uint64_t> linux_syscalls::build_arguments_buffer(drakvuf_t drakvuf, 
             // The order of the arguments is different when processing x32 syscalls
             // https://elixir.bootlin.com/linux/v5.10.166/source/arch/x86/include/asm/syscall_wrapper.h#L24
             // Assume if it is not x32 syscall, then we will use the standard convention for x64
+            // The upper halves of the registers of a 32-bit process are not its own: the
+            // kernel's wrappers truncate them too, and a pointer would not be read otherwise.
             if ( !strcmp(syscall_type, SYSCALL_TYPE_LINUX_X32) )
             {
                 if ( nargs > 0 )
-                    arguments.push_back(pt_regs[PT_REGS_RBX]);
+                    arguments.push_back((uint32_t)pt_regs[PT_REGS_RBX]);
                 if ( nargs > 1 )
-                    arguments.push_back(pt_regs[PT_REGS_RCX]);
+                    arguments.push_back((uint32_t)pt_regs[PT_REGS_RCX]);
                 if ( nargs > 2 )
-                    arguments.push_back(pt_regs[PT_REGS_RDX]);
+                    arguments.push_back((uint32_t)pt_regs[PT_REGS_RDX]);
                 if ( nargs > 3 )
-                    arguments.push_back(pt_regs[PT_REGS_RSI]);
+                    arguments.push_back((uint32_t)pt_regs[PT_REGS_RSI]);
                 if ( nargs > 4 )
-                    arguments.push_back(pt_regs[PT_REGS_RDI]);
+                    arguments.push_back((uint32_t)pt_regs[PT_REGS_RDI]);
                 if ( nargs > 5 )
-                    arguments.push_back(pt_regs[PT_REGS_RBP]);
+                    arguments.push_back((uint32_t)pt_regs[PT_REGS_RBP]);
             }
             else
             {
@@ -330,13 +334,13 @@ event_response_t linux_syscalls::linux_ret_cb(drakvuf_t drakvuf, drakvuf_trap_in
     return VMI_EVENT_RESPONSE_NONE;
 }
 
-// Helper to look up syscall definition for dispatcher hooks (x64_sys_call/do_syscall_64)
+// Helper to look up syscall definition for dispatcher hooks (x64_sys_call/do_syscall_64, ia32_sys_call/do_int80_syscall_32)
 // Returns nullptr if the syscall should be skipped (invalid, no definition, or filtered)
 const syscall_t* linux_syscalls::lookup_syscall_for_dispatcher(drakvuf_trap_info_t* info, addr_t nr, const char** out_type, uint16_t* out_num)
 {
     bool is_32bit_syscall = (info->trap->name && strstr(info->trap->name, "32") != nullptr);
-    const syscall_t** syscall_table = is_32bit_syscall ? linuxsc::linux_syscalls_table_x32 : linuxsc::linux_syscalls_table_x64;
-    uint64_t num_syscalls = is_32bit_syscall ? NUM_SYSCALLS_LINUX_X32 : NUM_SYSCALLS_LINUX_X64;
+    const syscall_t** syscall_table = is_32bit_syscall ? linuxsc::linux_syscalls_table_ia32 : linuxsc::linux_syscalls_table_x64;
+    uint64_t num_syscalls = is_32bit_syscall ? NUM_SYSCALLS_LINUX_IA32 : NUM_SYSCALLS_LINUX_X64;
     *out_type = is_32bit_syscall ? SYSCALL_TYPE_LINUX_X32 : SYSCALL_TYPE_LINUX_X64;
 
     if (nr >= num_syscalls)
@@ -572,25 +576,47 @@ bool linux_syscalls::trap_syscall_table_entries(drakvuf_t drakvuf)
         }
     }
 
-    // For 32-bit compatibility, also try to hook do_int80_syscall_32
-    {
-        auto hook = createSyscallHook<linux_syscall_data>("do_int80_syscall_32", &linux_syscalls::linux_cb, "do_int80_syscall_32",
-                UNLIMITED_TTL, this->hooks_mt_safe());
-        if (hook)
-        {
-            auto params = libhook::GetTrapParams<linux_syscall_data>(hook->trap_);
-            params->num = 0;
-            params->type = SYSCALL_TYPE_LINUX_X32;
-            params->sc = nullptr;  // null sc triggers dynamic lookup
+    /*
+     * 32-bit syscalls. On a 64-bit kernel, int $0x80 and sysenter or syscall from
+     * 32-bit mode all dispatch through ia32_sys_call(regs, nr), the counterpart of
+     * x64_sys_call, which takes its arguments the same way. By then the number is
+     * final and all six arguments are in pt_regs: the sysenter path reads the sixth
+     * from the user stack first. Kernels before the 2024 branch history injection
+     * fix don't have it and call through ia32_sys_call_table; do_int80_syscall_32
+     * is the fallback there, and sees int $0x80 only. A kernel whose int $0x80
+     * goes to int80_emulation has no do_int80_syscall_32 at all, so its hook was
+     * never placed: the Ubuntu (5.15) and Android (6.6) guests' among them.
+     * A 32-bit kernel keeps the do_int80_syscall_32 hook it had.
+     */
+    std::vector<const char*> dispatchers32 = { "do_int80_syscall_32" };
+    if (!this->is32bit)
+        dispatchers32.insert(dispatchers32.begin(), "ia32_sys_call");
 
-            this->hooks[hook->trap_->breakpoint.addr] = std::move(hook);
-            PRINT_DEBUG("[SYSCALLS] Successfully registered do_int80_syscall_32 hook\n");
-        }
-        else
+    bool hooked32 = false;
+    for (const char* dispatcher : dispatchers32)
+    {
+        auto hook = createSyscallHook<linux_syscall_data>(dispatcher, &linux_syscalls::linux_cb, dispatcher,
+                UNLIMITED_TTL, this->hooks_mt_safe());
+        if (!hook)
         {
-            PRINT_DEBUG("[SYSCALLS] do_int80_syscall_32 not found (may not be needed)\n");
+            PRINT_DEBUG("[SYSCALLS] %s not found\n", dispatcher);
+            continue;
         }
+
+        auto params = libhook::GetTrapParams<linux_syscall_data>(hook->trap_);
+        params->num = 0;
+        params->type = SYSCALL_TYPE_LINUX_X32;
+        params->sc = nullptr;  // null sc triggers dynamic lookup
+
+        this->hooks[hook->trap_->breakpoint.addr] = std::move(hook);
+        PRINT_DEBUG("[SYSCALLS] Registered %s hook\n", dispatcher);
+        hooked32 = true;
+        break;
     }
+
+    // Only a debug message until now, which hid that no 32-bit syscall was traced
+    if (!hooked32)
+        fprintf(stderr, "[SYSCALLS] No 32-bit syscall dispatcher found, syscalls of 32-bit processes are not traced\n");
 
     return true;
 }
