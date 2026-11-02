@@ -107,7 +107,9 @@
 
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "private.h"
 #include "private_2.h"
@@ -131,6 +133,34 @@ public:
     std::unique_ptr<libhook::SyscallHook> create_process_hook;
     std::unique_ptr<libhook::SyscallHook> delete_process_hook;
     std::unique_ptr<libhook::ReturnHook> wait_process_creation_hook;
+
+    /*
+     * Dispatcher mode, on a 64-bit kernel: one breakpoint at KiSystemServiceCopyEnd instead of
+     * one per service table entry. Every syscall passes it once KiSystemServiceRepeat has looked
+     * its service routine up into r10: nt and win32k ones, from x64 and WoW64 processes, and Zw
+     * calls from the kernel. Returns are caught at KiSystemServiceExit.
+     */
+    struct dispatch_target
+    {
+        uint16_t num;
+        bool ntos;
+        const syscalls_ns::syscall_t* sc;
+        const char* name;
+    };
+    bool dispatcher = false;
+    addr_t dispatcher_exit = 0;         // KiSystemServiceExit
+    addr_t thread_syscall_number = 0;   // _KTHREAD.SystemCallNumber
+    addr_t thread_trap_frame = 0;       // _KTHREAD.TrapFrame
+    addr_t trap_frame_rsp = 0;          // _KTRAP_FRAME.Rsp
+    // Service routines by address. win32k's are added when its table is read, which may be after
+    // the breakpoint is placed. Stubs the linker folded into one routine share an address, whose
+    // entry lists all their numbers.
+    std::shared_mutex targets_mtx;
+    std::unordered_map<addr_t, std::vector<dispatch_target>> targets;
+    std::unique_ptr<libhook::SyscallHook> dispatcher_hook;
+
+    bool setup_dispatcher(drakvuf_t drakvuf, vmi_instance_t vmi);
+    event_response_t dispatcher_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
     bool setup_win32k_syscalls(drakvuf_t drakvuf);
 
