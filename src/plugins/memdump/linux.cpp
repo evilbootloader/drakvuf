@@ -106,6 +106,7 @@
 #include <assert.h>
 #include <libvmi/libvmi.h>
 #include <map>
+#include <mutex>
 #include <string>
 
 #include "plugins/plugins.h"
@@ -135,7 +136,7 @@ bool linux_memdump::get_pt_regs_and_nr(drakvuf_t drakvuf, drakvuf_trap_info_t* i
         }
 
         // Fallback: read orig_rax from pt_regs
-        auto vmi = vmi_lock_guard(drakvuf);
+        vmi_reader_guard vmi(drakvuf);
         return VMI_SUCCESS == vmi_read_addr_va(vmi, *pt_regs_addr + this->regs[PT_REGS_ORIG_RAX], 0, nr);
     }
 
@@ -156,7 +157,7 @@ bool linux_memdump::read_pt_regs_arg(drakvuf_t drakvuf, addr_t pt_regs_addr, int
     if (arg_index < 0 || arg_index >= 6)
         return false;
 
-    auto vmi = vmi_lock_guard(drakvuf);
+    vmi_reader_guard vmi(drakvuf);
     return VMI_SUCCESS == vmi_read_addr_va(vmi, pt_regs_addr + this->regs[arg_offsets[arg_index]], 0, value);
 }
 
@@ -192,6 +193,29 @@ bool linux_memdump::check_elf_header(drakvuf_t drakvuf, drakvuf_trap_info_t* inf
 
     // ELF magic: 0x7F 'E' 'L' 'F'
     return magic == 0x464C457F;
+}
+
+// The length a sample passes to mprotect or munmap is its number, and the hook
+// fires before the kernel has judged it: a terabyte "region" would reach
+// dump_memory_region as a terabyte. So the dump is sized from the VMA that
+// holds addr, as the Windows path sizes from the VAD. On a kernel without the
+// VMA list (Linux 6.1 and later -- drakvuf_linux_find_vma says so by
+// returning false), or when addr is mapped nowhere, the length stands and
+// dump_memory_region's own ceiling is what bounds it.
+static size_t clamp_to_vma(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t addr, size_t length)
+{
+    addr_t vm_start = 0, vm_end = 0;
+    if (!drakvuf_linux_find_vma(drakvuf, info->proc_data.base_addr, addr, &vm_start, &vm_end))
+        return length;
+
+    size_t to_end = vm_end - addr;
+    if (length > to_end)
+    {
+        PRINT_DEBUG("[MEMDUMP] Clamping a 0x%zx byte request at 0x%" PRIx64 " to the 0x%zx left of its VMA\n",
+            length, addr, to_end);
+        return to_end;
+    }
+    return length;
 }
 
 static const char* get_memory_syscall_name(uint64_t nr)
@@ -232,9 +256,11 @@ event_response_t linux_memdump::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_
     if (!get_pt_regs_and_nr(drakvuf, info, &pt_regs_addr, &nr))
         return VMI_EVENT_RESPONSE_NONE;
 
-    // Filter for memory-related syscalls only
+    // Filter for memory-related syscalls only, the others return without the lock
     if (!is_memory_syscall(nr))
         return VMI_EVENT_RESPONSE_NONE;
+
+    std::lock_guard<std::mutex> lock(this->syscall_mtx);
 
     const char* syscall_name = get_memory_syscall_name(nr);
 
@@ -294,6 +320,10 @@ event_response_t linux_memdump::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_
                 PRINT_DEBUG("[MEMDUMP] Detected mprotect changing to RWX at 0x%lx, size 0x%lx\n",
                     (unsigned long)addr, (unsigned long)length);
 
+                // Before the lock, as is_rwx_region and check_elf_header are
+                // called: the walk reads through the vCPU's own handle.
+                length = clamp_to_vma(drakvuf, info, addr, length);
+
                 // Try to dump the region
                 auto vmi = vmi_lock_guard(drakvuf);
                 ACCESS_CONTEXT(ctx,
@@ -326,6 +356,8 @@ event_response_t linux_memdump::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_
             {
                 PRINT_DEBUG("[MEMDUMP] Detected munmap of RWX region at 0x%lx\n", (unsigned long)addr);
 
+                length = clamp_to_vma(drakvuf, info, addr, length);
+
                 auto vmi = vmi_lock_guard(drakvuf);
                 ACCESS_CONTEXT(ctx,
                     .translate_mechanism = VMI_TM_PROCESS_DTB,
@@ -345,6 +377,8 @@ event_response_t linux_memdump::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_
                     break;
 
                 PRINT_DEBUG("[MEMDUMP] Detected munmap of ELF at 0x%lx\n", (unsigned long)addr);
+
+                length = clamp_to_vma(drakvuf, info, addr, length);
 
                 auto vmi = vmi_lock_guard(drakvuf);
                 ACCESS_CONTEXT(ctx,
@@ -467,7 +501,7 @@ linux_memdump::linux_memdump(drakvuf_t drakvuf, const memdump_config* c, output_
 
     // Try do_syscall_64 first - reliable on kernel 6.x+ with FRED where
     // x64_sys_call may be called via static_call (bypassing INT3 at entry)
-    syscall_hook = createSyscallHook("do_syscall_64", &linux_memdump::syscall_cb, "do_syscall_64");
+    syscall_hook = createSyscallHook("do_syscall_64", &linux_memdump::syscall_cb, "do_syscall_64", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
         PRINT_DEBUG("[MEMDUMP] Hooked do_syscall_64\n");
@@ -476,7 +510,7 @@ linux_memdump::linux_memdump(drakvuf_t drakvuf, const memdump_config* c, output_
     PRINT_DEBUG("[MEMDUMP] do_syscall_64 hook failed, trying x64_sys_call\n");
 
     // Fallback to x64_sys_call
-    syscall_hook = createSyscallHook("x64_sys_call", &linux_memdump::syscall_cb, "x64_sys_call");
+    syscall_hook = createSyscallHook("x64_sys_call", &linux_memdump::syscall_cb, "x64_sys_call", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
         PRINT_DEBUG("[MEMDUMP] Hooked x64_sys_call\n");

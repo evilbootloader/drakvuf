@@ -127,7 +127,13 @@
  * The problem is that drakvuf doesn't immediately remove those traps, but waits for entire drakvuf loop
  * to pass. This means that drakvuf might call hook, which has been already free'd.
  *
- * To avoid this we overwrite hook->trap_->cb with nullstub, which is a more "sane" (what user expects to happen).
+ * libdrakvuf flags a removed trap and never dispatches it again (trap->removed, checked before every
+ * callback), and frees it only once no vCPU thread is in a callback. What a callback in flight may still
+ * read has to live that long too: the trap's cb reaches the std::function through trap->data (the params),
+ * never through the hook object, and the dctor hands its reference on the params to the deferred free
+ * routine (call_result.hpp, detach_trap_params / release_trap_params). Until 2026-11-03 the dctor
+ * overwrote trap->cb with a null stub instead, unsynchronized, and freed the params and the hook object
+ * at once: an mt_safe callback on another vCPU then ran on freed memory.
  *
  *
  * 2) Well. this was quite easy, libhook introduces factory functions for that :)
@@ -149,6 +155,6 @@
  * lambda as trap's callback.
  *
  * The lambda has to:
- *  - get hook from trap
- *  - call callback stored in hook
+ *  - get the params from the trap
+ *  - call the callback stored in them (a copy of the hook's, see 1)
  */

@@ -130,6 +130,9 @@
 // PT_LOAD: a segment the loader maps. The union of these is the module's
 // footprint in memory; PT_DYNAMIC (2) is already matched by literal below.
 #define PT_LOAD_TAG             1
+// PT_NOTE: a segment of notes, NT_GNU_BUILD_ID (3) owned by "GNU" holds the build ID
+#define PT_NOTE_TAG             4
+#define NT_GNU_BUILD_ID_TYPE    3
 // struct mm_struct's saved_auxv is AT_VECTOR_SIZE longs, i.e. half that many
 // (type, value) pairs; cap the scan well above that rather than trusting the
 // AT_NULL terminator to be present in memory we may be reading mid-exec.
@@ -139,10 +142,18 @@
 #define VM_EXEC		        0x00000004
 #define VM_SHARED	        0x00000008
 #define R_X86_64_GLOB_DAT	0x00000006
+// Bounds on walks over guest-authored chains (2026-11-03, reviews M-4 and
+// M-7). The VMA list and a module's dynamic section are guest memory; a
+// sample that controls them -- libmon resolves symbols in whatever its
+// link_map names -- used to cost this process an unbounded loop per attempt.
+// Both are far above anything real: a process has hundreds of VMAs, a
+// dynamic section a few dozen entries.
+#define VMA_WALK_MAX            65536
+#define DYNAMIC_ENTRIES_MAX     1024
 
 addr_t linux_eprocess_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib, const char* sym)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     vmi_pid_t pid;
     if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
@@ -169,6 +180,7 @@ addr_t linux_eprocess_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, const char
     addr_t vm_next, nullp = 0;
 
     addr_t text_segment_address = 0;
+    unsigned walked = 0;
     do
     {
         addr_t vm_start;
@@ -230,7 +242,7 @@ addr_t linux_eprocess_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, const char
 next:
         mmap = vm_next;
 
-    } while (vm_next != nullp);
+    } while (vm_next != nullp && ++walked < VMA_WALK_MAX);
 
     if (text_segment_address == 0)
         return -1;
@@ -251,7 +263,7 @@ next:
  */
 addr_t linux_module_span(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     if (!drakvuf->offsets[ELF64PHDR_MEMSZ])
         return 0;
@@ -320,19 +332,28 @@ addr_t linux_module_span(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_
 }
 
 /*
- * Resolve a symbol in a shared object whose load address is already known,
+ * Resolve symbols in a shared object whose load address is already known,
  * skipping the VMA search that linux_eprocess_sym2va() has to do. Callers that
  * learned the base another way (the dynamic linker's link_map, or AT_BASE from
  * the aux vector) must use this: the VMA walk relies on mm_struct.mmap and
  * vm_area_struct.vm_next, which Linux 6.1 removed in favour of a maple tree.
+ *
+ * One pass over .dynsym for all of syms, which costs a few guest reads per
+ * entry: vas[i] is the address of syms[i], 0 if the object doesn't define it.
+ * Returns false if the tables could not be read; addresses found before the
+ * read failed are still set.
  */
-addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base, const char* sym)
+bool linux_module_syms2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base,
+    const char* const* syms, size_t count, addr_t* vas)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    for (size_t i = 0; i < count; i++)
+        vas[i] = 0;
+
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     vmi_pid_t pid;
     if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
-        return -1;
+        return false;
 
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_PID,
@@ -343,7 +364,7 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
     // Sanity check the caller's base before trusting anything we read past it.
     uint32_t elf_header;
     if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &elf_header) || elf_header != ELF_HEADER)
-        return -1;
+        return false;
 
     addr_t text_segment_address = module_base;
 
@@ -352,17 +373,17 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
     addr_t program_header_offset;
     ctx.addr = text_segment_address + drakvuf->offsets[ELF64HDR_PHOFF];
     if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &program_header_offset))
-        return -1;
+        return false;
 
     uint16_t num_of_program_headers;
     ctx.addr = text_segment_address + drakvuf->offsets[ELF64HDR_PHNUM];
     if (VMI_FAILURE == vmi_read_16(vmi, &ctx, &num_of_program_headers))
-        return -1;
+        return false;
 
     uint16_t size_of_program_headers;
     ctx.addr = text_segment_address + drakvuf->offsets[ELF64HDR_PHENTSIZE];
     if (VMI_FAILURE == vmi_read_16(vmi, &ctx, &size_of_program_headers))
-        return -1;
+        return false;
 
     // Extracting DYNAMIC SEGMENT offset program headers
 
@@ -373,11 +394,11 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
     {
         ctx.addr = text_segment_address + offset + program_header_offset + drakvuf->offsets[ELF64PHDR_TYPE];
         if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &ph_type))
-            return -1;
+            return false;
 
         ctx.addr = text_segment_address + offset + program_header_offset + drakvuf->offsets[ELF64PHDR_VADDR];
         if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &ph_vaddr))
-            return -1;
+            return false;
 
         if (ph_type == 2)
         {
@@ -397,14 +418,21 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
     ctx.addr = text_segment_address + dynamic_section_offset;
 
     addr_t word, ptr;
+    unsigned entries = 0;
     do
     {
+        // The section is guest memory the sample may have written: a fake
+        // library whose "dynamic section" is a gigabyte of non-zero words
+        // cost 2^27 reads per attempt here, repeated by libmon's deferred
+        // retries. A real one ends within a few dozen entries.
+        if (++entries > DYNAMIC_ENTRIES_MAX)
+            return false;
         if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &word))
-            return -1;
+            return false;
         ctx.addr += 0x8;
 
         if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &ptr))
-            return -1;
+            return false;
         ctx.addr += 0x8;
 
         if (word == 0x5) // .strtab section offset
@@ -474,7 +502,12 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
      * symbol -- open, fork, execve, connect, mprotect and plenty more in
      * glibc -- was unresolvable.
      */
-    addr_t fallback = 0;
+    // A hidden version found for a name, used if no default version follows
+    addr_t* fallback = g_new0(addr_t, count);
+    // Names with their default version found, the scan stops once all are
+    size_t found = 0;
+    bool ok = true;
+
     size_t max_symbols = 65536;
     if (dynstr_offset > dynsym_offset && dynsym_entry_size)
     {
@@ -484,14 +517,17 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
         max_symbols = (dynstr_offset - dynsym_offset) / dynsym_entry_size;
     }
 
-    for (size_t i = 0; i < max_symbols; i++)
+    for (size_t i = 0; i < max_symbols && found < count; i++)
     {
         addr_t entry = dynsym_offset + i * dynsym_entry_size;
 
         uint32_t st_name;
         ctx.addr = entry + drakvuf->offsets[ELF64SYM_NAME];
         if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &st_name))
-            return -1;
+        {
+            ok = false;
+            break;
+        }
 
         if (!st_name || (dynstr_size && st_name >= dynstr_size))
             continue;
@@ -501,16 +537,27 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
         if (!symbol_name)
             continue;
 
-        int cmp = strcmp(symbol_name, sym);
+        size_t match = count;
+        for (size_t j = 0; j < count; j++)
+        {
+            if (!vas[j] && !strcmp(symbol_name, syms[j]))
+            {
+                match = j;
+                break;
+            }
+        }
         g_free(symbol_name);
 
-        if (cmp)
+        if (match == count)
             continue;
 
         addr_t value = 0;
         ctx.addr = entry + drakvuf->offsets[ELF64SYM_VALUE];
         if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &value))
-            return -1;
+        {
+            ok = false;
+            break;
+        }
 
         // st_value is 0 for an undefined symbol, i.e. one this object imports
         // rather than defines. Keep looking instead of returning the base.
@@ -533,21 +580,126 @@ addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t modul
 
             if (VMI_SUCCESS == vmi_read_16(vmi, &ctx, &versym) && (versym & VERSYM_HIDDEN))
             {
-                if (!fallback)
-                    fallback = text_segment_address + value;
+                if (!fallback[match])
+                    fallback[match] = text_segment_address + value;
                 continue;
             }
         }
 
-        return text_segment_address + value;
+        vas[match] = text_segment_address + value;
+        found++;
     }
 
-    return fallback ? fallback : -1;
+    // A read failure makes the fallbacks unreliable: a default version may have followed
+    if (ok)
+        for (size_t j = 0; j < count; j++)
+            if (!vas[j])
+                vas[j] = fallback[j];
+
+    g_free(fallback);
+    return ok;
+}
+
+addr_t linux_module_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base, const char* sym)
+{
+    addr_t va = 0;
+    if (!linux_module_syms2va(drakvuf, eprocess_base, module_base, &sym, 1, &va) && !va)
+        return -1;
+    return va ? va : (addr_t)-1;
+}
+
+/*
+ * The GNU build ID of a module, from its PT_NOTE segments: identifies the file
+ * the module was loaded from, so whatever was learned about one mapping of it
+ * holds for every other. The notes sit in the first page, after the program
+ * headers, which the loader has read. Copies at most size bytes into id and
+ * returns the length of the ID, 0 if there is none or it can't be read.
+ */
+size_t linux_module_build_id(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module_base, uint8_t* id, size_t size)
+{
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
+
+    vmi_pid_t pid;
+    if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
+        return 0;
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_PID,
+        .addr = module_base,
+        .pid = pid
+    );
+
+    uint32_t elf_header;
+    if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &elf_header) || elf_header != ELF_HEADER)
+        return 0;
+
+    addr_t program_header_offset;
+    ctx.addr = module_base + drakvuf->offsets[ELF64HDR_PHOFF];
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &program_header_offset))
+        return 0;
+
+    uint16_t num_of_program_headers;
+    ctx.addr = module_base + drakvuf->offsets[ELF64HDR_PHNUM];
+    if (VMI_FAILURE == vmi_read_16(vmi, &ctx, &num_of_program_headers))
+        return 0;
+
+    uint16_t size_of_program_headers;
+    ctx.addr = module_base + drakvuf->offsets[ELF64HDR_PHENTSIZE];
+    if (VMI_FAILURE == vmi_read_16(vmi, &ctx, &size_of_program_headers))
+        return 0;
+
+    addr_t offset = 0;
+    for (uint16_t i = 0; i < num_of_program_headers; i++, offset += size_of_program_headers)
+    {
+        uint32_t ph_type;
+        ctx.addr = module_base + program_header_offset + offset + drakvuf->offsets[ELF64PHDR_TYPE];
+        if (VMI_FAILURE == vmi_read_32(vmi, &ctx, &ph_type))
+            return 0;
+
+        if (ph_type != PT_NOTE_TAG)
+            continue;
+
+        addr_t ph_vaddr, ph_memsz;
+        ctx.addr = module_base + program_header_offset + offset + drakvuf->offsets[ELF64PHDR_VADDR];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &ph_vaddr))
+            return 0;
+
+        ctx.addr = module_base + program_header_offset + offset + drakvuf->offsets[ELF64PHDR_MEMSZ];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &ph_memsz))
+            return 0;
+
+        // Elf64_Nhdr: namesz, descsz, type, then the name and the descriptor, each padded to 4 bytes
+        addr_t note = module_base + ph_vaddr, end = note + ph_memsz;
+        while (note + 12 <= end)
+        {
+            uint32_t nhdr[3];
+            ctx.addr = note;
+            if (VMI_FAILURE == vmi_read(vmi, &ctx, sizeof(nhdr), nhdr, NULL))
+                break;
+
+            addr_t name = note + 12;
+            addr_t desc = name + ((nhdr[0] + 3) & ~3u);
+            char owner[4];
+            ctx.addr = name;
+            if (nhdr[2] == NT_GNU_BUILD_ID_TYPE && nhdr[0] == sizeof(owner) &&
+                VMI_SUCCESS == vmi_read(vmi, &ctx, sizeof(owner), owner, NULL) && !memcmp(owner, "GNU", 4) &&
+                nhdr[1] && nhdr[1] <= size)
+            {
+                ctx.addr = desc;
+                if (VMI_FAILURE == vmi_read(vmi, &ctx, nhdr[1], id, NULL))
+                    return 0;
+                return nhdr[1];
+            }
+            note = desc + ((nhdr[1] + 3) & ~3u);
+        }
+    }
+
+    return 0;
 }
 
 addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     vmi_pid_t pid;
     if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
@@ -569,6 +721,7 @@ addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib)
         return -1;
 
     addr_t vm_next, nullp = 0;
+    unsigned walked = 0;
     do
     {
         addr_t vm_start;
@@ -614,9 +767,109 @@ addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib)
 next:
         mmap = vm_next;
 
-    } while (vm_next != nullp);
+    } while (vm_next != nullp && ++walked < VMA_WALK_MAX);
 
     return -1;
+}
+
+/*
+ * The VMA that contains vaddr, as [*start, *end). Only on a kernel that still
+ * keeps mm_struct.mmap and vm_area_struct.vm_next: 6.1 replaced the list with
+ * a maple tree. A profile without the member leaves its offset at 0, which is
+ * also the member's real offset on the kernels that have it (it is the first
+ * field of mm_struct there), so the profile is asked for the member rather
+ * than the offset tested. At most VMA_WALK_MAX entries are read: the list is
+ * guest memory, and a cycle planted in it must cost a bounded number of
+ * reads, never a vCPU thread for ever.
+ *
+ * Returns false when the kernel has no list, the address is in no VMA, or a
+ * read fails; *start and *end are untouched then.
+ *
+ * The walk is shared with linux_find_vma_file(): with `file` set, the VMA's
+ * vm_file (0 for an anonymous mapping) is read into it as well.
+ */
+static bool find_vma(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* start, addr_t* end, addr_t* file)
+{
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
+
+    addr_t mmap_rva = 0;
+    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "mm_struct", "mmap", &mmap_rva))
+        return false;
+
+    vmi_pid_t pid;
+    if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
+        return false;
+
+    addr_t mm_struct_address;
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_PID,
+        .addr = eprocess_base + drakvuf->offsets[TASK_STRUCT_MMSTRUCT],
+        .pid = pid
+    );
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mm_struct_address) || !mm_struct_address)
+    {
+        ctx.addr = eprocess_base + drakvuf->offsets[TASK_STRUCT_ACTIVE_MMSTRUCT];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mm_struct_address) || !mm_struct_address)
+            return false;
+    }
+
+    addr_t vma;
+    ctx.addr = mm_struct_address + mmap_rva;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vma))
+        return false;
+
+    for (size_t n = 0; vma && n < VMA_WALK_MAX; n++)
+    {
+        addr_t vm_start, vm_end, vm_next;
+
+        ctx.addr = vma + drakvuf->offsets[VM_AREA_STRUCT_START];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vm_start))
+            return false;
+
+        ctx.addr = vma + drakvuf->offsets[VM_AREA_STRUCT_END];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vm_end))
+            return false;
+
+        if (vaddr >= vm_start && vaddr < vm_end)
+        {
+            if (file)
+            {
+                ctx.addr = vma + drakvuf->offsets[VM_AREA_STRUCT_FILE];
+                if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, file))
+                    return false;
+            }
+            *start = vm_start;
+            *end = vm_end;
+            return true;
+        }
+
+        ctx.addr = vma + drakvuf->offsets[VM_AREA_STRUCT_NEXT];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vm_next))
+            return false;
+
+        vma = vm_next;
+    }
+
+    return false;
+}
+
+bool linux_find_vma(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* start, addr_t* end)
+{
+    return find_vma(drakvuf, eprocess_base, vaddr, start, end, NULL);
+}
+
+/*
+ * The file behind the VMA holding vaddr, as the kernel's `struct file`
+ * address, 0 for an anonymous mapping. Two addresses in mappings of the same
+ * file give the same value, and no process can write the VMA list, which is
+ * what makes this the check that an address a process's own link_map and
+ * symbol table led to really lies in the library they named (libmon, review
+ * L-14). False as linux_find_vma() is.
+ */
+bool linux_find_vma_file(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* vm_file)
+{
+    addr_t start, end;
+    return find_vma(drakvuf, eprocess_base, vaddr, &start, &end, vm_file);
 }
 
 /*
@@ -629,7 +882,7 @@ next:
  */
 addr_t linux_get_auxv_value(drakvuf_t drakvuf, addr_t eprocess_base, uint64_t type)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     // A profile without saved_auxv leaves the offset zeroed, which would make
     // us read from the head of mm_struct instead.

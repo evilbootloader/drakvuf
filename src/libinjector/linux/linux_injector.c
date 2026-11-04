@@ -142,6 +142,25 @@ static bool check_userspace_int3_trap(linux_injector_t injector, drakvuf_trap_in
                 info->proc_data.name, injector->child_data.name);
             return false;
         }
+        /*
+         * The parent and the name don't identify the child. The breakpoint is
+         * on a shared page, so any other child of the target with its name
+         * that returns through the same code hits it too, e.g. systemd --user
+         * when the target is PID 1. The vfork child is in the target's
+         * address space and returns 0.
+         */
+        if ( (info->regs->cr3 & ~0xfffull) != injector->child_dtb )
+        {
+            PRINT_DEBUG("INT3 received but forked process %d is in another address space (CR3 0x%lx, target 0x%lx)\n",
+                info->proc_data.pid, info->regs->cr3, injector->child_dtb);
+            return false;
+        }
+        if ( info->regs->rax != 0 )
+        {
+            PRINT_DEBUG("INT3 received but forked process %d didn't return from vfork (RAX 0x%lx)\n",
+                info->proc_data.pid, info->regs->rax);
+            return false;
+        }
         injector->fork = false;
         return true;
     }

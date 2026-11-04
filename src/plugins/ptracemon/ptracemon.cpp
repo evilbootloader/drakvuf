@@ -180,5 +180,5 @@ ptracemon::ptracemon(drakvuf_t drakvuf, output_format_t output) : pluginex(drakv
         fprintf(stderr, "[PTRACEMON] Method __x64_sys_ptrace not found\n");
         return;
     }
-    fprintf(stderr, "[PTRACEMON] Hooked __x64_sys_ptrace\n");
+    PRINT_DEBUG("[PTRACEMON] Hooked __x64_sys_ptrace\n");
 }

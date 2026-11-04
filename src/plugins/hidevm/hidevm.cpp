@@ -671,7 +671,9 @@ static void check_and_replace_query_string(drakvuf_t drakvuf, drakvuf_trap_info_
             {
                 fmt::print(plugin->format, "hidevm", drakvuf, info,
                     keyval("Reason", fmt::Qstr("WMI query spoofed")),
-                    keyval("strQuery", fmt::Qstr(query.c_str()))
+                    // Estr for what the guest wrote: Qstr leaves a newline in
+                    // it to split the JSON line (review L-13)
+                    keyval("strQuery", fmt::Estr(query))
                 );
             }
         }
@@ -818,7 +820,7 @@ static event_response_t hidevm_open_key_entry(hidevm* plugin, drakvuf_t drakvuf,
                 plugin->hide_key_ret_hooks[hook_ID] = std::move(hook);
                 fmt::print(plugin->format, "hidevm", drakvuf, info,
                     keyval("Reason", fmt::Qstr("Xen PCI registry key hidden")),
-                    keyval("KeyName", fmt::Qstr(key_path))
+                    keyval("KeyName", fmt::Estr(key_path))
                 );
             }
         }
@@ -1010,7 +1012,7 @@ event_response_t hidevm::EnumerateKeyReturn_cb(drakvuf_t, drakvuf_trap_info_t* i
     {
         fmt::print(this->format, "hidevm", drakvuf, info,
             keyval("Reason", fmt::Qstr("Enum subkey name munged")),
-            keyval("Match", fmt::Qstr(matched))
+            keyval("Match", fmt::Estr(matched))
         );
     }
 

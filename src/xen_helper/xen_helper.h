@@ -158,4 +158,14 @@ bool xen_disable_ipt(xen_interface_t* xen, domid_t domID, unsigned int vcpu, ipt
 bool xen_decrease_reservation(xen_interface_t* xen, domid_t domID, xen_pfn_t* r);
 bool xen_populate_physmap(xen_interface_t* xen, domid_t domID, xen_pfn_t* r);
 
+/* The domain as the toolstack sees it: running, shut down by the guest (reason = SHUTDOWN_* from xen/sched.h) or no longer there.
+ * Upstream 3ce4088c, ported 2026-11-03. */
+typedef enum
+{
+    XEN_DOMAIN_RUNNING,
+    XEN_DOMAIN_SHUTDOWN,
+    XEN_DOMAIN_GONE,
+} xen_domain_state_t;
+xen_domain_state_t xen_get_domain_state(xen_interface_t* xen, domid_t domID, int* shutdown_reason);
+
 #endif

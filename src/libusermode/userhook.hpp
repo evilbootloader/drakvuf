@@ -139,6 +139,8 @@ struct hook_target_entry_t
     const std::vector < std::unique_ptr < ArgumentPrinter > >& argument_printers;
     target_hook_state state;
     drakvuf_trap_t* trap = nullptr;
+    bool shared{false};     // trap is a breakpoint of userhook::shared_images, not this process's
+    bool mt_safe{false};    // callback may run on several vCPU threads at once, on a shared breakpoint
     void* plugin;
 
     hook_target_entry_t(std::string target_name,
@@ -240,7 +242,10 @@ using hook_filter_t = std::function<bool(const plugin_target_config_entry_t&)>;
  */
 bool drakvuf_are_userhooks_supported(drakvuf_t drakvuf);
 void drakvuf_register_usermode_callback(drakvuf_t drakvuf, usermode_cb_registration* reg);
-bool drakvuf_request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, const plugin_target_config_entry_t* target, callback_t callback, void* extra);
+// mt_safe: the callback may run on several vCPU threads at once. It then runs so
+// on breakpoints shared by the processes mapping the DLL image, and serialized on
+// the breakpoints of one process, whose target the process's exit frees.
+bool drakvuf_request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, const plugin_target_config_entry_t* target, callback_t callback, void* extra, bool mt_safe = false);
 void drakvuf_load_dll_hook_config(drakvuf_t drakvuf, const char* dll_hooks_list_path, const bool print_no_addr, const hook_filter_t& hook_filter, wanted_hooks_t& wanted_hooks);
 
 

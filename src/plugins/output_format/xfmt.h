@@ -111,6 +111,7 @@ namespace fmt
 template<class... Args>
 void print(output_format_t format, const char* plugin_name, drakvuf_t drakvuf, const drakvuf_trap_info_t* info, const Args& ... args)
 {
+    std::lock_guard<std::mutex> lock(cout_mutex);
     switch (format)
     {
         case OUTPUT_CSV:
@@ -148,6 +149,7 @@ void print_proc_data(output_format_t format, const char* plugin_name, drakvuf_t 
 
 inline void print_running_process(output_format_t format, const char* plugin_name, drakvuf_t drakvuf, gint64 timestamp, proc_data_t const& proc_data)
 {
+    std::lock_guard<std::mutex> lock(cout_mutex);
     switch (format)
     {
         case OUTPUT_CSV:

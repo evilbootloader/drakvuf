@@ -123,6 +123,11 @@ bool init_vmi(drakvuf_t drakvuf, bool fast_singlestep);
 void close_vmi(drakvuf_t drakvuf);
 
 void drakvuf_vmi_event_callback (int fd, void* data);
+void drakvuf_free_removed_traps(drakvuf_t drakvuf);
+
+bool create_reader_vmis(drakvuf_t drakvuf);
+void destroy_reader_vmis(drakvuf_t drakvuf);
+bool stop_parallel_events(drakvuf_t drakvuf);
 
 bool inject_trap(drakvuf_t drakvuf,
     drakvuf_trap_t* trap,

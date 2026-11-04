@@ -397,6 +397,22 @@ bool xen_set_vcpu_ctx(xen_interface_t* xen, domid_t domID, unsigned int vcpu, vc
     return xen->xlw.xc_vcpu_setcontext(xen->xc, domID, vcpu, ctx) == 0;
 }
 
+xen_domain_state_t xen_get_domain_state(xen_interface_t* xen, domid_t domID, int* shutdown_reason)
+{
+    xc_domaininfo_t info = { 0 };
+
+    if (1 != xen->xlw.xc_domain_getinfolist(xen->xc, domID, 1, &info) || info.domain != domID || (info.flags & XEN_DOMINF_dying))
+        return XEN_DOMAIN_GONE;
+
+    if (info.flags & XEN_DOMINF_shutdown)
+    {
+        *shutdown_reason = (info.flags >> XEN_DOMINF_shutdownshift) & XEN_DOMINF_shutdownmask;
+        return XEN_DOMAIN_SHUTDOWN;
+    }
+
+    return XEN_DOMAIN_RUNNING;
+}
+
 bool xen_decrease_reservation(xen_interface_t* xen, domid_t domID, xen_pfn_t* r)
 {
     return xen->xlw.xc_domain_decrease_reservation_exact(xen->xc, domID, 1, 0, r) == 0;

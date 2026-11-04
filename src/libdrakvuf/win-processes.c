@@ -150,7 +150,7 @@ static uint64_t win_read_flag(drakvuf_t drakvuf, uint64_t flags, int idx)
 
 static bool win_get_current_kpcr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* kpcr, addr_t* prcb)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     // TODO: check whether we could use ss_arbytes here
     unsigned int cpl = info->regs->cs_sel & 3;
 
@@ -201,7 +201,7 @@ bool win_get_user_rsp(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* user
         return false;
 
 
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     addr_t kpcr = 0;
     addr_t prcb = 0;
 
@@ -239,7 +239,7 @@ bool win_get_user_rsp(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* user
 
 addr_t win_get_syscall_retaddr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, privilege_mode_t mode)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     if (mode == MAXIMUM_MODE)
     {
@@ -272,7 +272,7 @@ addr_t win_get_syscall_retaddr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, pri
 
 bool win_get_current_irql(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint8_t* irql)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     addr_t prcb = 0;
     addr_t kpcr = 0;
 
@@ -285,7 +285,7 @@ bool win_get_current_irql(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint8_t*
 
 addr_t win_get_current_thread(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     addr_t thread = 0;
     addr_t prcb = 0;
     addr_t kpcr = 0;
@@ -305,7 +305,7 @@ addr_t win_get_current_thread(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
 addr_t win_get_rspbase(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     addr_t rspbase = 0;
     addr_t prcb = 0;
     addr_t kpcr = 0;
@@ -325,7 +325,7 @@ addr_t win_get_rspbase(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
 addr_t win_get_current_thread_teb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     addr_t kthread = win_get_current_thread(drakvuf, info);
     if (!kthread)
@@ -340,7 +340,7 @@ addr_t win_get_current_thread_teb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
 addr_t win_get_current_thread_stackbase(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     addr_t kthread = win_get_current_thread(drakvuf, info);
     if (!kthread)
@@ -359,7 +359,7 @@ addr_t win_get_current_process(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
     addr_t thread = win_get_current_thread(drakvuf, info);
 
-    if (thread == 0 || VMI_SUCCESS != vmi_read_addr_va(drakvuf->vmi, thread + drakvuf->offsets[KTHREAD_PROCESS], 0, &process))
+    if (thread == 0 || VMI_SUCCESS != vmi_read_addr_va(drakvuf_vmi(drakvuf), thread + drakvuf->offsets[KTHREAD_PROCESS], 0, &process))
     {
         return 0;
     }
@@ -373,9 +373,9 @@ addr_t win_get_current_attached_process(drakvuf_t drakvuf, drakvuf_trap_info_t* 
     addr_t process;
     addr_t thread = win_get_current_thread(drakvuf, info);
     if (thread &&
-        VMI_SUCCESS == vmi_read_8_va(drakvuf->vmi, thread + drakvuf->offsets[KTHREAD_APCSTATEINDEX], 0, &apcstateindex) &&
+        VMI_SUCCESS == vmi_read_8_va(drakvuf_vmi(drakvuf), thread + drakvuf->offsets[KTHREAD_APCSTATEINDEX], 0, &apcstateindex) &&
         apcstateindex &&
-        VMI_SUCCESS == vmi_read_addr_va(drakvuf->vmi, thread + drakvuf->offsets[KTHREAD_APCSTATE] + drakvuf->offsets[KAPC_STATE_PROCESS], 0, &process))
+        VMI_SUCCESS == vmi_read_addr_va(drakvuf_vmi(drakvuf), thread + drakvuf->offsets[KTHREAD_APCSTATE] + drakvuf->offsets[KAPC_STATE_PROCESS], 0, &process))
     {
         return process;
     }
@@ -388,7 +388,7 @@ bool win_get_last_error(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint32_t* 
     if (!err || !err_str)
         return false;
 
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     addr_t eprocess = win_get_current_process(drakvuf, info);
     addr_t cr3 = 0;
@@ -432,7 +432,7 @@ static addr_t win_get_file_name_ptr_from_controlarea(drakvuf_t drakvuf, addr_t c
     ctx.addr = control_area + drakvuf->offsets[CONTROL_AREA_FILEPOINTER];
 
     addr_t file_object = 0;
-    if (vmi_read_addr(drakvuf->vmi, &ctx, &file_object) == VMI_SUCCESS)
+    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &file_object) == VMI_SUCCESS)
     {
         // file_object is a special _EX_FAST_REF pointer,
         // we need to explicitly clear low bits
@@ -448,7 +448,7 @@ static addr_t win_get_file_name_ptr_from_controlarea(drakvuf_t drakvuf, addr_t c
 static unicode_string_t* win_get_process_full_name(drakvuf_t drakvuf, addr_t eprocess_base)
 {
     addr_t image_file_name_addr = 0;
-    if ( vmi_read_addr_va(drakvuf->vmi,
+    if ( vmi_read_addr_va(drakvuf_vmi(drakvuf),
             eprocess_base + drakvuf->offsets[EPROCESS_PROCCREATIONINFO] + drakvuf->offsets[PROCCREATIONINFO_IMAGEFILENAME],
             0, &image_file_name_addr) != VMI_SUCCESS )
     {
@@ -462,27 +462,27 @@ static unicode_string_t* win_get_process_full_name(drakvuf_t drakvuf, addr_t epr
     else
     {
         addr_t section_object = 0;
-        if ( vmi_read_addr_va(drakvuf->vmi,
+        if ( vmi_read_addr_va(drakvuf_vmi(drakvuf),
                 eprocess_base + drakvuf->offsets[EPROCESS_SECTIONOBJECT],
                 0, &image_file_name_addr) == VMI_SUCCESS)
         {
             addr_t control_area = 0;
-            bool is_win7_win8 = vmi_get_winver( drakvuf->vmi ) <= VMI_OS_WINDOWS_8;
+            bool is_win7_win8 = vmi_get_winver( drakvuf_vmi(drakvuf) ) <= VMI_OS_WINDOWS_8;
             if (is_win7_win8)
             {
                 addr_t segment = 0;
-                if ( vmi_read_addr_va(drakvuf->vmi,
+                if ( vmi_read_addr_va(drakvuf_vmi(drakvuf),
                         section_object + drakvuf->offsets[SECTIONOBJECT_SEGMENT],
                         0, &segment) == VMI_SUCCESS)
                 {
-                    vmi_read_addr_va(drakvuf->vmi,
+                    vmi_read_addr_va(drakvuf_vmi(drakvuf),
                         segment + drakvuf->offsets[SEGMENT_CONTROLAREA],
                         0, &control_area);
                 }
             }
             else
             {
-                vmi_read_addr_va(drakvuf->vmi,
+                vmi_read_addr_va(drakvuf_vmi(drakvuf),
                     section_object + drakvuf->offsets[SECTION_CONTROLAREA], 0, &control_area);
             }
 
@@ -529,14 +529,14 @@ char* win_get_process_name(drakvuf_t drakvuf, addr_t eprocess_base, bool fullpat
     vmi_free_unicode_str(fullname);
 
     if (!name)
-        name = vmi_read_str_va(drakvuf->vmi, eprocess_base + drakvuf->offsets[EPROCESS_PNAME], 0);
+        name = vmi_read_str_va(drakvuf_vmi(drakvuf), eprocess_base + drakvuf->offsets[EPROCESS_PNAME], 0);
 
     return name;
 }
 
 char* win_get_process_commandline(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t eprocess_base)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB,
@@ -567,7 +567,7 @@ char* win_get_process_commandline(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
 
 bool win_get_process_pid(drakvuf_t drakvuf, addr_t eprocess_base, vmi_pid_t* pid)
 {
-    if ( VMI_SUCCESS == vmi_read_32_va(drakvuf->vmi, eprocess_base + drakvuf->offsets[EPROCESS_PID], 0, (uint32_t*)pid) )
+    if ( VMI_SUCCESS == vmi_read_32_va(drakvuf_vmi(drakvuf), eprocess_base + drakvuf->offsets[EPROCESS_PID], 0, (uint32_t*)pid) )
         return true;
 
     return false;
@@ -582,7 +582,7 @@ int64_t win_get_process_userid(drakvuf_t drakvuf, addr_t eprocess_base)
 {
     addr_t peb;
     addr_t userid;
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB
     );
@@ -610,7 +610,7 @@ int64_t win_get_process_userid(drakvuf_t drakvuf, addr_t eprocess_base)
 unicode_string_t* win_get_process_csdversion(drakvuf_t drakvuf, addr_t eprocess_base)
 {
     addr_t peb;
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB
     );
@@ -639,7 +639,7 @@ int64_t win_get_current_process_userid(drakvuf_t drakvuf, drakvuf_trap_info_t* i
 
 bool win_get_process_dtb(drakvuf_t drakvuf, addr_t process_base, addr_t* dtb)
 {
-    return (VMI_SUCCESS == vmi_read_addr_va(drakvuf->vmi, process_base + drakvuf->offsets[EPROCESS_PDBASE], 0, dtb));
+    return (VMI_SUCCESS == vmi_read_addr_va(drakvuf_vmi(drakvuf), process_base + drakvuf->offsets[EPROCESS_PDBASE], 0, dtb));
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////
@@ -647,7 +647,7 @@ bool win_get_process_dtb(drakvuf_t drakvuf, addr_t process_base, addr_t* dtb)
 static bool win_get_thread_id(drakvuf_t drakvuf, addr_t ethread, uint32_t* thread_id)
 {
     addr_t p_tid ;
-    if ( vmi_read_addr_va( drakvuf->vmi, ethread + drakvuf->offsets[ ETHREAD_CID ] + drakvuf->offsets[ CLIENT_ID_UNIQUETHREAD ],
+    if ( vmi_read_addr_va( drakvuf_vmi(drakvuf), ethread + drakvuf->offsets[ ETHREAD_CID ] + drakvuf->offsets[ CLIENT_ID_UNIQUETHREAD ],
             0,
             &p_tid ) == VMI_SUCCESS )
     {
@@ -680,7 +680,7 @@ bool win_get_thread_previous_mode( drakvuf_t drakvuf, addr_t kthread, privilege_
     if ( kthread )
     {
         uint8_t previous_mode_byte = 0xFF;
-        if ( vmi_read_8_va( drakvuf->vmi, kthread + drakvuf->offsets[ KTHREAD_PREVIOUSMODE ], 0,
+        if ( vmi_read_8_va( drakvuf_vmi(drakvuf), kthread + drakvuf->offsets[ KTHREAD_PREVIOUSMODE ], 0,
                 &previous_mode_byte ) == VMI_SUCCESS )
         {
             *previous_mode = (privilege_mode_t)previous_mode_byte;
@@ -722,7 +722,7 @@ bool win_is_ethread( drakvuf_t drakvuf, addr_t dtb, addr_t ethread_addr )
     ctx.addr = ethread_addr + drakvuf->offsets[ ETHREAD_TCB ] + drakvuf->offsets[ KTHREAD_HEADER ]
         + drakvuf->offsets[ DISPATCHER_TYPE ] ;
 
-    if ( vmi_read_8( drakvuf->vmi, &ctx, (uint8_t*)&dispatcher_type ) == VMI_SUCCESS )
+    if ( vmi_read_8( drakvuf_vmi(drakvuf), &ctx, (uint8_t*)&dispatcher_type ) == VMI_SUCCESS )
     {
         if ( dispatcher_type == DISPATCHER_THREAD_OBJECT )
             return true ;
@@ -745,7 +745,7 @@ bool win_is_eprocess( drakvuf_t drakvuf, addr_t dtb, addr_t eprocess_addr )
             + drakvuf->offsets[ DISPATCHER_TYPE ]
     );
 
-    if ( vmi_read_8( drakvuf->vmi, &ctx, (uint8_t*)&dispatcher_type ) == VMI_SUCCESS )
+    if ( vmi_read_8( drakvuf_vmi(drakvuf), &ctx, (uint8_t*)&dispatcher_type ) == VMI_SUCCESS )
     {
         if ( dispatcher_type == DISPATCHER_PROCESS_OBJECT )
             return true ;
@@ -757,7 +757,7 @@ bool win_is_eprocess( drakvuf_t drakvuf, addr_t dtb, addr_t eprocess_addr )
 GHashTable* win_enum_threads(drakvuf_t drakvuf, addr_t process)
 {
     GHashTable* threads = g_hash_table_new(g_direct_hash, g_direct_equal);
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     addr_t list_head;
     if ( VMI_SUCCESS != vmi_read_addr_va(vmi, process + drakvuf->offsets[EPROCESS_LISTTHREADHEAD], 0, &list_head) )
@@ -793,7 +793,7 @@ GHashTable* win_enum_threads(drakvuf_t drakvuf, addr_t process)
 
 bool win_is_process_suspended(drakvuf_t drakvuf, addr_t process, bool* status)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     addr_t list_head;
     if ( VMI_SUCCESS != vmi_read_addr_va(vmi, process + drakvuf->offsets[EPROCESS_LISTTHREADHEAD], 0, &list_head) )
@@ -850,7 +850,7 @@ bool win_is_process_suspended(drakvuf_t drakvuf, addr_t process, bool* status)
 
 bool win_get_module_list(drakvuf_t drakvuf, addr_t eprocess_base, addr_t* module_list)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
     addr_t peb=0;
     addr_t ldr=0;
     addr_t modlist=0;
@@ -889,7 +889,7 @@ bool win_get_module_list_wow(drakvuf_t drakvuf, access_context_t* ctx, addr_t wo
     if (!wow_peb || !drakvuf->wow_offsets)
         return false;
 
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     ctx->addr = wow_peb + drakvuf->wow_offsets[WOW_PEB_LDR];
 
@@ -915,7 +915,7 @@ bool win_get_module_list_wow(drakvuf_t drakvuf, access_context_t* ctx, addr_t wo
 
 static bool win_find_process_list(drakvuf_t drakvuf, addr_t* list_head)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     addr_t current_process;
     status_t status = vmi_read_addr_ksym(vmi, "PsInitialSystemProcess", &current_process);
@@ -928,7 +928,7 @@ static bool win_find_process_list(drakvuf_t drakvuf, addr_t* list_head)
 
 static bool win_find_driver_list(drakvuf_t drakvuf, addr_t* list_head)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     status_t status = vmi_read_addr_ksym(vmi, "PsLoadedModuleList", list_head);
     if ( VMI_FAILURE == status )
@@ -939,7 +939,7 @@ static bool win_find_driver_list(drakvuf_t drakvuf, addr_t* list_head)
 
 static bool win_find_next_process_list_entry(drakvuf_t drakvuf, addr_t current_list_entry, addr_t* next_list_entry)
 {
-    if ( VMI_SUCCESS == vmi_read_addr_va(drakvuf->vmi, current_list_entry, 0, next_list_entry) )
+    if ( VMI_SUCCESS == vmi_read_addr_va(drakvuf_vmi(drakvuf), current_list_entry, 0, next_list_entry) )
         return true;
 
     return false;
@@ -963,7 +963,7 @@ static bool win_process_is_alive(drakvuf_t drakvuf, addr_t eprocess_base)
         );
 
         uint32_t flags2;
-        if (VMI_SUCCESS == vmi_read_32(drakvuf->vmi, &ctx, &flags2))
+        if (VMI_SUCCESS == vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &flags2))
         {
             return !win_read_flag(drakvuf, flags2, EPROCESS_EXITPROCESSREPORTED);
         }
@@ -1118,7 +1118,7 @@ static bool enumerate_modules_visitor(drakvuf_t drakvuf, module_info_t* module_i
 
 bool win_enumerate_process_modules(drakvuf_t drakvuf, addr_t eprocess, process_const_module_visitor_t visitor_func, void* visitor_ctx)
 {
-    vmi_instance_t vmi = drakvuf->vmi;
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
     vmi_pid_t pid;
     addr_t dtb;
@@ -1182,16 +1182,16 @@ addr_t win_get_wow_peb( drakvuf_t drakvuf, access_context_t* ctx, addr_t eproces
     addr_t wow_process = 0 ;
     addr_t eprocess_wow64_addr = eprocess + drakvuf->offsets[EPROCESS_WOW64PROCESS];
 
-    if ( vmi_get_winver( drakvuf->vmi ) == VMI_OS_WINDOWS_10 )
+    if ( vmi_get_winver( drakvuf_vmi(drakvuf) ) == VMI_OS_WINDOWS_10 )
         eprocess_wow64_addr = eprocess + drakvuf->offsets[EPROCESS_WOW64PROCESS_WIN10];
 
-    if ( vmi_read_addr_va( drakvuf->vmi, eprocess_wow64_addr, 0, &wow_process ) == VMI_SUCCESS )
+    if ( vmi_read_addr_va( drakvuf_vmi(drakvuf), eprocess_wow64_addr, 0, &wow_process ) == VMI_SUCCESS )
     {
-        if ( vmi_get_winver( drakvuf->vmi ) == VMI_OS_WINDOWS_10 )
+        if ( vmi_get_winver( drakvuf_vmi(drakvuf) ) == VMI_OS_WINDOWS_10 )
         {
             ctx->addr = wow_process + drakvuf->offsets[EWOW64PROCESS_PEB] ;
 
-            if ( vmi_read_addr( drakvuf->vmi, ctx, &ret_peb_addr ) == VMI_FAILURE )
+            if ( vmi_read_addr( drakvuf_vmi(drakvuf), ctx, &ret_peb_addr ) == VMI_FAILURE )
                 ret_peb_addr = 0;
         }
         else
@@ -1216,22 +1216,22 @@ bool win_get_wow_context(drakvuf_t drakvuf, addr_t ethread, addr_t* wow_ctx)
         .addr = ethread + drakvuf->offsets[KTHREAD_TEB]
     );
 
-    if (vmi_read_addr(drakvuf->vmi, &ctx, &teb_ptr) != VMI_SUCCESS)
+    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &teb_ptr) != VMI_SUCCESS)
         return false;
 
     addr_t eprocess;
     ctx.addr = ethread + drakvuf->offsets[KTHREAD_PROCESS];
 
-    if (vmi_read_addr(drakvuf->vmi, &ctx, &eprocess) != VMI_SUCCESS)
+    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &eprocess) != VMI_SUCCESS)
         return false;
 
     addr_t wow64process;
     ctx.addr = eprocess + drakvuf->offsets[EPROCESS_WOW64PROCESS];
 
-    if ( vmi_get_winver( drakvuf->vmi ) == VMI_OS_WINDOWS_10 )
+    if ( vmi_get_winver( drakvuf_vmi(drakvuf) ) == VMI_OS_WINDOWS_10 )
         ctx.addr = eprocess + drakvuf->offsets[EPROCESS_WOW64PROCESS_WIN10];
 
-    if (vmi_read_addr(drakvuf->vmi, &ctx, &wow64process) != VMI_SUCCESS)
+    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &wow64process) != VMI_SUCCESS)
         return false;
 
     // seems like process is not a WOW64 process, so the data in TLS may be fake
@@ -1245,11 +1245,11 @@ bool win_get_wow_context(drakvuf_t drakvuf, addr_t ethread, addr_t* wow_ctx)
 
     ctx.translate_mechanism = VMI_TM_PROCESS_DTB;
 
-    if (vmi_pid_to_dtb(drakvuf->vmi, pid, &ctx.dtb) != VMI_SUCCESS)
+    if (vmi_pid_to_dtb(drakvuf_vmi(drakvuf), pid, &ctx.dtb) != VMI_SUCCESS)
         return false;
 
     addr_t self_teb_ptr;
-    if (vmi_read_addr(drakvuf->vmi, &ctx, &self_teb_ptr) != VMI_SUCCESS)
+    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &self_teb_ptr) != VMI_SUCCESS)
         return false;
 
     addr_t tls_slot;
@@ -1259,7 +1259,7 @@ bool win_get_wow_context(drakvuf_t drakvuf, addr_t ethread, addr_t* wow_ctx)
     addr_t tls_slot_val;
     ctx.addr = tls_slot;
 
-    if (vmi_read_addr(drakvuf->vmi, &ctx, &tls_slot_val) != VMI_SUCCESS)
+    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &tls_slot_val) != VMI_SUCCESS)
         return false;
 
     *wow_ctx = tls_slot_val + WOW64_CONTEXT_PAD;
@@ -1276,12 +1276,12 @@ bool win_get_user_stack64(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* 
         .addr = win_get_current_thread(drakvuf, info) + drakvuf->offsets[KTHREAD_TRAPFRAME]
     );
 
-    if (vmi_read_addr(drakvuf->vmi, &ctx, &ptrap_frame) != VMI_SUCCESS)
+    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &ptrap_frame) != VMI_SUCCESS)
         return false;
 
     ctx.addr = ptrap_frame + drakvuf->offsets[KTRAP_FRAME_RSP];
 
-    if (vmi_read_64(drakvuf->vmi, &ctx, &rsp) != VMI_SUCCESS)
+    if (vmi_read_64(drakvuf_vmi(drakvuf), &ctx, &rsp) != VMI_SUCCESS)
         return false;
 
     *stack_ptr = rsp;
@@ -1307,12 +1307,12 @@ bool win_get_user_stack32(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* 
         .addr = wow_ctx + drakvuf->wow_offsets[WOW_CONTEXT_ESP]
     );
 
-    if (vmi_read_32(drakvuf->vmi, &ctx, &esp) != VMI_SUCCESS)
+    if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &esp) != VMI_SUCCESS)
         return false;
 
     ctx.addr = wow_ctx + drakvuf->wow_offsets[WOW_CONTEXT_EBP];
 
-    if (vmi_read_32(drakvuf->vmi, &ctx, &ebp) != VMI_SUCCESS)
+    if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &ebp) != VMI_SUCCESS)
         return false;
 
     *stack_ptr = esp;
@@ -1404,7 +1404,7 @@ bool win_enumerate_processes_with_module( drakvuf_t drakvuf, const char* module_
                 .translate_mechanism = VMI_TM_PROCESS_DTB
             );
 
-            if ( vmi_pid_to_dtb( drakvuf->vmi, pid, &ctx.dtb ) == VMI_SUCCESS )
+            if ( vmi_pid_to_dtb( drakvuf_vmi(drakvuf), pid, &ctx.dtb ) == VMI_SUCCESS )
             {
                 addr_t wow_peb = win_get_wow_peb( drakvuf, &ctx, current_process ) ;
 
@@ -1474,7 +1474,7 @@ bool win_is_crashreporter(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_
 
 bool win_get_process_ppid( drakvuf_t drakvuf, addr_t process_base, vmi_pid_t* ppid )
 {
-    if ( VMI_SUCCESS == vmi_read_32_va( drakvuf->vmi, process_base + drakvuf->offsets[EPROCESS_INHERITEDPID], 0, (uint32_t*)ppid ) )
+    if ( VMI_SUCCESS == vmi_read_32_va( drakvuf_vmi(drakvuf), process_base + drakvuf->offsets[EPROCESS_INHERITEDPID], 0, (uint32_t*)ppid ) )
         return true;
 
     return false;
@@ -1514,7 +1514,7 @@ bool win_get_process_data( drakvuf_t drakvuf, addr_t base_addr, proc_data_priv_t
 
 static bool win_parse_mmvad(drakvuf_t drakvuf, addr_t node_addr, addr_t* left_child, addr_t* right_child, uint64_t* starting_vpn, uint64_t* ending_vpn, uint64_t* mmvad_core)
 {
-    bool is_win7 = vmi_get_winver( drakvuf->vmi ) <= VMI_OS_WINDOWS_7;
+    bool is_win7 = vmi_get_winver( drakvuf_vmi(drakvuf) ) <= VMI_OS_WINDOWS_7;
 
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_PID,
@@ -1535,7 +1535,7 @@ static bool win_parse_mmvad(drakvuf_t drakvuf, addr_t node_addr, addr_t* left_ch
         ctx.addr = node_addr + drakvuf->offsets[RTL_BALANCED_NODE_LEFT];
     }
 
-    if (vmi_read_addr(drakvuf->vmi, &ctx, left_child) != VMI_SUCCESS)
+    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, left_child) != VMI_SUCCESS)
     {
         return false;
     }
@@ -1549,7 +1549,7 @@ static bool win_parse_mmvad(drakvuf_t drakvuf, addr_t node_addr, addr_t* left_ch
         ctx.addr = node_addr + drakvuf->offsets[RTL_BALANCED_NODE_RIGHT];
     }
 
-    if (vmi_read_addr(drakvuf->vmi, &ctx, right_child) != VMI_SUCCESS)
+    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, right_child) != VMI_SUCCESS)
     {
         return false;
     }
@@ -1557,11 +1557,11 @@ static bool win_parse_mmvad(drakvuf_t drakvuf, addr_t node_addr, addr_t* left_ch
     if (is_win7)
     {
         ctx.addr = node_addr + drakvuf->offsets[MMVAD_STARTING_VPN];
-        if (vmi_read_addr(drakvuf->vmi, &ctx, starting_vpn) != VMI_SUCCESS)
+        if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, starting_vpn) != VMI_SUCCESS)
             return false;
 
         ctx.addr = node_addr + drakvuf->offsets[MMVAD_ENDING_VPN];
-        if (vmi_read_addr(drakvuf->vmi, &ctx, ending_vpn) != VMI_SUCCESS)
+        if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, ending_vpn) != VMI_SUCCESS)
             return false;
     }
     else
@@ -1569,28 +1569,28 @@ static bool win_parse_mmvad(drakvuf_t drakvuf, addr_t node_addr, addr_t* left_ch
         *mmvad_core = node_addr + drakvuf->offsets[MMVAD_CORE];
         ctx.addr = *mmvad_core + drakvuf->offsets[MMVAD_SHORT_STARTING_VPN];
 
-        if (vmi_read_32(drakvuf->vmi, &ctx, &starting_vpn_low) != VMI_SUCCESS)
+        if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &starting_vpn_low) != VMI_SUCCESS)
         {
             return false;
         }
 
         ctx.addr = *mmvad_core + drakvuf->offsets[MMVAD_SHORT_ENDING_VPN];
 
-        if (vmi_read_32(drakvuf->vmi, &ctx, &ending_vpn_low) != VMI_SUCCESS)
+        if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &ending_vpn_low) != VMI_SUCCESS)
         {
             return false;
         }
 
         ctx.addr = *mmvad_core + drakvuf->offsets[MMVAD_SHORT_STARTING_VPN_HIGH];
 
-        if (vmi_read_8(drakvuf->vmi, &ctx, &starting_vpn_high) != VMI_SUCCESS)
+        if (vmi_read_8(drakvuf_vmi(drakvuf), &ctx, &starting_vpn_high) != VMI_SUCCESS)
         {
             return false;
         }
 
         ctx.addr = *mmvad_core + drakvuf->offsets[MMVAD_SHORT_ENDING_VPN_HIGH];
 
-        if (vmi_read_8(drakvuf->vmi, &ctx, &ending_vpn_high) != VMI_SUCCESS)
+        if (vmi_read_8(drakvuf_vmi(drakvuf), &ctx, &ending_vpn_high) != VMI_SUCCESS)
         {
             return false;
         }
@@ -1610,7 +1610,7 @@ static bool win_parse_mmvad(drakvuf_t drakvuf, addr_t node_addr, addr_t* left_ch
 bool win_find_mmvad(drakvuf_t drakvuf, addr_t eprocess, addr_t vaddr, mmvad_info_t* out_mmvad)
 {
     int depth = 0;
-    bool is_win7 = vmi_get_winver( drakvuf->vmi ) <= VMI_OS_WINDOWS_7;
+    bool is_win7 = vmi_get_winver( drakvuf_vmi(drakvuf) ) <= VMI_OS_WINDOWS_7;
     bool is32bit = (drakvuf_get_page_mode(drakvuf) != VMI_PM_IA32E);
 
     int pool_tag_delta = is32bit ? POOL_TAG_SIZE_X86 : POOL_TAG_SIZE_X64;
@@ -1630,7 +1630,7 @@ bool win_find_mmvad(drakvuf_t drakvuf, addr_t eprocess, addr_t vaddr, mmvad_info
     {
         ctx.addr = eprocess + drakvuf->offsets[EPROCESS_VADROOT] + drakvuf->offsets[RTL_AVL_TREE_ROOT];
 
-        if (vmi_read_addr(drakvuf->vmi, &ctx, &node_addr) != VMI_SUCCESS)
+        if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &node_addr) != VMI_SUCCESS)
         {
             PRINT_DEBUG("MMVAD failed for node addr\n");
             return false;
@@ -1680,7 +1680,7 @@ bool win_find_mmvad(drakvuf_t drakvuf, addr_t eprocess, addr_t vaddr, mmvad_info
             if (is_win7)
             {
                 ctx.addr = node_addr + drakvuf->offsets[MMVAD_FLAGS];
-                if (vmi_read_64(drakvuf->vmi, &ctx, &flags) != VMI_SUCCESS)
+                if (vmi_read_64(drakvuf_vmi(drakvuf), &ctx, &flags) != VMI_SUCCESS)
                 {
                     return false;
                 }
@@ -1689,13 +1689,13 @@ bool win_find_mmvad(drakvuf_t drakvuf, addr_t eprocess, addr_t vaddr, mmvad_info
             {
                 ctx.addr = node_addr + drakvuf->offsets[MMVAD_SHORT_FLAGS];
                 uint32_t flags32 = 0;
-                if (vmi_read_32(drakvuf->vmi, &ctx, &flags32) != VMI_SUCCESS)
+                if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &flags32) != VMI_SUCCESS)
                 {
                     return false;
                 }
                 flags = flags32;
                 ctx.addr = mmvad_core + drakvuf->offsets[MMVAD_SHORT_FLAGS1];
-                if (vmi_read_32(drakvuf->vmi, &ctx, &flags1) != VMI_SUCCESS)
+                if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &flags1) != VMI_SUCCESS)
                 {
                     return false;
                 }
@@ -1703,7 +1703,7 @@ bool win_find_mmvad(drakvuf_t drakvuf, addr_t eprocess, addr_t vaddr, mmvad_info
 
             // read Windows' PoolTag which is 12 bytes before the actual object
             ctx.addr = node_addr - pool_tag_delta;
-            if (vmi_read_32(drakvuf->vmi, &ctx, &pool_tag) != VMI_SUCCESS)
+            if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &pool_tag) != VMI_SUCCESS)
             {
                 return false;
             }
@@ -1714,28 +1714,28 @@ bool win_find_mmvad(drakvuf_t drakvuf, addr_t eprocess, addr_t vaddr, mmvad_info
             {
                 ctx.addr = node_addr + drakvuf->offsets[MMVAD_SUBSECTION];
 
-                if (vmi_read_addr(drakvuf->vmi, &ctx, &subsection) == VMI_SUCCESS)
+                if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &subsection) == VMI_SUCCESS)
                 {
                     ctx.addr = subsection + drakvuf->offsets[SUBSECTION_CONTROL_AREA];
 
-                    if (vmi_read_addr(drakvuf->vmi, &ctx, &control_area) == VMI_SUCCESS)
+                    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &control_area) == VMI_SUCCESS)
                     {
                         out_mmvad->file_name_ptr = win_get_file_name_ptr_from_controlarea(drakvuf, control_area);
 
                         ctx.addr = control_area + drakvuf->offsets[CONTROL_AREA_SEGMENT];
 
-                        if (vmi_read_addr(drakvuf->vmi, &ctx, &segment) == VMI_SUCCESS)
+                        if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &segment) == VMI_SUCCESS)
                         {
-                            ctx.addr = control_area + drakvuf->offsets[SEGMENT_TOTALNUMBEROFPTES];
+                            ctx.addr = segment + drakvuf->offsets[SEGMENT_TOTALNUMBEROFPTES];
 
-                            if (vmi_read_32(drakvuf->vmi, &ctx, &ptes) == VMI_SUCCESS)
+                            if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &ptes) == VMI_SUCCESS)
                             {
                                 out_mmvad->total_number_of_ptes = ptes;
                             }
 
-                            ctx.addr = control_area + drakvuf->offsets[SEGMENT_PROTOTYPEPTE];
+                            ctx.addr = segment + drakvuf->offsets[SEGMENT_PROTOTYPEPTE];
 
-                            if (vmi_read_addr(drakvuf->vmi, &ctx, &prototype_pte) == VMI_SUCCESS)
+                            if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &prototype_pte) == VMI_SUCCESS)
                             {
                                 out_mmvad->prototype_pte = prototype_pte;
                             }
@@ -1766,7 +1766,7 @@ bool win_find_mmvad(drakvuf_t drakvuf, addr_t eprocess, addr_t vaddr, mmvad_info
 
 static bool win_traverse_mmvad_node(drakvuf_t drakvuf, addr_t node_addr, mmvad_callback callback, void* callback_data)
 {
-    bool is_win7 = vmi_get_winver( drakvuf->vmi ) <= VMI_OS_WINDOWS_7;
+    bool is_win7 = vmi_get_winver( drakvuf_vmi(drakvuf) ) <= VMI_OS_WINDOWS_7;
     bool is32bit = (drakvuf_get_page_mode(drakvuf) != VMI_PM_IA32E);
 
     int pool_tag_delta = is32bit ? POOL_TAG_SIZE_X86 : POOL_TAG_SIZE_X64;
@@ -1811,7 +1811,7 @@ static bool win_traverse_mmvad_node(drakvuf_t drakvuf, addr_t node_addr, mmvad_c
     if (is_win7)
     {
         ctx.addr = node_addr + drakvuf->offsets[MMVAD_FLAGS];
-        if (vmi_read_64(drakvuf->vmi, &ctx, &flags) != VMI_SUCCESS)
+        if (vmi_read_64(drakvuf_vmi(drakvuf), &ctx, &flags) != VMI_SUCCESS)
         {
             return false;
         }
@@ -1820,13 +1820,13 @@ static bool win_traverse_mmvad_node(drakvuf_t drakvuf, addr_t node_addr, mmvad_c
     {
         ctx.addr = node_addr + drakvuf->offsets[MMVAD_SHORT_FLAGS];
         uint32_t flags32 = 0;
-        if (vmi_read_32(drakvuf->vmi, &ctx, &flags32) != VMI_SUCCESS)
+        if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &flags32) != VMI_SUCCESS)
         {
             return false;
         }
         flags = flags32;
         ctx.addr = mmvad_core + drakvuf->offsets[MMVAD_SHORT_FLAGS1];
-        if (vmi_read_32(drakvuf->vmi, &ctx, &flags1) != VMI_SUCCESS)
+        if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &flags1) != VMI_SUCCESS)
         {
             return false;
         }
@@ -1834,7 +1834,7 @@ static bool win_traverse_mmvad_node(drakvuf_t drakvuf, addr_t node_addr, mmvad_c
 
     // read Windows' PoolTag which is 12 bytes before the actual object
     ctx.addr = node_addr - pool_tag_delta;
-    if (vmi_read_32(drakvuf->vmi, &ctx, &pool_tag) != VMI_SUCCESS)
+    if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &pool_tag) != VMI_SUCCESS)
     {
         return false;
     }
@@ -1845,29 +1845,29 @@ static bool win_traverse_mmvad_node(drakvuf_t drakvuf, addr_t node_addr, mmvad_c
     {
         ctx.addr = node_addr + drakvuf->offsets[MMVAD_SUBSECTION];
 
-        if (vmi_read_addr(drakvuf->vmi, &ctx, &subsection) == VMI_SUCCESS)
+        if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &subsection) == VMI_SUCCESS)
         {
             ctx.addr = subsection + drakvuf->offsets[SUBSECTION_CONTROL_AREA];
 
-            if (vmi_read_addr(drakvuf->vmi, &ctx, &control_area) == VMI_SUCCESS)
+            if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &control_area) == VMI_SUCCESS)
             {
                 mmvad.file_name_ptr = win_get_file_name_ptr_from_controlarea(drakvuf, control_area);
 
                 // FIXME We could get this fields form MMVAD.FirstPrototypePte and MMVAD.LastPrototypePte
                 ctx.addr = control_area + drakvuf->offsets[CONTROL_AREA_SEGMENT];
 
-                if (vmi_read_addr(drakvuf->vmi, &ctx, &segment) == VMI_SUCCESS)
+                if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &segment) == VMI_SUCCESS)
                 {
                     ctx.addr = segment + drakvuf->offsets[SEGMENT_TOTALNUMBEROFPTES];
 
-                    if (vmi_read_32(drakvuf->vmi, &ctx, &ptes) == VMI_SUCCESS)
+                    if (vmi_read_32(drakvuf_vmi(drakvuf), &ctx, &ptes) == VMI_SUCCESS)
                     {
                         mmvad.total_number_of_ptes = ptes;
                     }
 
                     ctx.addr = segment + drakvuf->offsets[SEGMENT_PROTOTYPEPTE];
 
-                    if (vmi_read_addr(drakvuf->vmi, &ctx, &prototype_pte) == VMI_SUCCESS)
+                    if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &prototype_pte) == VMI_SUCCESS)
                     {
                         mmvad.prototype_pte = prototype_pte;
                     }
@@ -1892,7 +1892,7 @@ static bool win_traverse_mmvad_node(drakvuf_t drakvuf, addr_t node_addr, mmvad_c
 
 bool win_traverse_mmvad(drakvuf_t drakvuf, addr_t eprocess, mmvad_callback callback, void* callback_data)
 {
-    bool is_win7 = vmi_get_winver( drakvuf->vmi ) <= VMI_OS_WINDOWS_7;
+    bool is_win7 = vmi_get_winver( drakvuf_vmi(drakvuf) ) <= VMI_OS_WINDOWS_7;
 
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_PID,
@@ -1909,7 +1909,7 @@ bool win_traverse_mmvad(drakvuf_t drakvuf, addr_t eprocess, mmvad_callback callb
     {
         ctx.addr = eprocess + drakvuf->offsets[EPROCESS_VADROOT] + drakvuf->offsets[RTL_AVL_TREE_ROOT];
 
-        if (vmi_read_addr(drakvuf->vmi, &ctx, &node_addr) != VMI_SUCCESS)
+        if (vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &node_addr) != VMI_SUCCESS)
         {
             PRINT_DEBUG("MMVAD failed for node addr\n");
             return false;
@@ -1924,7 +1924,7 @@ bool win_traverse_mmvad(drakvuf_t drakvuf, addr_t eprocess, mmvad_callback callb
 
 bool win_is_mmvad_commited(drakvuf_t drakvuf, mmvad_info_t* mmvad)
 {
-    bool is_win7 = vmi_get_winver( drakvuf->vmi ) <= VMI_OS_WINDOWS_7;
+    bool is_win7 = vmi_get_winver( drakvuf_vmi(drakvuf) ) <= VMI_OS_WINDOWS_7;
     int idx = is_win7 ? MMVAD_FLAGS_MEMCOMMIT : MMVAD_FLAGS1_MEMCOMMIT;
     uint64_t flags = is_win7 ? mmvad->flags : mmvad->flags1;
     return win_read_flag(drakvuf, flags, idx);
@@ -1932,7 +1932,7 @@ bool win_is_mmvad_commited(drakvuf_t drakvuf, mmvad_info_t* mmvad)
 
 uint64_t win_mmvad_commit_charge(drakvuf_t drakvuf, mmvad_info_t* mmvad, uint64_t* width)
 {
-    bool is_win7 = vmi_get_winver( drakvuf->vmi ) <= VMI_OS_WINDOWS_7;
+    bool is_win7 = vmi_get_winver( drakvuf_vmi(drakvuf) ) <= VMI_OS_WINDOWS_7;
     int idx = is_win7 ? MMVAD_FLAGS_COMMITCHARGE : MMVAD_FLAGS1_COMMITCHARGE;
     uint64_t flags = is_win7 ? mmvad->flags : mmvad->flags1;
     if (width)

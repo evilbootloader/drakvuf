@@ -708,6 +708,7 @@ struct linux_syscall_data : PluginResult
     std::string type;
     const syscall_t* sc;
     uint16_t num;
+    addr_t result_va = 0;
 };
 
 #define ENUM(name, number) { number, #name }

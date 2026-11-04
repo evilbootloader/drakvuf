@@ -113,8 +113,10 @@
 
 /* FIXME Could break analysis in general case
  *
- * If there exists other child process for the parent in return path from the
- * same system call then it could break thing during STEP4 or STEP5.
+ * check_userspace_int3_trap tells the child from other children of the parent
+ * by its address space and vfork's return value. A second vfork child in the
+ * same address space, from another thread of the parent calling vfork at the
+ * same time, would still be taken for it.
  */
 static event_response_t cleanup(linux_injector_t injector, x86_registers_t* regs);
 bool is_child_process(linux_injector_t injector,  drakvuf_trap_info_t* info)

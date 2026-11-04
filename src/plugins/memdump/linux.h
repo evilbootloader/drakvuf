@@ -225,6 +225,7 @@ enum vm_flags
 // Use system-defined PROT_* and CLONE_* macros
 #include <sys/mman.h>
 #include <sched.h>
+#include <mutex>
 
 class linux_memdump : public pluginex
 {
@@ -248,6 +249,11 @@ public:
 
     // Return hooks for async syscall results
     std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
+
+    // The syscall hook runs on several vCPU threads at once. The memory
+    // syscalls it handles take this: dumping shares the plugin's dump counter
+    // and temporary file.
+    std::mutex syscall_mtx;
 
     // Callbacks
     event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);

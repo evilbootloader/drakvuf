@@ -112,7 +112,7 @@ namespace libhook
 struct CallResult
 {
     CallResult()
-        : target_pid(), target_tid(), target_rsp(), hook_()
+        : target_pid(), target_tid(), target_rsp(), hook_(), callback_(), keep_alive_()
     {}
 
     virtual ~CallResult() = default;
@@ -130,7 +130,15 @@ struct CallResult
     vmi_pid_t target_pid;
     uint32_t target_tid;
     addr_t target_rsp;
+    // The hook owning the trap; nullptr once that hook is destroyed
     BaseHook* hook_;
+    // What the trap's cb runs. A copy of the hook's, kept here because a
+    // callback in flight on another vCPU thread outlives the hook object
+    // (libhook.hpp, 1)
+    cb_wrapper_t callback_;
+    // The destroyed hook's reference on these params, held until libdrakvuf
+    // frees the trap (detach_trap_params / release_trap_params below)
+    std::shared_ptr<CallResult> keep_alive_;
 };
 
 template<typename Params = CallResult>
@@ -156,11 +164,44 @@ Params* GetTrapParams(const drakvuf_trap_info_t* info)
     return GetTrapParams<Params>(info->trap);
 }
 
+// nullptr once the hook has been destroyed: the trap and its params outlive it (see below)
 template<typename Hook>
 Hook* GetTrapHook(const drakvuf_trap_info_t* info)
 {
     static_assert(std::is_base_of_v<BaseHook, Hook>, "Hook must derive from BaseHook");
     return dynamic_cast<Hook*>(GetTrapParams(info)->hook_);
+}
+
+/*
+ * The two halves of destroying a hook whose callback may be running on another
+ * vCPU thread (a trap marked mt_safe, with parallel events). libdrakvuf frees a
+ * removed trap only once every vCPU thread is idle, and the callback reaches
+ * everything it uses through trap->data: the params, and the std::function
+ * stored in them. So the hook's destructor hands its reference on the params to
+ * the params themselves and clears the back reference to the dying hook object
+ * (detach_trap_params), and the deferred free routine releases that reference
+ * (release_trap_params); a plugin still holding hook->params() is then the only
+ * thing keeping them. Until 2026-11-03 the destructor freed the params with the
+ * hook object at once, and an mt_safe callback on another vCPU ran on freed
+ * memory (review M-6).
+ */
+inline void detach_trap_params(const std::shared_ptr<CallResult>& params)
+{
+    if (!params)
+        return;
+    params->hook_ = nullptr;
+    params->keep_alive_ = params;
+}
+
+inline void release_trap_params(drakvuf_trap_t* trap)
+{
+    auto params = static_cast<CallResult*>(trap->data);
+    trap->data = nullptr;
+    if (params)
+    {
+        // The move empties keep_alive_ first; `last` then drops what may be the final reference
+        std::shared_ptr<CallResult> last = std::move(params->keep_alive_);
+    }
 }
 
 } // namespace libhook

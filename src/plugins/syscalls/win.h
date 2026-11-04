@@ -105,6 +105,12 @@
 #ifndef SYSCALLS_WIN_H
 #define SYSCALLS_WIN_H
 
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <unordered_map>
+#include <vector>
+
 #include "private.h"
 #include "private_2.h"
 
@@ -115,6 +121,8 @@ public:
 
     std::array<std::array<addr_t, 2>, 2> sst;
 
+    // Modules by pid, shared by the syscall callbacks of all vCPU threads
+    std::mutex procs_mtx;
     std::unordered_map<vmi_pid_t, std::vector<syscalls_ns::syscalls_module>> procs;
 
     addr_t image_path_name;
@@ -126,6 +134,34 @@ public:
     std::unique_ptr<libhook::SyscallHook> delete_process_hook;
     std::unique_ptr<libhook::ReturnHook> wait_process_creation_hook;
 
+    /*
+     * Dispatcher mode, on a 64-bit kernel: one breakpoint at KiSystemServiceCopyEnd instead of
+     * one per service table entry. Every syscall passes it once KiSystemServiceRepeat has looked
+     * its service routine up into r10: nt and win32k ones, from x64 and WoW64 processes, and Zw
+     * calls from the kernel. Returns are caught at KiSystemServiceExit.
+     */
+    struct dispatch_target
+    {
+        uint16_t num;
+        bool ntos;
+        const syscalls_ns::syscall_t* sc;
+        const char* name;
+    };
+    bool dispatcher = false;
+    addr_t dispatcher_exit = 0;         // KiSystemServiceExit
+    addr_t thread_syscall_number = 0;   // _KTHREAD.SystemCallNumber
+    addr_t thread_trap_frame = 0;       // _KTHREAD.TrapFrame
+    addr_t trap_frame_rsp = 0;          // _KTRAP_FRAME.Rsp
+    // Service routines by address. win32k's are added when its table is read, which may be after
+    // the breakpoint is placed. Stubs the linker folded into one routine share an address, whose
+    // entry lists all their numbers.
+    std::shared_mutex targets_mtx;
+    std::unordered_map<addr_t, std::vector<dispatch_target>> targets;
+    std::unique_ptr<libhook::SyscallHook> dispatcher_hook;
+
+    bool setup_dispatcher(drakvuf_t drakvuf, vmi_instance_t vmi);
+    event_response_t dispatcher_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+
     bool setup_win32k_syscalls(drakvuf_t drakvuf);
 
     event_response_t load_driver_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
@@ -134,7 +170,8 @@ public:
     event_response_t delete_process_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
     bool trap_syscall_table_entries(drakvuf_t drakvuf, vmi_instance_t vmi, addr_t cr3, bool ntos, addr_t base, std::array<addr_t, 2> _sst, json_object* json);
-    virtual char* win_extract_string(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::arg_t& arg, addr_t val);
+    char* win_extract_string(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::arg_t& arg, addr_t val) override;
+    void print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call) override;
 
     void print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int nr, const char* module, const syscalls_ns::syscall_t* sc, std::vector<uint64_t> args, privilege_mode_t mode, std::optional<std::string> from_dll, std::optional<std::string> from_parent_dll);
 
