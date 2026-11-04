@@ -241,7 +241,9 @@ void linux_filetracer::print_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
         drakvuf,
         info,
         keyval("Permissions", fmt::Rstr(to_oct_str(params->permissions))),
-        keyval("ThreadName", fmt::Rstr(thread_name)),
+        // Estr: the name is prctl(PR_SET_NAME)'s, and Rstr escapes only quotes
+        // and backslashes, so a newline in it split the JSON line (review L-13)
+        keyval("ThreadName", fmt::Estr(thread_name)),
         std::move(extra_args)
     );
 
@@ -1238,6 +1240,15 @@ std::string linux_filetracer::get_filename_from_fd(drakvuf_t drakvuf, drakvuf_tr
     if (VMI_FAILURE == vmi_read_addr_va(vmi, files_struct + this->offsets[_FILES_STRUCT_FDT], 0, &fdtable) || !fdtable)
         return "";
 
+    // fdtable->max_fds, then the index against it (2026-11-03, review M-4):
+    // the fd is the sample's number, and past the table it indexes whatever
+    // follows the array in kernel memory.
+    uint32_t max_fds = 0;
+    if (VMI_FAILURE == vmi_read_32_va(vmi, fdtable + this->offsets[_FDTABLE_MAX_FDS], 0, &max_fds))
+        return "";
+    if (fd < 0 || static_cast<uint64_t>(fd) >= max_fds)
+        return "";
+
     // fdtable->fd (struct file **fd)
     addr_t fd_array;
     if (VMI_FAILURE == vmi_read_addr_va(vmi, fdtable + this->offsets[_FDTABLE_FD], 0, &fd_array) || !fd_array)
@@ -1293,19 +1304,12 @@ void linux_filetracer::print_syscall_info(drakvuf_t drakvuf, drakvuf_trap_info_t
 // Runs on several vCPU threads at once: it only reads guest memory and the offsets found at startup
 event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    static std::atomic<int> cb_count{0};
-    if (int count = ++cb_count; count <= 3)
-        fprintf(stderr, "[FILETRACER] syscall_cb fired (count=%d) rdi=0x%lx rsi=0x%lx\n",
-            count, (unsigned long)info->regs->rdi, (unsigned long)info->regs->rsi);
-
     addr_t pt_regs_addr = 0;
     uint64_t nr = 0;
 
     if (!get_pt_regs_and_nr(drakvuf, info, &pt_regs_addr, &nr))
     {
-        static std::atomic<int> fail_count{0};
-        if (int count = ++fail_count; count <= 3)
-            fprintf(stderr, "[FILETRACER] get_pt_regs_and_nr failed (count=%d)\n", count);
+        PRINT_DEBUG("[FILETRACER] get_pt_regs_and_nr failed\n");
         return VMI_EVENT_RESPONSE_NONE;
     }
 
@@ -1568,7 +1572,7 @@ linux_filetracer::linux_filetracer(drakvuf_t drakvuf, output_format_t output) : 
     syscall_hook = createSyscallHook("do_syscall_64", &linux_filetracer::syscall_cb, "do_syscall_64", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
-        fprintf(stderr, "[FILETRACER] Hooked do_syscall_64\n");
+        PRINT_DEBUG("[FILETRACER] Hooked do_syscall_64\n");
         return;  // Success - no need for legacy hooks
     }
     fprintf(stderr, "[FILETRACER] do_syscall_64 hook failed, trying x64_sys_call\n");
@@ -1577,7 +1581,7 @@ linux_filetracer::linux_filetracer(drakvuf_t drakvuf, output_format_t output) : 
     syscall_hook = createSyscallHook("x64_sys_call", &linux_filetracer::syscall_cb, "x64_sys_call", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
-        fprintf(stderr, "[FILETRACER] Hooked x64_sys_call\n");
+        PRINT_DEBUG("[FILETRACER] Hooked x64_sys_call\n");
         return;  // Success - no need for legacy hooks
     }
     fprintf(stderr, "[FILETRACER] x64_sys_call hook failed\n");

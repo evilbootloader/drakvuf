@@ -179,7 +179,7 @@ auto ReturnHook::create(drakvuf_t drakvuf, drakvuf_trap_info* info, cb_wrapper_t
     trap->ttl = ttl;
     trap->cb = [](drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     {
-        return GetTrapHook<ReturnHook>(info)->callback_(drakvuf, info);
+        return GetTrapParams(info)->callback_(drakvuf, info);
     };
 
     // not using std::make_unique because ctor is private
@@ -193,6 +193,7 @@ auto ReturnHook::create(drakvuf_t drakvuf, drakvuf_trap_info* info, cb_wrapper_t
     // pupulate backref
     hook->params_ = std::make_shared<Params>();
     hook->params_->hook_ = hook.get();
+    hook->params_->callback_ = hook->callback_;
     hook->trap_->data = static_cast<void*>(hook->params_.get());
 
     if (!drakvuf_add_trap(drakvuf, hook->trap_))

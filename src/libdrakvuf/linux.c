@@ -115,6 +115,10 @@
 
 #include "private.h"
 #include "linux-exports.h"
+
+/* Most dentry components a path walk follows before it gives up: far above
+ * any real path, far below a hang (linux_get_filepath_from_dentry). */
+#define DENTRY_WALK_MAX 256
 #include "linux.h"
 #include "linux-offsets.h"
 #include "linux-offsets-map.h"
@@ -227,8 +231,14 @@ char* linux_get_filepath_from_dentry(drakvuf_t drakvuf, addr_t dentry_addr)
     GString* b = g_string_new(NULL);
 
     ctx.addr = dentry_addr + drakvuf->offsets[DENTRY_D_PARENT];
-    // TODO Bound this loop
-    while (VMI_SUCCESS == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &parent) && parent != dentry_addr)
+    /* Bounded (2026-11-03, review M-4): the chain is guest memory, and a
+     * struct file* a sample steered here used to walk a planted two-entry
+     * cycle for ever, growing the string each step, on that vCPU thread.
+     * No real path has anywhere near this many components; past the bound
+     * the partial path is returned, which records the walk rather than
+     * hanging it. */
+    unsigned depth = 0;
+    while (depth++ < DENTRY_WALK_MAX && VMI_SUCCESS == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &parent) && parent != dentry_addr)
     {
         gchar* name = NULL;
         addr_t qstr_str_addr;
@@ -401,6 +411,8 @@ bool set_os_linux(drakvuf_t drakvuf)
     drakvuf->osi.exportsym_to_va = linux_eprocess_sym2va;
     drakvuf->osi.exportsym_to_va_at_base = linux_module_sym2va;
     drakvuf->osi.get_auxv_value = linux_get_auxv_value;
+    drakvuf->osi.find_vma = linux_find_vma;
+    drakvuf->osi.find_vma_file = linux_find_vma_file;
     drakvuf->osi.module_span = linux_module_span;
     drakvuf->osi.exportsyms_to_va_at_base = linux_module_syms2va;
     drakvuf->osi.module_build_id = linux_module_build_id;

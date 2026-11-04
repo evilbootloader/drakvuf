@@ -169,7 +169,7 @@ auto MemAccessHook::create(drakvuf_t drakvuf, cb_wrapper_t cb, addr_t gfn, memac
     hook->trap_->ttl = ttl;
     hook->trap_->cb = [](drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     {
-        return GetTrapHook<MemAccessHook>(info)->callback_(drakvuf, info);
+        return GetTrapParams(info)->callback_(drakvuf, info);
     };
 
     static_assert(std::is_base_of_v<CallResult, Params>, "Params must derive from CallResult");
@@ -178,6 +178,7 @@ auto MemAccessHook::create(drakvuf_t drakvuf, cb_wrapper_t cb, addr_t gfn, memac
     // populate backref
     hook->params_ = std::make_shared<Params>();
     hook->params_->hook_ = hook.get();
+    hook->params_->callback_ = hook->callback_;
     hook->trap_->data = static_cast<void*>(hook->params_.get());
 
     if (!drakvuf_add_trap(drakvuf, hook->trap_))

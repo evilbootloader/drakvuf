@@ -202,6 +202,7 @@ auto SyscallHook::create(drakvuf_t drakvuf, const std::string& syscall_name, cb_
     // populate backref
     hook->params_ = std::make_shared<Params>();
     hook->params_->hook_ = hook.get();
+    hook->params_->callback_ = hook->callback_;
     hook->trap_->data = static_cast<void*>(hook->params_.get());
 
     if (!drakvuf_add_trap(drakvuf, hook->trap_))

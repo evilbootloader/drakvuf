@@ -559,6 +559,8 @@ void win_fileextractor::apply_deferred_writes(task_t& task)
             , task.deferred_writes.size(), task.pid, task.handle);
 
     task.deferred_writes.clear();
+    task.deferred_bytes = 0;
+    task.deferred_dropped = false;
 }
 
 // The handle was closed on another thread while an injected call of the task was in
@@ -612,10 +614,25 @@ event_response_t win_fileextractor::writefile_ret_cb(drakvuf_t drakvuf,
 
     if (task && task->injection_in_flight())
     {
+        // `len` is the guest's Length, up to 4 GiB; checked before a byte of
+        // it is read into Dom0's heap (private.h, DEFERRED_MAX_BYTES).
+        if (task->deferred_dropped || len > task_t::DEFERRED_MAX_BYTES - task->deferred_bytes)
+        {
+            if (!task->deferred_dropped)
+                print_extraction_failure(info, task->filename,
+                    "Writes during extraction exceeded the deferred-write cap; the copy is incomplete");
+            task->deferred_dropped = true;
+            PRINT_DEBUG("[FILEEXTRACTOR] [%8zu] [%d:%d] Dropped a deferred NtWriteFile of %" PRIu64 " bytes\n"
+                , info->event_uid
+                , info->attached_proc_data.pid, info->attached_proc_data.tid, len
+            );
+            return VMI_EVENT_RESPONSE_NONE;
+        }
         read_mem_chunks(info->regs->cr3, str, byteoffset, len,
             [task](uint64_t chunk_offset, const uint8_t* data, size_t chunk_size)
         {
             task->deferred_writes.emplace_back(chunk_offset, std::vector<uint8_t>(data, data + chunk_size));
+            task->deferred_bytes += chunk_size;
         });
         PRINT_DEBUG("[FILEEXTRACTOR] [%8zu] [%d:%d] Deferred NtWriteFile return\n"
             , info->event_uid

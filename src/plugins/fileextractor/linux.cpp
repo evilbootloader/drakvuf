@@ -129,6 +129,7 @@ static const char* linux_offset_names[][2] =
     {"task_struct", "files"},
     {"files_struct", "fdt"},
     {"fdtable", "fd"},
+    {"fdtable", "max_fds"},
     {"file", "f_path"},
     {"path", "dentry"},
 };
@@ -213,7 +214,7 @@ linux_fileextractor::linux_fileextractor(drakvuf_t drakvuf, const fileextractor_
     syscall_hook = createSyscallHook("do_syscall_64", &linux_fileextractor::syscall_cb, "do_syscall_64", UNLIMITED_TTL, true);
     if (syscall_hook)
     {
-        fprintf(stderr, "[FILEEXTRACTOR-LINUX] Hooked do_syscall_64\n");
+        PRINT_DEBUG("[FILEEXTRACTOR-LINUX] Hooked do_syscall_64\n");
     }
     else
     {
@@ -222,7 +223,7 @@ linux_fileextractor::linux_fileextractor(drakvuf_t drakvuf, const fileextractor_
         syscall_hook = createSyscallHook("x64_sys_call", &linux_fileextractor::syscall_cb, "x64_sys_call", UNLIMITED_TTL, true);
         if (syscall_hook)
         {
-            fprintf(stderr, "[FILEEXTRACTOR-LINUX] Hooked x64_sys_call\n");
+            PRINT_DEBUG("[FILEEXTRACTOR-LINUX] Hooked x64_sys_call\n");
         }
         else
         {
@@ -302,6 +303,16 @@ std::string linux_fileextractor::get_filename_from_fd(drakvuf_t drakvuf, drakvuf
     /* files->fdt */
     addr_t fdtable;
     if (VMI_FAILURE == vmi_read_addr_va(vmi, files_struct + this->offsets[FE_LINUX_FILES_STRUCT_FDT], 0, &fdtable) || !fdtable)
+        return "";
+
+    /* fdt->max_fds, then the index against it (2026-11-03, review M-4). The
+     * fd is the sample's number: past the table it indexes whatever follows
+     * the array in kernel memory, and the pointer found there is handed to
+     * the dentry walk as a struct file. */
+    uint32_t max_fds = 0;
+    if (VMI_FAILURE == vmi_read_32_va(vmi, fdtable + this->offsets[FE_LINUX_FDTABLE_MAX_FDS], 0, &max_fds))
+        return "";
+    if (fd < 0 || static_cast<uint64_t>(fd) >= max_fds)
         return "";
 
     /* fdt->fd (array of struct file*) */
@@ -386,18 +397,41 @@ std::string linux_fileextractor::make_dump_filename(const std::string& original_
     return std::string(buf);
 }
 
-bool linux_fileextractor::save_file_chunk(const std::string& dump_path, const std::vector<uint8_t>& data, bool append)
+bool linux_fileextractor::save_file_chunk(const std::string& dump_path, const std::vector<uint8_t>& data, bool append, int64_t at)
 {
-    std::ios_base::openmode mode = std::ios::binary;
-    if (append)
-        mode |= std::ios::app;
-    else
-        mode |= std::ios::trunc;
+    if (at < 0)
+    {
+        std::ios_base::openmode mode = std::ios::binary;
+        if (append)
+            mode |= std::ios::app;
+        else
+            mode |= std::ios::trunc;
 
-    std::ofstream file(dump_path, mode);
+        std::ofstream file(dump_path, mode);
+        if (!file.is_open())
+            return false;
+
+        file.write(reinterpret_cast<const char*>(data.data()), data.size());
+        return file.good();
+    }
+
+    /* A positioned write (pwrite64) lands where the guest put it, so the dump
+     * keeps the guest file's layout and a rewrite of one offset grows nothing
+     * on Dom0 (2026-11-03). Until then the offset was read and ignored and
+     * every pwrite was appended. The file is created first when it is new;
+     * `in | out` on its own refuses to create. */
+    std::fstream file(dump_path, std::ios::binary | std::ios::in | std::ios::out);
     if (!file.is_open())
-        return false;
-
+    {
+        std::ofstream create(dump_path, std::ios::binary | std::ios::trunc);
+        if (!create.is_open())
+            return false;
+        create.close();
+        file.open(dump_path, std::ios::binary | std::ios::in | std::ios::out);
+        if (!file.is_open())
+            return false;
+    }
+    file.seekp(static_cast<std::streamoff>(at));
     file.write(reinterpret_cast<const char*>(data.data()), data.size());
     return file.good();
 }
@@ -414,7 +448,9 @@ void linux_fileextractor::print_extraction_info(drakvuf_t drakvuf, drakvuf_trap_
         keyval("FileName", fmt::Estr(filename)),
         keyval("Size", fmt::Nval(size)),
         keyval("DumpFile", fmt::Estr(dump_path)),
-        keyval("ProcessName", fmt::Rstr(process_name ? process_name : ""))
+        // Estr: the name is prctl(PR_SET_NAME)'s, and Rstr escapes only quotes
+        // and backslashes, so a newline in it split the JSON line (review L-13)
+        keyval("ProcessName", fmt::Estr(process_name))
     );
 
     if (process_name)
@@ -483,6 +519,11 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
 
     std::lock_guard<std::mutex> lock(this->write_mtx);
 
+    /* Past the per-trace cap nothing more is extracted: not even tracked,
+     * since a tracking entry costs a path walk per new descriptor. */
+    if (this->total_capped)
+        return VMI_EVENT_RESPONSE_NONE;
+
     gint64 now = g_get_monotonic_time();
     auto ignored = ignored_fds.find(file_key);
     if (ignored != ignored_fds.end())
@@ -528,6 +569,35 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
 
     file_info_t& file_info = it->second;
 
+    if (file_info.capped)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    /* Where this write ends in the dump, and what it adds on Dom0's disk: a
+     * positioned write adds only what reaches past the current extent, so a
+     * sample rewriting the same 16 MiB adds nothing after the first time. The
+     * arithmetic is done so a huge offset cannot wrap past the cap. */
+    const bool positioned = (nr == __NR_pwrite64);
+    uint64_t extent;
+    if (positioned)
+        extent = (offset > MAX_FILE_BYTES || count > MAX_FILE_BYTES - offset) ? MAX_FILE_BYTES + 1 : offset + count;
+    else
+        extent = (count > MAX_FILE_BYTES - file_info.size) ? MAX_FILE_BYTES + 1 : file_info.size + count;
+    if (extent > MAX_FILE_BYTES)
+    {
+        file_info.capped = true;
+        print_extraction_info(drakvuf, info, file_info.filename, extent,
+            file_info.dump_path, "WriteFile past the per-file cap; this file is no longer extracted");
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+    const uint64_t added = extent > file_info.size ? extent - file_info.size : 0;
+    if (added > MAX_TOTAL_BYTES - this->extracted_total)
+    {
+        this->total_capped = true;
+        print_extraction_info(drakvuf, info, file_info.filename, this->extracted_total + added,
+            file_info.dump_path, "per-trace extraction cap reached; nothing more is extracted");
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
     /* Read buffer from guest memory */
     std::vector<uint8_t> buffer;
     if (!read_user_buffer(drakvuf, info, buf_addr, count, buffer))
@@ -538,9 +608,12 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
 
     /* Save to file */
     bool append = !file_info.is_new;
-    if (save_file_chunk(file_info.dump_path, buffer, append))
+    if (save_file_chunk(file_info.dump_path, buffer, append, positioned ? static_cast<int64_t>(offset) : -1))
     {
         file_info.total_bytes += buffer.size();
+        if (extent > file_info.size)
+            file_info.size = extent;
+        this->extracted_total += added;
         file_info.is_new = false;
 
         /* Print extraction info for first write or periodically */

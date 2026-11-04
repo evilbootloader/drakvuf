@@ -120,6 +120,8 @@
 
 #include "../xen_helper/xen_helper.h"
 
+#include <xenctrl.h>
+
 #include "private.h"
 #include "libdrakvuf.h"
 #include "vmi.h"
@@ -296,9 +298,71 @@ void process_free_requests(drakvuf_t drakvuf)
         drakvuf_free_removed_traps(drakvuf);
 }
 
+/* Re-arm one breakpoint in the refreshed shadow copy of its page */
+static bool reapply_breakpoint(vmi_instance_t vmi, struct memcb_pass* pass, addr_t pa, struct wrapper* s)
+{
+    drakvuf_t drakvuf = pass->drakvuf;
+    uint8_t test = 0;
+
+#ifdef DRAKVUF_DEBUG
+    for (GSList* t = s->traps; t; t = t->next)
+        trap_stats_shadow_copy(t->data);
+#endif
+
+    if ( VMI_FAILURE == vmi_read_8_pa(vmi, pa, &test) )
+    {
+        fprintf(stderr, "Critical error in re-copying remapped gfn\n");
+        drakvuf->interrupted = -1;
+        return 0;
+    }
+
+    if ( test == bp )
+    {
+        PRINT_DEBUG("Double-trap at 0x%lx\n", pa);
+        s->breakpoint.doubletrap = 1;
+        return 1;
+    }
+
+    s->breakpoint.doubletrap = 0;
+
+    /*
+     * If a write was observed near or at a breakpoint we automatically
+     * fall back to memory access permission based monitoring.
+     */
+    if ( pass->pa < pa && pass->pa >= pa-14 )
+    {
+        PRINT_DEBUG("Write happened near a breakpoint at 0x%lx, switching to mem X-based monitoring\n", pa);
+        remove_trap(drakvuf, &s->breakpoint.guard);
+        s->breakpoint.guard.memaccess.access |= VMI_MEMACCESS_X;
+        if ( !inject_trap_mem(drakvuf, &s->breakpoint.guard, 0) )
+            drakvuf->interrupted = -1;
+    }
+    else if ( VMI_FAILURE == vmi_write_8_pa(vmi, (pass->remapped_gfn->r << 12) + (pa & VMI_BIT_MASK(0, 11)), &bp) )
+    {
+        fprintf(stderr, "Failed to set breakpoint in post_mem_cb!\n");
+        drakvuf->interrupted = -1;
+        return 0;
+    }
+
+    return 1;
+}
+
 static bool refresh_shadow_copy(vmi_instance_t vmi, struct memcb_pass* pass)
 {
     drakvuf_t drakvuf = pass->drakvuf;
+
+    /*
+     * The page may have got its first breakpoint, and so its shadow copy,
+     * only after the write was intercepted. That copy was taken after the
+     * write and is current; a page without one has nothing to refresh.
+     * Looked up here rather than trusted from the pass for the same reason
+     * the list below is: what was recorded at the pre-write callback may be
+     * gone by now. This also covers the IDRX path, whose pass carries no
+     * remapped gfn when the page has none.
+     */
+    pass->remapped_gfn = (struct remapped_gfn*)g_hash_table_lookup(drakvuf->remapped_gfns, GSIZE_TO_POINTER(pass->gfn));
+    if (!pass->remapped_gfn)
+        return 1;
 
     PRINT_DEBUG("Re-copying remapped gfn\n");
 
@@ -321,7 +385,22 @@ static bool refresh_shadow_copy(vmi_instance_t vmi, struct memcb_pass* pass)
         return 0;
     }
 
-    GSList* loop = (GSList*)pass->traps;
+    /*
+     * pass->traps was looked up when the write was intercepted. Trap callbacks
+     * and the deferred removal may have removed breakpoints on this page
+     * since, which frees nodes of that list (remove_trap, g_slist_remove), so
+     * walk the CURRENT list instead and skip what is no longer a breakpoint.
+     * Upstream's d5b220de. Here the window is the common case rather than a
+     * corner: return_tracker removes transient return breakpoints on exactly
+     * the pages a packer writes, and under --parallel-events the removal is
+     * applied after the listen in which the post-write step event may still
+     * be pending -- so the stale list was walked after its nodes were freed.
+     * A reused node then holds a heap pointer as its pa, vmi_read_8_pa fails
+     * with "Critical error in re-copying remapped gfn" and the trace stops;
+     * a not-yet-reused one puts 0xCC into the shadow copy at a breakpoint
+     * that no longer exists.
+     */
+    GSList* loop = (GSList*)g_hash_table_lookup(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(pass->gfn));
 #ifdef DRAKVUF_DEBUG
     if (loop)
     {
@@ -331,51 +410,11 @@ static bool refresh_shadow_copy(vmi_instance_t vmi, struct memcb_pass* pass)
 #endif
     while (loop)
     {
-        uint8_t test = 0;
         addr_t pa = GPOINTER_TO_SIZE(loop->data);
         struct wrapper* s = (struct wrapper*)g_hash_table_lookup(drakvuf->breakpoint_lookup_pa, loop->data);
 
-#ifdef DRAKVUF_DEBUG
-        for (GSList* t = s ? s->traps : NULL; t; t = t->next)
-            trap_stats_shadow_copy(t->data);
-#endif
-
-        if ( VMI_FAILURE == vmi_read_8_pa(vmi, pa, &test) )
-        {
-            fprintf(stderr, "Critical error in re-copying remapped gfn\n");
-            drakvuf->interrupted = -1;
+        if ( s && !reapply_breakpoint(vmi, pass, pa, s) )
             return 0;
-        }
-
-        if ( test == bp )
-        {
-            PRINT_DEBUG("Double-trap at 0x%lx\n", pa);
-            s->breakpoint.doubletrap = 1;
-        }
-        else
-        {
-            s->breakpoint.doubletrap = 0;
-
-            /*
-             * If a write was observed near or at a breakpoint we automatically
-             * fall back to memory access permission based monitoring.
-             */
-            if ( pass->pa < pa && pass->pa >= pa-14 )
-            {
-                PRINT_DEBUG("Write happened near a breakpoint at 0x%lx, switching to mem X-based monitoring\n", pa);
-                remove_trap(drakvuf, &s->breakpoint.guard);
-                s->breakpoint.guard.memaccess.access |= VMI_MEMACCESS_X;
-                if ( !inject_trap_mem(drakvuf, &s->breakpoint.guard, 0) )
-                    drakvuf->interrupted = -1;
-
-            }
-            else if ( VMI_FAILURE == vmi_write_8_pa(vmi, (pass->remapped_gfn->r << 12) + (pa & VMI_BIT_MASK(0, 11)), &bp) )
-            {
-                fprintf(stderr, "Failed to set breakpoint in post_mem_cb!\n");
-                drakvuf->interrupted = -1;
-                return 0;
-            }
-        }
 
         loop = loop->next;
     }
@@ -446,9 +485,13 @@ static event_response_t _post_mem_cb(drakvuf_t drakvuf, vmi_event_t* event)
 
     /*
      * We need to copy the newly written page to the remapped gfn
-     * and reapply all traps
+     * and reapply all traps. pass->traps is set only for a write to a page
+     * that had breakpoints when the write was intercepted. Use it as that
+     * flag only: the list itself may have been freed since (refresh_shadow_copy).
      */
-    if ( pass->traps && !refresh_shadow_copy(drakvuf->vmi, pass) )
+    if ( pass->traps &&
+        g_hash_table_lookup(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(pass->gfn)) &&
+        !refresh_shadow_copy(drakvuf->vmi, pass) )
     {
         fprintf(stderr, "Failed to refresh shadow copy\n");
         drakvuf->interrupted = 1;
@@ -1377,6 +1420,23 @@ static event_response_t io_cb(vmi_instance_t vmi, vmi_event_t* event)
     return ret;
 }
 
+// Put the original byte back in the guest. A domain that is gone has nothing left to restore,
+// only the bookkeeping remains to be dropped
+static bool restore_breakpoint_byte(drakvuf_t drakvuf, const struct wrapper* container, const struct remapped_gfn* remapped_gfn)
+{
+    uint8_t backup;
+
+    if (drakvuf->domain_gone)
+        return true;
+
+    if (VMI_FAILURE == vmi_read_8_pa(drakvuf->vmi, container->breakpoint.pa, &backup))
+        return false;
+
+    return VMI_SUCCESS == vmi_write_8_pa(drakvuf->vmi,
+            (remapped_gfn->r << 12) + (container->breakpoint.pa & VMI_BIT_MASK(0, 11)),
+            &backup);
+}
+
 void remove_trap(drakvuf_t drakvuf,
     const drakvuf_trap_t* trap)
 {
@@ -1427,18 +1487,7 @@ void remove_trap(drakvuf_t drakvuf,
                     drakvuf->interrupted = -1;
                     break;
                 }
-                uint8_t backup;
-
-                if ( VMI_FAILURE == vmi_read_8_pa(drakvuf->vmi, container->breakpoint.pa, &backup) )
-                {
-                    fprintf(stderr, "Critical error in removing int3\n");
-                    drakvuf->interrupted = -1;
-                    break;
-                }
-
-                if ( VMI_FAILURE == vmi_write_8_pa(drakvuf->vmi,
-                        (remapped_gfn->r << 12) + (container->breakpoint.pa & VMI_BIT_MASK(0, 11)),
-                        &backup) )
+                if ( !restore_breakpoint_byte(drakvuf, container, remapped_gfn) )
                 {
                     fprintf(stderr, "Critical error in removing int3\n");
                     drakvuf->interrupted = -1;
@@ -1450,7 +1499,7 @@ void remove_trap(drakvuf_t drakvuf,
 
                 /* In the idrx view the only memaccess traps are for guard3 and guard4, so if no breakpoint traps left on the gfn
                  * we can just remove the idrx settings directly */
-                if ( !traps_on_gfn )
+                if ( !traps_on_gfn && !drakvuf->domain_gone )
                 {
                     if ( VMI_FAILURE == vmi_slat_change_gfn(vmi, drakvuf->altp2m_idrx, container->breakpoint.guard3.memaccess.gfn, ~(addr_t)0))
                     {
@@ -1482,7 +1531,7 @@ void remove_trap(drakvuf_t drakvuf,
 
             if (!container->traps)
             {
-                if ( VMI_SUCCESS == vmi_slat_change_gfn(vmi, drakvuf->altp2m_idx, container->memaccess.gfn, ~(addr_t)0))
+                if ( drakvuf->domain_gone || VMI_SUCCESS == vmi_slat_change_gfn(vmi, drakvuf->altp2m_idx, container->memaccess.gfn, ~(addr_t)0))
                 {
                     PRINT_DEBUG("Removed memtrap for GFN 0x%lx in altp2m view %u\n",
                         container->memaccess.gfn, drakvuf->altp2m_idx);
@@ -2156,6 +2205,39 @@ static status_t drain_ring(drakvuf_t drakvuf)
     return status;
 }
 
+/*
+ * Ask the toolstack whether the guest is still there, the same way xl learns about a guest-initiated reboot or
+ * power off. Returns true when it is not: the loop is interrupted with the matching exit reason and guest memory
+ * is not touched any more (the traps cannot be removed from a domain that no longer exists).
+ * Upstream 3ce4088c, ported 2026-11-03: without it a sample that rebooted or shut the guest down left the run
+ * going until its timeout, then one "Critical error in removing int3" per trap and `interrupted = -1`.
+ */
+static bool check_domain_gone(drakvuf_t drakvuf)
+{
+    static const char* reasons[] = { "poweroff", "reboot", "suspend", "crash", "watchdog", "soft reset" };
+    int reason = -1;
+
+    switch (xen_get_domain_state(drakvuf->xen, drakvuf->domID, &reason))
+    {
+        case XEN_DOMAIN_RUNNING:
+            return false;
+        case XEN_DOMAIN_SHUTDOWN:
+            // A suspended (xl save -c, migration) or soft-reset domain can run again: keep going, the traps still have to be removed
+            if (reason == SHUTDOWN_suspend || reason == SHUTDOWN_soft_reset)
+                return false;
+            fprintf(stderr, "Guest %s (domid %u) has shut down: %s\n", drakvuf->dom_name, drakvuf->domID,
+                (reason >= 0 && reason < 6) ? reasons[reason] : "unknown reason");
+            break;
+        case XEN_DOMAIN_GONE:
+            fprintf(stderr, "Guest %s (domid %u) is no longer running\n", drakvuf->dom_name, drakvuf->domID);
+            break;
+    }
+
+    drakvuf->domain_gone = true;
+    drakvuf->interrupted = (reason == SHUTDOWN_crash) ? SIGDRAKVUFKERNELPANIC : SIGDRAKVUFPOWEROFF;
+    return true;
+}
+
 void drakvuf_vmi_event_callback (int fd, void* data)
 {
     UNUSED(fd);
@@ -2176,7 +2258,7 @@ void drakvuf_vmi_event_callback (int fd, void* data)
     }
 
     status_t status = vmi_events_listen(drakvuf->vmi, drakvuf->poll_rc);
-    if (VMI_SUCCESS != status)
+    if (VMI_SUCCESS != status && !check_domain_gone(drakvuf))
     {
         PRINT_DEBUG("Error waiting for events or timeout, quitting...\n");
         drakvuf->interrupted = -1;
@@ -2197,8 +2279,9 @@ void drakvuf_vmi_event_callback (int fd, void* data)
          * cleared they'd find no handler and fail the next listen. So do the
          * same here.
          */
-        bool paused = clears_events && drakvuf_pause(drakvuf);
-        if (clears_events && !paused)
+        // A domain that is gone cannot be paused, and has no ring left to drain
+        bool paused = clears_events && !drakvuf->domain_gone && drakvuf_pause(drakvuf);
+        if (clears_events && !paused && !drakvuf->domain_gone)
             fprintf(stderr, "Failed to pause the VM to clear events of removed traps\n");
         if (paused)
             trap_stats_drain();
@@ -2287,7 +2370,11 @@ static void drakvuf_poll(drakvuf_t drakvuf, unsigned int timeout)
     drakvuf->poll_rc = rc;
 
     if (!rc && timeout)
+    {
+        // Nothing happened for a whole poll period: a guest that shut itself down produces no event at all
+        check_domain_gone(drakvuf);
         return;
+    }
 
     else if (rc < 0)
     {
@@ -2553,6 +2640,23 @@ bool init_vmi(drakvuf_t drakvuf, bool fast_singlestep)
 
 // -------------------------- closing
 
+/* Nothing to restore in a guest that is gone: drop the LibVMI instance without touching guest memory. */
+static void drop_vmi_of_gone_domain(drakvuf_t drakvuf)
+{
+    if (drakvuf->vmi && drakvuf->domain_gone)
+    {
+        // The fork's per-vCPU readers and worker threads first, as close_vmi
+        // does for a live domain: the caller holds the VMI lock, so what is
+        // left of the callbacks runs on this thread.
+        stop_parallel_events(drakvuf);
+        // While a generic mem_event is registered, LibVMI resets the access rights of every guest page on destroy: seconds of
+        // hypercalls for a domain that is gone, so drop the event first
+        vmi_clear_event(drakvuf->vmi, &drakvuf->mem_event, NULL);
+        vmi_destroy(drakvuf->vmi);
+        drakvuf->vmi = NULL;
+    }
+}
+
 void close_vmi(drakvuf_t drakvuf)
 {
     PRINT_DEBUG("close_vmi starting\n");
@@ -2560,6 +2664,8 @@ void close_vmi(drakvuf_t drakvuf)
     xen_pause(drakvuf->xen, drakvuf->domID);
 
     trap_stats_print();
+
+    drop_vmi_of_gone_domain(drakvuf);
 
     if (drakvuf->vmi)
     {

@@ -218,6 +218,15 @@ typedef struct os_interface
     addr_t (*module_span)
     (drakvuf_t drakvuf, addr_t process_addr, addr_t module_base);
 
+    /* Linux only: the VMA holding an address, from mm_struct.mmap. Left NULL
+     * on Windows, where drakvuf_find_mmvad answers the same question. */
+    bool (*find_vma)
+    (drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr, addr_t* vm_start, addr_t* vm_end);
+
+    /* Linux only: the kernel file object behind the VMA holding an address, 0 if anonymous */
+    bool (*find_vma_file)
+    (drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr, addr_t* vm_file);
+
     /* Linux only: several symbols in one pass, and the module's GNU build ID */
     bool (*exportsyms_to_va_at_base)
     (drakvuf_t drakvuf, addr_t process_addr, addr_t module_base, const char* const* syms, size_t count, addr_t* vas);

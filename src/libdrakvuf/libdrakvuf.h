@@ -718,6 +718,22 @@ addr_t drakvuf_get_auxv_value(drakvuf_t drakvuf, addr_t process_addr, uint64_t t
 
 addr_t drakvuf_get_module_span(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base) NOEXCEPT;
 
+/* The VMA holding vaddr, as [*vm_start, *vm_end), from mm_struct.mmap --
+ * the Linux counterpart of drakvuf_find_mmvad, for sizing a dump by what
+ * the kernel mapped rather than by what the sample asked for. False on
+ * Windows, on a kernel without the list (6.1 and later keep a maple tree,
+ * which a profile shows by having no mm_struct.mmap), when vaddr is in no
+ * VMA, or when a read fails; *vm_start and *vm_end are untouched then. The
+ * walk is bounded, since the list is guest memory. */
+bool drakvuf_linux_find_vma(drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr,
+    addr_t* vm_start, addr_t* vm_end) NOEXCEPT;
+
+/* The kernel's `struct file` behind the VMA holding vaddr, 0 for an anonymous
+ * mapping: equal for two addresses in mappings of the same file, and written
+ * by the kernel alone. False as drakvuf_linux_find_vma() is. */
+bool drakvuf_linux_find_vma_file(drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr,
+    addr_t* vm_file) NOEXCEPT;
+
 // Microsoft PreviousMode KTHREAD explanation:
 // https://msdn.microsoft.com/en-us/library/windows/hardware/ff559860(v=vs.85).aspx
 bool drakvuf_get_current_thread_previous_mode(drakvuf_t drakvuf,

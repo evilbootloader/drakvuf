@@ -765,6 +765,36 @@ addr_t drakvuf_get_auxv_value(drakvuf_t drakvuf, addr_t process_addr, uint64_t t
     return ret;
 }
 
+bool drakvuf_linux_find_vma(drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr,
+    addr_t* vm_start, addr_t* vm_end)
+{
+    bool ret = false;
+
+    if ( drakvuf->osi.find_vma )
+    {
+        drakvuf_reader_lock(drakvuf);
+        ret = drakvuf->osi.find_vma(drakvuf, process_addr, vaddr, vm_start, vm_end);
+        drakvuf_reader_unlock(drakvuf);
+    }
+
+    return ret;
+}
+
+bool drakvuf_linux_find_vma_file(drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr,
+    addr_t* vm_file)
+{
+    bool ret = false;
+
+    if ( drakvuf->osi.find_vma_file )
+    {
+        drakvuf_reader_lock(drakvuf);
+        ret = drakvuf->osi.find_vma_file(drakvuf, process_addr, vaddr, vm_file);
+        drakvuf_reader_unlock(drakvuf);
+    }
+
+    return ret;
+}
+
 bool drakvuf_exportsyms_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base,
     const char* const* syms, size_t count, addr_t* vas)
 {

@@ -337,6 +337,16 @@ public:
     // flight, applied once the extraction is done: the file offset and the data of the
     // writes that returned, in their order, and a close of the handle.
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> deferred_writes;
+    // What that vector holds, and whether any write had to be dropped. It is
+    // Dom0 heap filled at guest write speed for as long as the injection is
+    // in flight -- a large file's extraction spans many 1 MiB round trips --
+    // and until 2026-11-03 nothing bounded it (review M-5): two sample
+    // threads, one keeping the extraction busy and one rewriting the handle,
+    // grew it without limit. Past the cap the rest is dropped and the copy is
+    // reported incomplete (fileextractor_fail), never silently stale.
+    static constexpr uint64_t DEFERRED_MAX_BYTES = 64ULL << 20;
+    uint64_t deferred_bytes{0};
+    bool deferred_dropped{false};
     bool close_deferred{false};
 
     // The event being dispatched is the return of the task's injected call: only then

@@ -112,14 +112,10 @@ SyscallHook::~SyscallHook()
     {
         PRINT_DEBUG("[LIBHOOK] destroying syscall hook...\n");
         // read in libhook.hpp why this happens
-        this->trap_->cb = [](drakvuf_t, drakvuf_trap_info_t*) -> event_response_t
-        {
-            PRINT_DEBUG("[LIBHOOK] drakvuf called deleted hook, replaced by nullstub\n");
-            return VMI_EVENT_RESPONSE_NONE;
-        };
+        detach_trap_params(this->params_);
         drakvuf_remove_trap(this->drakvuf_, this->trap_, [](drakvuf_trap_t* trap)
         {
-            trap->data = nullptr;
+            release_trap_params(trap);
             delete trap;
         });
     }
@@ -160,7 +156,7 @@ drakvuf_trap_t* SyscallHook::createWindowsTrap(drakvuf_t drakvuf, const std::str
     trap->ttl = ttl;
     trap->cb = [](drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     {
-        return GetTrapHook<SyscallHook>(info)->callback_(drakvuf, info);
+        return GetTrapParams(info)->callback_(drakvuf, info);
     };
 
     return trap;
@@ -187,7 +183,7 @@ drakvuf_trap_t* SyscallHook::createLinuxTrap(drakvuf_t drakvuf, const std::strin
     trap->ttl = ttl;
     trap->cb = [](drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     {
-        return GetTrapHook<SyscallHook>(info)->callback_(drakvuf, info);
+        return GetTrapParams(info)->callback_(drakvuf, info);
     };
 
     return trap;

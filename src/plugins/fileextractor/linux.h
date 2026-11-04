@@ -170,6 +170,7 @@ private:
         FE_LINUX_TASK_STRUCT_FILES,
         FE_LINUX_FILES_STRUCT_FDT,
         FE_LINUX_FDTABLE_FD,
+        FE_LINUX_FDTABLE_MAX_FDS,
         FE_LINUX_FILE_F_PATH,
         FE_LINUX_PATH_DENTRY,
         __FE_LINUX_OFFSET_MAX
@@ -183,11 +184,33 @@ private:
         std::string filename;
         std::string dump_path;
         uint64_t total_bytes{0};
+        /* The dump's extent: the furthest byte any write reached. Not
+         * total_bytes, which counts bytes written and grows with every
+         * rewrite of the same offset. */
+        uint64_t size{0};
         int sequence_num{0};
         bool is_new{true};
+        /* Past MAX_FILE_BYTES: this descriptor's writes are dropped until it
+         * is closed, and the record that said so was printed once. */
+        bool capped{false};
     };
 
     std::map<std::pair<uint64_t, int>, file_info_t> tracked_files;
+
+    /* Caps in bytes (2026-11-03, review M-3). A guest write used to grow the
+     * dump by its length whatever its offset, with no bound per file or per
+     * trace: a loop of 16 MiB pwrites at offset 0 filled Dom0's disk while
+     * the guest file stayed 16 MiB. The per-file cap equals sandboxd's
+     * postprocessing limit for one extracted file
+     * (plugin_base.ExtractedConfigSection.max_single_extracted_size), which
+     * drops anything larger anyway. The per-trace cap is the operator's
+     * number: it bounds what a trace may write to Dom0's disk, and it is
+     * above postprocessing's max_total_extracted_size (512 MiB), which
+     * decides how much of it is packed and uploaded. */
+    static constexpr uint64_t MAX_FILE_BYTES = 128ULL << 20;
+    static constexpr uint64_t MAX_TOTAL_BYTES = 4096ULL << 20;
+    uint64_t extracted_total{0};
+    bool total_capped{false};
 
     /* Descriptors of pipes, sockets and the like, skipped without resolving
      * their path on every write. Forgotten after a while, since a descriptor
@@ -213,7 +236,8 @@ private:
     bool read_user_buffer(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t user_addr, size_t size, std::vector<uint8_t>& buffer);
     std::string sanitize_filename(const std::string& filename);
     std::string make_dump_filename(const std::string& original_name, int seq_num);
-    bool save_file_chunk(const std::string& dump_path, const std::vector<uint8_t>& data, bool append);
+    /* `at` >= 0 writes at that offset (pwrite64); -1 appends or truncates */
+    bool save_file_chunk(const std::string& dump_path, const std::vector<uint8_t>& data, bool append, int64_t at = -1);
 
     /* Output */
     void print_extraction_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info,

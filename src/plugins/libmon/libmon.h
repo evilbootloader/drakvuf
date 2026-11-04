@@ -163,6 +163,17 @@ private:
     std::optional<addr_t> find_shared_pa(drakvuf_t drakvuf, vmi_pid_t pid,
         const deferred_hook& target) const;
 
+    // Whether `va` may be breakpointed as a function of the library at
+    // `so_base` in the process: the two lie in mappings of the same file, by
+    // the kernel's VMA list, which the process cannot write. Both addresses
+    // came from the process's own link_map and .dynsym, which a sample can
+    // forge under a real library's build ID; unchecked, the breakpoint went
+    // wherever `va` pointed, and through find_shared_pa() into a page every
+    // process maps (review L-14, 2026-11-04). Without the list (Linux 6.1
+    // keeps a maple tree) only the PT_LOAD extent read at discovery bounds it.
+    bool within_library(drakvuf_t drakvuf, vmi_pid_t pid, addr_t proc_base,
+        addr_t so_base, addr_t va) const;
+
     // Remove the hooks of a process accepted by drop, and the breakpoints
     // with them once no process has a hook on them.
     template<typename Drop>

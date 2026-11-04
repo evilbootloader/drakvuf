@@ -346,6 +346,13 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
             continue;
         }
 
+        if (!this->within_library(drakvuf, so.pid, so.proc_base, so.base, va))
+        {
+            PRINT_DEBUG("[LIBMON] pid %d: %s!%s at 0x%lx is not in %s, not hooked\n", so.pid,
+                entry.dll_name.c_str(), entry.function_name.c_str(), va, so.path.c_str());
+            continue;
+        }
+
         if (this->place_hook(drakvuf, info, so.pid, so.dtb, entry, so.path, so.base, va))
             continue;
 
@@ -433,12 +440,39 @@ bool libmon::place_hook(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
     fmt::print(m_output_format, "libmon", drakvuf, nullptr,
         keyval("Event", fmt::Rstr("hook_placed")),
         keyval("PID", fmt::Nval(pid)),
-        keyval("Library", fmt::Qstr(so_path)),
+        // Estr, not Qstr: the path is link_map.l_name, which the process
+        // writes. Qstr escapes only quotes and backslashes, so a newline in it
+        // split the JSON line and hid the record from the parser (review L-13)
+        keyval("Library", fmt::Estr(so_path)),
         keyval("Function", fmt::Qstr(entry.function_name)),
         keyval("Address", fmt::Xval(va))
     );
 
     return true;
+}
+
+bool libmon::within_library(drakvuf_t drakvuf, vmi_pid_t pid, addr_t proc_base,
+    addr_t so_base, addr_t va) const
+{
+    addr_t mmap_rva = 0;
+    if (drakvuf_get_kernel_struct_member_rva(drakvuf, "mm_struct", "mmap", &mmap_rva))
+    {
+        addr_t so_file = 0, va_file = 0;
+        return drakvuf_linux_find_vma_file(drakvuf, proc_base, so_base, &so_file)
+            && drakvuf_linux_find_vma_file(drakvuf, proc_base, va, &va_file)
+            && so_file && so_file == va_file;
+    }
+
+    // No VMA list to ask. The extent is the library's own headers, which the
+    // same forger writes, so this is a bound and not a proof.
+    auto proc = this->libs.find(pid);
+    if (proc == this->libs.end())
+        return false;
+    auto so = proc->second.loaded.find(so_base);
+    if (so == proc->second.loaded.end())
+        return false;
+    addr_t end = so->second.end ? so->second.end : so_base + MODULE_SPAN_CAP;
+    return va >= so_base && va < end;
 }
 
 std::optional<addr_t> libmon::find_shared_pa(drakvuf_t drakvuf, vmi_pid_t pid,
@@ -461,6 +495,12 @@ std::optional<addr_t> libmon::find_shared_pa(drakvuf_t drakvuf, vmi_pid_t pid,
         for (const auto& [other_base, build_id] : other.build_ids)
         {
             if (build_id != target.build_id)
+                continue;
+
+            // The donor's own mapping must hold the address: the target's
+            // library, where the offset came from, can be a forgery carrying
+            // the donor's build ID (review L-14)
+            if (!this->within_library(drakvuf, other_pid, other.proc_base, other_base, other_base + offset))
                 continue;
 
             addr_t pa = 0;
@@ -522,6 +562,14 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
         {
             PRINT_DEBUG("[LIBMON] pid %d: %s doesn't define %s\n", pid, target->so_path.c_str(),
                 target->config->function_name.c_str());
+            target = targets.erase(target);
+            continue;
+        }
+
+        if (target->va && !this->within_library(drakvuf, pid, target->proc_base, target->so_base, target->va))
+        {
+            PRINT_DEBUG("[LIBMON] pid %d: %s at 0x%lx is not in %s, not hooked\n", pid,
+                target->config->function_name.c_str(), target->va, target->so_path.c_str());
             target = targets.erase(target);
             continue;
         }
@@ -806,15 +854,16 @@ void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     // rip is the hooked function when reporting at entry, and the caller's
     // return address when reporting at return -- so with return values on,
     // FromModule names whoever made the call, as it does in apimon.
-    std::optional<fmt::Qstr<std::string>> fmt_module;
+    // Estr for the two paths: both are link_map.l_name, written by the process (review L-13)
+    std::optional<fmt::Estr<std::string>> fmt_module;
     if (auto module = this->resolve_module(call_info.proc_data.pid, call_info.regs->rip))
-        fmt_module = fmt::Qstr(*module);
+        fmt_module = fmt::Estr(*module);
 
     // No Function field: the output formatters already emit the trap's name
     // as Method.
     fmt::print(m_output_format, "libmon", drakvuf, &call_info,
         keyval("Event", fmt::Rstr("api_called")),
-        keyval("Library", fmt::Qstr(so_path)),
+        keyval("Library", fmt::Estr(so_path)),
         keyval("CalledFrom", fmt::Xval(call_info.regs->rip)),
         keyval("ReturnValue", fmt_retval),
         keyval("FromModule", fmt_module),

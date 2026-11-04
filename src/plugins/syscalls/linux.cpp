@@ -214,7 +214,7 @@ std::vector<uint64_t> linux_syscalls::build_arguments_buffer(drakvuf_t drakvuf, 
                 ctx.addr = pt_regs_addr + this->regs[i];
                 if ( VMI_FAILURE == vmi_read_64(vmi, &ctx, &pt_regs[i]) )
                 {
-                    fprintf(stderr, "vmi_read_va(%p) failed\n", (void*)ctx.addr);
+                    PRINT_DEBUG("[SYSCALLS] vmi_read_64(%p) failed\n", (void*)ctx.addr);
                     return arguments;
                 }
             }
@@ -415,29 +415,13 @@ uint64_t linux_syscalls::syscall_result(drakvuf_t drakvuf, drakvuf_trap_info_t* 
 // syscalls of a dispatcher hook and are only read here.
 event_response_t linux_syscalls::linux_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
-    static std::atomic<int> cb_count{0};
-    if (cb_count.load(std::memory_order_relaxed) < 3)
-    {
-        int count = ++cb_count;
-        if (count <= 3)
-            fprintf(stderr, "[SYSCALLS] linux_cb fired (count=%d) trap=%s rdi=0x%lx rsi=0x%lx\n",
-                count, info->trap->name ? info->trap->name : "null",
-                (unsigned long)info->regs->rdi, (unsigned long)info->regs->rsi);
-    }
-
     addr_t pt_regs_addr = 0;
     addr_t nr = ~0;
 
     if (!get_pt_regs_addr(drakvuf, info, &pt_regs_addr, &nr))
     {
-        static std::atomic<int> fail_count{0};
-        if (fail_count.load(std::memory_order_relaxed) < 3)
-        {
-            int count = ++fail_count;
-            if (count <= 3)
-                fprintf(stderr, "[SYSCALLS] get_pt_regs_addr failed (count=%d) in %s\n",
-                    count, info->trap->name ? info->trap->name : "null");
-        }
+        PRINT_DEBUG("[SYSCALLS] get_pt_regs_addr failed in %s\n",
+            info->trap->name ? info->trap->name : "null");
         return VMI_EVENT_RESPONSE_NONE;
     }
 
@@ -685,6 +669,6 @@ linux_syscalls::linux_syscalls(drakvuf_t drakvuf, const syscalls_config* config,
     }
     else
     {
-        fprintf(stderr, "[SYSCALLS] Syscall table breakpoints set\n");
+        PRINT_DEBUG("[SYSCALLS] Syscall table breakpoints set\n");
     }
 }

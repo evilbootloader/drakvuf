@@ -115,6 +115,20 @@
 
 #define DUMP_NAME_PLACEHOLDER "(not configured)"
 
+// A request above this is answered with a record and no file. Every size
+// that reaches dump_memory_region is the guest's in the end -- a syscall
+// argument on Linux, NtWriteVirtualMemory's buffer length on Windows, a VAD
+// or VMA the sample laid out -- so without a ceiling a sample that asks
+// mprotect for a terabyte has this root process allocate a pointer per page,
+// 2^28 of them, and write a zero page to the dump directory for every page
+// that does not map, before the kernel has even refused the call. 64 MiB:
+// sandboxd's postprocessing drops any single dump above 32 MiB
+// (plugin_base.MemdumpConfigSection), so nothing the pipeline keeps is lost,
+// and the record still carries the size that was asked for, which is itself
+// a finding about the sample.
+#define DUMP_MAX_BYTES (64ULL << 20)
+#define DUMP_NAME_REFUSED "(not dumped: size above ceiling)"
+
 static void save_file_metadata(const proc_data_t* proc,
     const char* file_path,
     const char* data_file_name,
@@ -199,6 +213,14 @@ bool dump_memory_region(
     // attached to, on Linux the thread's own, as there is no attached process
     const proc_data_t* proc = drakvuf_get_os_type(drakvuf) == VMI_OS_WINDOWS ?
         &info->attached_proc_data : &info->proc_data;
+
+    if (len_bytes > DUMP_MAX_BYTES)
+    {
+        PRINT_DEBUG("[MEMDUMP] Refusing a %zu byte dump at 0x%" PRIx64 " (%s): above the %llu byte ceiling\n",
+            len_bytes, dump_addr, reason, (unsigned long long)DUMP_MAX_BYTES);
+        display_file = DUMP_NAME_REFUSED;
+        goto printout;
+    }
 
     if (!plugin->memdump_dir)
     {

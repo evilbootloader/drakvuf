@@ -142,6 +142,14 @@
 #define VM_EXEC		        0x00000004
 #define VM_SHARED	        0x00000008
 #define R_X86_64_GLOB_DAT	0x00000006
+// Bounds on walks over guest-authored chains (2026-11-03, reviews M-4 and
+// M-7). The VMA list and a module's dynamic section are guest memory; a
+// sample that controls them -- libmon resolves symbols in whatever its
+// link_map names -- used to cost this process an unbounded loop per attempt.
+// Both are far above anything real: a process has hundreds of VMAs, a
+// dynamic section a few dozen entries.
+#define VMA_WALK_MAX            65536
+#define DYNAMIC_ENTRIES_MAX     1024
 
 addr_t linux_eprocess_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib, const char* sym)
 {
@@ -172,6 +180,7 @@ addr_t linux_eprocess_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, const char
     addr_t vm_next, nullp = 0;
 
     addr_t text_segment_address = 0;
+    unsigned walked = 0;
     do
     {
         addr_t vm_start;
@@ -233,7 +242,7 @@ addr_t linux_eprocess_sym2va(drakvuf_t drakvuf, addr_t eprocess_base, const char
 next:
         mmap = vm_next;
 
-    } while (vm_next != nullp);
+    } while (vm_next != nullp && ++walked < VMA_WALK_MAX);
 
     if (text_segment_address == 0)
         return -1;
@@ -409,8 +418,15 @@ bool linux_module_syms2va(drakvuf_t drakvuf, addr_t eprocess_base, addr_t module
     ctx.addr = text_segment_address + dynamic_section_offset;
 
     addr_t word, ptr;
+    unsigned entries = 0;
     do
     {
+        // The section is guest memory the sample may have written: a fake
+        // library whose "dynamic section" is a gigabyte of non-zero words
+        // cost 2^27 reads per attempt here, repeated by libmon's deferred
+        // retries. A real one ends within a few dozen entries.
+        if (++entries > DYNAMIC_ENTRIES_MAX)
+            return false;
         if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &word))
             return false;
         ctx.addr += 0x8;
@@ -705,6 +721,7 @@ addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib)
         return -1;
 
     addr_t vm_next, nullp = 0;
+    unsigned walked = 0;
     do
     {
         addr_t vm_start;
@@ -750,9 +767,109 @@ addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib)
 next:
         mmap = vm_next;
 
-    } while (vm_next != nullp);
+    } while (vm_next != nullp && ++walked < VMA_WALK_MAX);
 
     return -1;
+}
+
+/*
+ * The VMA that contains vaddr, as [*start, *end). Only on a kernel that still
+ * keeps mm_struct.mmap and vm_area_struct.vm_next: 6.1 replaced the list with
+ * a maple tree. A profile without the member leaves its offset at 0, which is
+ * also the member's real offset on the kernels that have it (it is the first
+ * field of mm_struct there), so the profile is asked for the member rather
+ * than the offset tested. At most VMA_WALK_MAX entries are read: the list is
+ * guest memory, and a cycle planted in it must cost a bounded number of
+ * reads, never a vCPU thread for ever.
+ *
+ * Returns false when the kernel has no list, the address is in no VMA, or a
+ * read fails; *start and *end are untouched then.
+ *
+ * The walk is shared with linux_find_vma_file(): with `file` set, the VMA's
+ * vm_file (0 for an anonymous mapping) is read into it as well.
+ */
+static bool find_vma(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* start, addr_t* end, addr_t* file)
+{
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
+
+    addr_t mmap_rva = 0;
+    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "mm_struct", "mmap", &mmap_rva))
+        return false;
+
+    vmi_pid_t pid;
+    if (!drakvuf_get_process_pid(drakvuf, eprocess_base, &pid))
+        return false;
+
+    addr_t mm_struct_address;
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_PID,
+        .addr = eprocess_base + drakvuf->offsets[TASK_STRUCT_MMSTRUCT],
+        .pid = pid
+    );
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mm_struct_address) || !mm_struct_address)
+    {
+        ctx.addr = eprocess_base + drakvuf->offsets[TASK_STRUCT_ACTIVE_MMSTRUCT];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mm_struct_address) || !mm_struct_address)
+            return false;
+    }
+
+    addr_t vma;
+    ctx.addr = mm_struct_address + mmap_rva;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vma))
+        return false;
+
+    for (size_t n = 0; vma && n < VMA_WALK_MAX; n++)
+    {
+        addr_t vm_start, vm_end, vm_next;
+
+        ctx.addr = vma + drakvuf->offsets[VM_AREA_STRUCT_START];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vm_start))
+            return false;
+
+        ctx.addr = vma + drakvuf->offsets[VM_AREA_STRUCT_END];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vm_end))
+            return false;
+
+        if (vaddr >= vm_start && vaddr < vm_end)
+        {
+            if (file)
+            {
+                ctx.addr = vma + drakvuf->offsets[VM_AREA_STRUCT_FILE];
+                if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, file))
+                    return false;
+            }
+            *start = vm_start;
+            *end = vm_end;
+            return true;
+        }
+
+        ctx.addr = vma + drakvuf->offsets[VM_AREA_STRUCT_NEXT];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vm_next))
+            return false;
+
+        vma = vm_next;
+    }
+
+    return false;
+}
+
+bool linux_find_vma(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* start, addr_t* end)
+{
+    return find_vma(drakvuf, eprocess_base, vaddr, start, end, NULL);
+}
+
+/*
+ * The file behind the VMA holding vaddr, as the kernel's `struct file`
+ * address, 0 for an anonymous mapping. Two addresses in mappings of the same
+ * file give the same value, and no process can write the VMA list, which is
+ * what makes this the check that an address a process's own link_map and
+ * symbol table led to really lies in the library they named (libmon, review
+ * L-14). False as linux_find_vma() is.
+ */
+bool linux_find_vma_file(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* vm_file)
+{
+    addr_t start, end;
+    return find_vma(drakvuf, eprocess_base, vaddr, &start, &end, vm_file);
 }
 
 /*

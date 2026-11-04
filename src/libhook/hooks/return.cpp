@@ -120,17 +120,13 @@ ReturnHook::~ReturnHook()
     {
         PRINT_DEBUG("[LIBHOOK] destroying return hook...\n");
         // read in libhook.hpp why this happens
-        this->trap_->cb = [](drakvuf_t, drakvuf_trap_info_t*) -> event_response_t
-        {
-            PRINT_DEBUG("[LIBHOOK] drakvuf called deleted hook, replaced by nullstub\n");
-            return VMI_EVENT_RESPONSE_NONE;
-        };
+        detach_trap_params(this->params_);
         if (this->display_name_ != this->trap_->name)
         {
             g_free(this->display_name_);
             drakvuf_remove_trap(this->drakvuf_, this->trap_, [](drakvuf_trap_t* trap)
             {
-                trap->data = nullptr;
+                release_trap_params(trap);
                 delete trap;
             });
         }
@@ -138,7 +134,7 @@ ReturnHook::~ReturnHook()
         {
             drakvuf_remove_trap(this->drakvuf_, this->trap_, [](drakvuf_trap_t* trap)
             {
-                trap->data = nullptr;
+                release_trap_params(trap);
                 g_free(const_cast<char*>(trap->name));
                 delete trap;
             });

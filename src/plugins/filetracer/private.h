@@ -692,6 +692,7 @@ enum
     _TASK_STRUCT_FILES,
     _FILES_STRUCT_FDT,
     _FDTABLE_FD,
+    _FDTABLE_MAX_FDS,
 
     __LINUX_OFFSET_MAX,
 };
@@ -719,6 +720,7 @@ static const char* linux_offset_names[__LINUX_OFFSET_MAX][2] =
     [_TASK_STRUCT_FILES] = {"task_struct", "files"},
     [_FILES_STRUCT_FDT] = {"files_struct", "fdt"},
     [_FDTABLE_FD] = {"fdtable", "fd"},
+    [_FDTABLE_MAX_FDS] = {"fdtable", "max_fds"},
 };
 
 // Linux Inode Flags
