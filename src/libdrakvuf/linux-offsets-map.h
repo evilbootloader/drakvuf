@@ -131,6 +131,7 @@ static const char* linux_offset_names[__LINUX_OFFSETS_MAX][2] =
     [TASK_STRUCT_THREAD_PID] = {"task_struct", "thread_pid"},
     [TASK_STRUCT_SIGNAL] = {"task_struct", "signal"},
     [SIGNAL_STRUCT_PIDS] = {"signal_struct", "pids"},
+    [SIGNAL_STRUCT_LIVE] = {"signal_struct", "live"},
     [PID_LEVEL] = {"pid", "level"},
     [PID_NUMBERS] = {"pid", "numbers"},
     [PID_NAMESPACE_LEVEL] = {"pid_namespace", "level"},

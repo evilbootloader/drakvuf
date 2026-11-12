@@ -503,6 +503,21 @@ static bool linux_get_task_pgrp(drakvuf_t drakvuf, addr_t process_base, addr_t* 
     return true;
 }
 
+bool linux_get_process_live_threads(drakvuf_t drakvuf, addr_t process_base, uint32_t* live)
+{
+    addr_t signal;
+    if (!get_kernel_struct_field_pointer(drakvuf, process_base, TASK_STRUCT_SIGNAL, &signal))
+        return false;
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = drakvuf->kpgd,
+        .addr = signal + drakvuf->offsets[SIGNAL_STRUCT_LIVE]
+    );
+
+    return VMI_SUCCESS == vmi_read_32(drakvuf_vmi(drakvuf), &ctx, live);
+}
+
 static bool linux_get_ns_of_pid(drakvuf_t drakvuf, addr_t struct_pid, addr_t* ns)
 {
     ACCESS_CONTEXT(ctx,

@@ -397,6 +397,20 @@ bool drakvuf_get_process_group_id(drakvuf_t drakvuf, addr_t process_base, uint32
     return ret;
 }
 
+bool drakvuf_get_process_live_threads(drakvuf_t drakvuf, addr_t process_base, uint32_t* live)
+{
+    bool ret = false;
+
+    if ( drakvuf->osi.get_process_live_threads )
+    {
+        drakvuf_reader_lock(drakvuf);
+        ret = drakvuf->osi.get_process_live_threads(drakvuf, process_base, live);
+        drakvuf_reader_unlock(drakvuf);
+    }
+
+    return ret;
+}
+
 char* drakvuf_get_current_process_name(drakvuf_t drakvuf, drakvuf_trap_info_t* info, bool fullpath)
 {
     char* ret = NULL;

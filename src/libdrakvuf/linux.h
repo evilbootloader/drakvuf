@@ -120,6 +120,8 @@ bool linux_get_process_tid(drakvuf_t drakvuf, addr_t process_base, uint32_t* tid
 
 bool linux_get_process_pgid(drakvuf_t drakvuf, addr_t process_base, uint32_t* pgid);
 
+bool linux_get_process_live_threads(drakvuf_t drakvuf, addr_t process_base, uint32_t* live);
+
 char* linux_get_current_process_name(drakvuf_t drakvuf, drakvuf_trap_info_t* info, bool fullpath);
 
 int64_t linux_get_process_userid(drakvuf_t drakvuf, addr_t process_base);

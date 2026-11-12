@@ -794,6 +794,13 @@ bool linux_procdump::is_process_handled(vmi_pid_t pid)
 
 event_response_t linux_procdump::do_exit_cb(drakvuf_t drakvuf, drakvuf_trap_info* info)
 {
+    // do_exit runs once per thread: dump when the last one leaves, not while
+    // the process is still running. A count that cannot be read is taken as
+    // the last thread.
+    uint32_t live = 0;
+    if (drakvuf_get_process_live_threads(drakvuf, info->proc_data.base_addr, &live) && live > 1)
+        return VMI_EVENT_RESPONSE_NONE;
+
     if (!is_process_handled(info->proc_data.pid))
         start_dump_process(info->proc_data.pid, 1);
 

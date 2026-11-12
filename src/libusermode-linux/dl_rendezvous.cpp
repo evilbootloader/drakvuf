@@ -865,6 +865,13 @@ event_response_t dl_rendezvous::do_exit_cb(drakvuf_t drakvuf, drakvuf_trap_info_
     if (it == this->procs.end())
         return VMI_EVENT_RESPONSE_NONE;
 
+    // do_exit runs once per thread and `pid` is the tgid: the address space
+    // goes with the last thread, so the others leave the process tracked. A
+    // count that cannot be read is taken as the last thread.
+    uint32_t live = 0;
+    if (drakvuf_get_process_live_threads(drakvuf, info->proc_data.base_addr, &live) && live > 1)
+        return VMI_EVENT_RESPONSE_NONE;
+
     if (this->reset_cb)
         this->reset_cb(pid);
 

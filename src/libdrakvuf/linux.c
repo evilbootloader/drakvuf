@@ -405,6 +405,7 @@ bool set_os_linux(drakvuf_t drakvuf)
     drakvuf->osi.get_process_pid = linux_get_process_pid;
     drakvuf->osi.get_process_tid = linux_get_process_tid;
     drakvuf->osi.get_process_pgid = linux_get_process_pgid;
+    drakvuf->osi.get_process_live_threads = linux_get_process_live_threads;
     drakvuf->osi.get_process_ppid = linux_get_process_ppid;
     drakvuf->osi.get_process_data = linux_get_process_data;
     drakvuf->osi.get_process_dtb = linux_get_process_dtb;

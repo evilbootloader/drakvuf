@@ -590,6 +590,16 @@ bool drakvuf_get_process_group_id( drakvuf_t drakvuf,
     addr_t process_base,
     uint32_t* pgid) NOEXCEPT;
 
+/*
+ * Linux: how many threads of the task's thread group have not started to exit
+ * (signal_struct.live). At the entry of do_exit the exiting thread is still
+ * counted, so 1 there means the last thread, the one the address space goes
+ * with.
+ */
+bool drakvuf_get_process_live_threads( drakvuf_t drakvuf,
+    addr_t process_base,
+    uint32_t* live) NOEXCEPT;
+
 
 bool drakvuf_get_current_process_environ(drakvuf_t drakvuf,
     drakvuf_trap_info_t* info,
