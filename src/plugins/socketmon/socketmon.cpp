@@ -131,8 +131,12 @@
 #include <iostream>
 #include <cassert>
 
+#include <algorithm>
+#include <vector>
+
 #include "plugins/plugins.h"
 #include "plugins/output_format.h"
+#include "libusermode/printers/utils.hpp"
 
 #include "private.h"
 #include "socketmon.h"
@@ -837,6 +841,244 @@ static event_response_t trap_DnsQueryEx_cb(drakvuf_t drakvuf, drakvuf_trap_info_
     return 0;
 }
 
+/*
+ * AFD's control codes for a socket (_AFD_CONTROL_CODE: FILE_DEVICE_NETWORK
+ * shifted by 12, not by 16 as CTL_CODE does -- so 0x12003, not the
+ * 0x12000f of a CTL_CODE on the same device type, which NSI uses).
+ */
+#define IOCTL_AFD_BIND          0x12003
+#define IOCTL_AFD_CONNECT       0x12007
+#define IOCTL_AFD_START_LISTEN  0x1200B
+#define IOCTL_AFD_SEND          0x1201F
+
+// A send's bytes printed at most, as unixsocketmon's print_max_size default
+#define AFD_SEND_MAX            4096
+// Buffers of one send summed into its size at most
+#define AFD_SEND_MAX_BUFFERS    64
+
+// "203.0.113.7:443" or "[2001:db8::1]:443" (format_sockaddr) as address and port
+static bool split_endpoint(const std::string& text, std::string& ip, int& port)
+{
+    auto colon = text.rfind(':');
+    if (colon == std::string::npos || colon == 0)
+        return false;
+    ip = text.substr(0, colon);
+    if (ip.size() > 1 && ip.front() == '[' && ip.back() == ']')
+        ip = ip.substr(1, ip.size() - 2);
+    port = atoi(text.c_str() + colon + 1);
+    return true;
+}
+
+static bool is_text(const std::vector<uint8_t>& data)
+{
+    return !data.empty() && std::all_of(data.begin(), data.end(), [](uint8_t c)
+    {
+        return (c >= 0x20 && c < 0x7f) || c == '\t' || c == '\r' || c == '\n';
+    });
+}
+
+/*
+ * NTSTATUS NtDeviceIoControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+ *     IoStatusBlock, IoControlCode, InputBuffer, InputBufferLength, ...)
+ *
+ * mswsock's requests of AFD, which tcpip's hooks see only as far as a TCP
+ * connection or a UDP send: a bind and a listen (the sample serving), a
+ * connect before it completes or fails, a send's bytes. Read at the
+ * service's entry, in the caller's buffers.
+ *
+ * The structures are AFD's and undocumented; their layouts are the ones
+ * public AFD clients use (Windows 10 x64), pointer-sized fields 4 bytes in
+ * a 32-bit process, whose buffers AFD takes as they are. KNOWN GAP: not
+ * yet validated against a trace; an accept's peer and a receive's bytes
+ * exist only at the return and are not read.
+ */
+static event_response_t afd_ioctl_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    socketmon* s = (socketmon*)info->trap->data;
+    const uint32_t code = (uint32_t)drakvuf_get_function_argument(drakvuf, info, 6);
+    if (code != IOCTL_AFD_BIND && code != IOCTL_AFD_CONNECT && code != IOCTL_AFD_START_LISTEN && code != IOCTL_AFD_SEND)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    const addr_t handle = drakvuf_get_function_argument(drakvuf, info, 1);
+    const addr_t input = drakvuf_get_function_argument(drakvuf, info, 7);
+    const uint32_t input_length = (uint32_t)drakvuf_get_function_argument(drakvuf, info, 8);
+    if (!input || !input_length)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    // A socket is \Device\Afd\Endpoint: the same codes on another device
+    // are another driver's
+    char* filename = drakvuf_get_filename_from_handle(drakvuf, info, handle);
+    const bool afd = filename && g_str_has_suffix(filename, "Endpoint");
+    g_free(filename);
+    if (!afd)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    const bool is32 = drakvuf_get_address_width(drakvuf) == 4 || drakvuf_is_wow64(drakvuf, info);
+    const size_t ptr_size = is32 ? 4 : 8;
+    const auto key = std::make_pair(info->proc_data.pid, (uint64_t)handle);
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3
+    );
+    // This vCPU's reader instance, its translations of the caller's address
+    // space flushed: another vCPU may have changed them since
+    {
+        vmi_reader_guard vmi(drakvuf);
+        vmi_v2pcache_flush(vmi, info->regs->cr3);
+    }
+    auto read_ptr = [&](addr_t addr, addr_t& value) -> bool
+    {
+        vmi_reader_guard vmi(drakvuf);
+        ctx.addr = addr;
+        if (is32)
+        {
+            uint32_t v = 0;
+            if (VMI_SUCCESS != vmi_read_32(vmi, &ctx, &v))
+                return false;
+            value = v;
+            return true;
+        }
+        return VMI_SUCCESS == vmi_read_64(vmi, &ctx, &value);
+    };
+    auto read_32 = [&](addr_t addr, uint32_t& value) -> bool
+    {
+        vmi_reader_guard vmi(drakvuf);
+        ctx.addr = addr;
+        return VMI_SUCCESS == vmi_read_32(vmi, &ctx, &value);
+    };
+    std::string ip;
+    int port = -1;
+    auto read_sockaddr = [&](size_t offset) -> bool
+    {
+        if (offset >= input_length)
+            return false;
+        uint8_t buf[28] = {};   // sockaddr_in6, the largest an AFD socket has
+        size_t got = 0;
+        {
+            vmi_reader_guard vmi(drakvuf);
+            ctx.addr = input + offset;
+            vmi_read(vmi, &ctx, std::min<size_t>(sizeof(buf), input_length - offset), buf, &got);
+        }
+        auto text = format_sockaddr(buf, got, false);
+        return text && split_endpoint(*text, ip, port);
+    };
+
+    // The record is named after the request, not after the service
+    drakvuf_trap_t trap = *info->trap;
+    drakvuf_trap_info_t call_info = *info;
+    call_info.trap = &trap;
+
+    std::lock_guard<std::mutex> lock(s->afd_mtx);
+    if (s->afd_bound.size() > 4096)
+        s->afd_bound.clear();
+    if (s->afd_peers.size() > 4096)
+        s->afd_peers.clear();
+
+    switch (code)
+    {
+        case IOCTL_AFD_BIND:
+            // { ULONG ShareType; SOCKADDR Address; }
+            if (!read_sockaddr(4))
+                break;
+            s->afd_bound[key] = { ip, port };
+            trap.name = "AfdBind";
+            fmt::print(s->format, "socketmon", drakvuf, &call_info,
+                keyval("LocalIp", fmt::Estr(ip)),
+                keyval("LocalPort", fmt::Nval(port))
+            );
+            break;
+        case IOCTL_AFD_CONNECT:
+            // { BOOLEAN UseSAN; HANDLE Root; ULONG_PTR Unknown; SOCKADDR
+            // RemoteAddress; }, each field pointer-aligned
+            if (!read_sockaddr(3 * ptr_size))
+                break;
+            s->afd_peers[key] = { ip, port };
+            trap.name = "AfdConnect";
+            fmt::print(s->format, "socketmon", drakvuf, &call_info,
+                keyval("RemoteIp", fmt::Estr(ip)),
+                keyval("RemotePort", fmt::Nval(port))
+            );
+            break;
+        case IOCTL_AFD_START_LISTEN:
+        {
+            // { BOOLEAN UseSAN; ULONG Backlog; BOOLEAN UseDelayedAcceptance; }
+            uint32_t backlog = 0;
+            read_32(input + 4, backlog);
+            auto bound = s->afd_bound.find(key);
+            trap.name = "AfdListen";
+            if (bound != s->afd_bound.end())
+                fmt::print(s->format, "socketmon", drakvuf, &call_info,
+                    keyval("LocalIp", fmt::Estr(bound->second.first)),
+                    keyval("LocalPort", fmt::Nval(bound->second.second)),
+                    keyval("Backlog", fmt::Nval(backlog))
+                );
+            else
+                fmt::print(s->format, "socketmon", drakvuf, &call_info,
+                    keyval("Backlog", fmt::Nval(backlog))
+                );
+            break;
+        }
+        case IOCTL_AFD_SEND:
+        {
+            // { PAFD_WSABUF BufferArray; ULONG BufferCount; ULONG AfdFlags;
+            // ULONG TdiFlags; }, AFD_WSABUF { ULONG len; PCHAR buf; }
+            addr_t array = 0;
+            uint32_t count = 0;
+            if (!read_ptr(input, array) || !array || !read_32(input + ptr_size, count) || !count)
+                break;
+            uint64_t size = 0;
+            uint32_t first_len = 0;
+            addr_t first_buf = 0;
+            for (uint32_t i = 0; i < count && i < AFD_SEND_MAX_BUFFERS; ++i)
+            {
+                const addr_t wsabuf = array + i * 2 * ptr_size;
+                uint32_t len = 0;
+                addr_t buf = 0;
+                if (!read_32(wsabuf, len) || !read_ptr(wsabuf + ptr_size, buf))
+                    break;
+                if (i == 0)
+                {
+                    first_len = len;
+                    first_buf = buf;
+                }
+                size += len;
+            }
+            std::vector<uint8_t> data(std::min<uint32_t>(first_len, AFD_SEND_MAX));
+            size_t got = 0;
+            if (first_buf && !data.empty())
+            {
+                vmi_reader_guard vmi(drakvuf);
+                ctx.addr = first_buf;
+                vmi_read(vmi, &ctx, data.size(), data.data(), &got);
+            }
+            data.resize(got);
+            trap.name = "AfdSend";
+            auto peer = s->afd_peers.find(key);
+            const std::string rip = peer != s->afd_peers.end() ? peer->second.first : "";
+            const int rport = peer != s->afd_peers.end() ? peer->second.second : 0;
+            if (is_text(data))
+                fmt::print(s->format, "socketmon", drakvuf, &call_info,
+                    keyval("RemoteIp", fmt::Estr(rip)),
+                    keyval("RemotePort", fmt::Nval(rport)),
+                    keyval("Size", fmt::Nval(size)),
+                    keyval("Value", fmt::Estr(std::string(data.begin(), data.end())))
+                );
+            else
+                fmt::print(s->format, "socketmon", drakvuf, &call_info,
+                    keyval("RemoteIp", fmt::Estr(rip)),
+                    keyval("RemotePort", fmt::Nval(rport)),
+                    keyval("Size", fmt::Nval(size)),
+                    keyval("Value", fmt::BinaryString(data.data(), data.size()))
+                );
+            break;
+        }
+        default:
+            break;
+    }
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
 static void register_tcpip_trap( drakvuf_t drakvuf, json_object* tcpip_profile_json, const char* function_name,
     drakvuf_trap_t* trap,
     event_response_t(*hook_cb)( drakvuf_t drakvuf, drakvuf_trap_info_t* info ) )
@@ -1004,6 +1246,17 @@ socketmon::socketmon(drakvuf_t drakvuf_, const socketmon_config* c, output_forma
     register_tcpip_trap(drakvuf, tcpip_profile_json, "UdpSendMessages", &this->tcpip_trap[1], udp_send_cb);
 
     json_object_put(tcpip_profile_json);
+
+    // AFD's requests: optional, the TCP and UDP hooks above stand without them
+    if (drakvuf_get_kernel_symbol_rva(drakvuf, "NtDeviceIoControlFile", &this->afd_trap.breakpoint.rva))
+    {
+        this->afd_trap.cb = afd_ioctl_cb;
+        this->afd_trap.ttl = drakvuf_get_limited_traps_ttl(drakvuf);
+        this->afd_trap.mt_safe = true;
+        this->afd_hooked = drakvuf_add_trap(drakvuf, &this->afd_trap);
+    }
+    if (!this->afd_hooked)
+        fprintf(stderr, "[SOCKETMON] Failed to hook NtDeviceIoControlFile, AFD binds, listens and sends are not recorded\n");
 }
 
 socketmon::~socketmon()
@@ -1015,5 +1268,7 @@ bool socketmon::stop_impl()
 {
     drakvuf_remove_trap(drakvuf, &this->tcpip_trap[0], nullptr);
     drakvuf_remove_trap(drakvuf, &this->tcpip_trap[1], nullptr);
+    if (this->afd_hooked)
+        drakvuf_remove_trap(drakvuf, &this->afd_trap, nullptr);
     return drakvuf_stop_userhooks(drakvuf);
 }

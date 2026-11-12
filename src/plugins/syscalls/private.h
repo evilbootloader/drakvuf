@@ -116,6 +116,8 @@ struct syscalls_module
     std::string name;
     addr_t base;
     size_t size;
+    // Windows: the base of a second mapping of a system DLL, 0 for Windows' own (resolve_module)
+    addr_t copy = 0;
 };
 
 typedef enum

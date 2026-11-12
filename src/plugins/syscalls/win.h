@@ -129,6 +129,39 @@ public:
     std::string win32k_profile;
     bool win32k_initialized;
 
+    // An address (0 when unknown), the module it lies in -- nothing when it could not be looked
+    // up, "" for memory no file backs -- and the base of that module when it is a second mapping
+    // of a system DLL (resolve_module in win.cpp)
+    struct frame
+    {
+        addr_t address = 0;
+        std::optional<std::string> module;
+        addr_t copy = 0;
+    };
+    /*
+     * Who made a syscall (get_origin in win.cpp). From user mode, the first two frames of the
+     * thread's user stack: `caller` the instruction after `syscall`, `parent` what the stub that
+     * ran it returns to. When `caller` is in an ntdll or win32u stub: `stub_syscall` the service
+     * that stub is for, when the thread called another; `call_target` what the call before
+     * `parent` called, when it was not that stub but the stub past its start, or a syscall stub
+     * of its own. `bitness`, for a WoW64 process: 32 when these are the frames of the 32-bit call
+     * WoW64 made the syscall for, 64 when they are 64-bit code's; 0 for a 64-bit process.
+     */
+    struct syscall_origin
+    {
+        privilege_mode_t mode = MAXIMUM_MODE;
+        frame caller;
+        frame parent;
+        std::optional<uint32_t> stub_syscall;
+        frame call_target;
+        int bitness = 0;
+    };
+    // _CONTEXT.Eip and .Esp in the 32-bit ntdll's profile; 0 without one
+    addr_t wow64_context_eip = 0;
+    addr_t wow64_context_esp = 0;
+    // Where Windows mapped each system DLL, by lowercased path: the first mapping seen of it
+    std::unordered_map<std::string, addr_t> system_dll_bases;
+
     std::unique_ptr<libhook::SyscallHook> load_driver_hook;
     std::unique_ptr<libhook::SyscallHook> create_process_hook;
     std::unique_ptr<libhook::SyscallHook> delete_process_hook;
@@ -149,7 +182,7 @@ public:
     };
     bool dispatcher = false;
     addr_t dispatcher_exit = 0;         // KiSystemServiceExit
-    addr_t thread_syscall_number = 0;   // _KTHREAD.SystemCallNumber
+    addr_t thread_syscall_number = 0;   // _KTHREAD.SystemCallNumber, also read for get_origin
     addr_t thread_trap_frame = 0;       // _KTHREAD.TrapFrame
     addr_t trap_frame_rsp = 0;          // _KTRAP_FRAME.Rsp
     // Service routines by address. win32k's are added when its table is read, which may be after
@@ -173,7 +206,7 @@ public:
     char* win_extract_string(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::arg_t& arg, addr_t val) override;
     void print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call) override;
 
-    void print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int nr, const char* module, const syscalls_ns::syscall_t* sc, std::vector<uint64_t> args, privilege_mode_t mode, std::optional<std::string> from_dll, std::optional<std::string> from_parent_dll);
+    void print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int nr, const char* module, const syscalls_ns::syscall_t* sc, std::vector<uint64_t> args, const syscall_origin& origin);
 
     win_syscalls(drakvuf_t drakvuf, const syscalls_config* config, output_format_t output);
     ~win_syscalls();

@@ -457,6 +457,24 @@ static char* get_parent_folder(char const* file_name)
 void win_filetracer::print_delete_file_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint32_t handle, addr_t fileinfo)
 {
     const char* operation_name = "FileDispositionInformation";
+
+    // FILE_DISPOSITION_INFORMATION.DeleteFile: FALSE takes a pending delete
+    // back, so the class alone does not say the file is deleted.
+    uint8_t delete_file = 0;
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3,
+            .addr = fileinfo
+        );
+        if ( VMI_FAILURE == vmi_read_8(vmi, &ctx, &delete_file) )
+        {
+            PRINT_DEBUG("[FILETRACER] failed to read FILE_DISPOSITION_INFORMATION\n");
+            return;
+        }
+    }
+
     char* file = drakvuf_get_filename_from_handle(drakvuf, info, handle);
     if ( !file )
         return;
@@ -464,7 +482,10 @@ void win_filetracer::print_delete_file_info(drakvuf_t drakvuf, drakvuf_trap_info
     fmt::print(this->m_output_format, "filetracer", drakvuf, info,
         keyval("Operation", fmt::Rstr(operation_name)),
         keyval("FileName", fmt::Qstr(file)),
-        keyval("FileHandle", fmt::Xval(handle))
+        keyval("FileHandle", fmt::Xval(handle)),
+        // A BOOLEAN: any non-zero byte deletes. As an int -- Nval of a
+        // uint8_t writes the byte itself, which is not a JSON number.
+        keyval("DeleteFile", fmt::Nval(static_cast<int>(delete_file != 0)))
     );
 
     g_free(file);

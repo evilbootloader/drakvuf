@@ -105,6 +105,11 @@
 #ifndef SOCKETMON_H
 #define SOCKETMON_H
 
+#include <map>
+#include <mutex>
+#include <string>
+#include <utility>
+
 #include <libusermode/userhook.hpp>
 #include "plugins/plugins.h"
 #include "private.h"
@@ -136,6 +141,28 @@ public:
             .ah_cb = nullptr
         }
     };
+
+    // NtDeviceIoControlFile, for the requests mswsock makes of AFD for a
+    // socket -- bind, connect, listen, send -- whoever made them: an API, a
+    // direct syscall, a sample talking to \Device\Afd itself (afd_ioctl_cb)
+    drakvuf_trap_t afd_trap =
+    {
+        .breakpoint.lookup_type = LOOKUP_PID,
+        .breakpoint.pid = 4,
+        .breakpoint.addr_type = ADDR_RVA,
+        .breakpoint.module = "ntoskrnl.exe",
+        .name = "NtDeviceIoControlFile",
+        .type = BREAKPOINT,
+        .data = (void*)this,
+        .ah_cb = nullptr
+    };
+    bool afd_hooked = false;
+    // Where each AFD socket was bound and connected, by process and handle:
+    // a listen's local end and a send's remote end. The trap is mt_safe --
+    // every device request on the guest passes it -- so these are locked.
+    std::mutex afd_mtx;
+    std::map<std::pair<vmi_pid_t, uint64_t>, std::pair<std::string, int>> afd_bound;
+    std::map<std::pair<vmi_pid_t, uint64_t>, std::pair<std::string, int>> afd_peers;
 
     drakvuf_trap_t dnsapi_traps[6] =
     {

@@ -105,6 +105,7 @@ private:
         const plugin_target_config_entry_t* config;
         std::string so_path;
         std::vector<uint64_t> arguments;
+        addr_t ret_addr;
     };
 
     void on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so);
@@ -120,7 +121,7 @@ private:
     void on_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const hooked_function& target);
 
     void print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
-        const plugin_target_config_entry_t& config, const std::string& so_path,
+        const plugin_target_config_entry_t& config, const std::string& so_path, addr_t ret_addr,
         const std::vector<uint64_t>& arguments, std::optional<uint64_t> return_value);
 
     // Which library an address lies in, or nothing if it lies in none. Tested

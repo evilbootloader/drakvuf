@@ -104,10 +104,13 @@
 
 #include "printers.hpp"
 #include "utils.hpp"
+#include <algorithm>
 #include <array>
 #include <string>
 #include <sstream>
 #include <iomanip>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 #include <libvmi/libvmi.h>
 #include <libdrakvuf/libdrakvuf.h>
 #include "plugins/plugins.h"
@@ -134,6 +137,22 @@ std::string ArgumentPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, u
 }
 
 ArgumentPrinter::~ArgumentPrinter() {}
+
+NarrowIntegerPrinter::NarrowIntegerPrinter(std::string arg_name, unsigned bits, PrinterConfig config) :
+    ArgumentPrinter(std::move(arg_name), config), bits(bits)
+{
+    // intentionally empty
+}
+
+std::string NarrowIntegerPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    return ArgumentPrinter::print(drakvuf, info, value(drakvuf, info, argument));
+}
+
+uint64_t NarrowIntegerPrinter::value(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    return argument & ((1ULL << bits) - 1);
+}
 
 std::string StringPrinterInterface::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
 {
@@ -215,6 +234,11 @@ std::string UnicodePrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, ui
 
 std::string UlongPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
 {
+    return ArgumentPrinter::print(drakvuf, info, value(drakvuf, info, argument));
+}
+
+uint64_t UlongPrinter::value(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB,
         .dtb = info->regs->cr3,
@@ -224,10 +248,15 @@ std::string UlongPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint
     uint32_t value;
     if (vmi_read_32(vmi, &ctx, &value) != VMI_SUCCESS)
         value = 0;
-    return ArgumentPrinter::print(drakvuf, info, value);
+    return value;
 }
 
 std::string UlongLongPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    return ArgumentPrinter::print(drakvuf, info, value(drakvuf, info, argument));
+}
+
+uint64_t UlongLongPrinter::value(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
 {
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB,
@@ -238,10 +267,62 @@ std::string UlongLongPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, 
     uint64_t value;
     if (vmi_read_64(vmi, &ctx, &value) != VMI_SUCCESS)
         value = 0;
-    return ArgumentPrinter::print(drakvuf, info, value);
+    return value;
+}
+
+std::string SockaddrPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument
+    );
+    // The largest decoded: sockaddr_un, a family and a 108-byte path. What
+    // precedes an unmapped page is still read, and enough for a short one.
+    uint8_t buf[2 + 108] = {};
+    size_t got = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        vmi_read(vmi, &ctx, sizeof(buf), buf, &got);
+    }
+
+    auto text = format_sockaddr(buf, got, drakvuf_get_os_type(drakvuf) == VMI_OS_LINUX);
+    if (!text)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    std::stringstream stream;
+    stream << name << "=";
+    if (!config.print_no_addr)
+        stream << "0x" << std::hex << argument << ":";
+    stream << "\"" << escape_str(*text) << "\"";
+    return stream.str();
+}
+
+std::string PointerToSockaddrPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument
+    );
+    addr_t sockaddr = 0;
+    if (drakvuf_read_addr(drakvuf, info, &ctx, &sockaddr) != VMI_SUCCESS || !sockaddr)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+    return SockaddrPrinter::print(drakvuf, info, sockaddr);
 }
 
 std::string PointerToPointerPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    return ArgumentPrinter::print(drakvuf, info, value(drakvuf, info, argument));
+}
+
+uint64_t PointerToPointerPrinter::value(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
 {
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB,
@@ -253,8 +334,419 @@ std::string PointerToPointerPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info*
     int ret = drakvuf_read_addr(drakvuf, info, &ctx, &value);
     if (ret != VMI_SUCCESS)
         value = 0;
+    return value;
+}
 
-    return ArgumentPrinter::print(drakvuf, info, value);
+// -- buffers and the structures signatures read through -----------------------
+
+BufferPrinter::BufferPrinter(std::string arg_name, std::string length_name, bool output, PrinterConfig config) :
+    ArgumentPrinter(std::move(arg_name), config), length_name(std::move(length_name)), output(output)
+{
+    // intentionally empty
+}
+
+std::string BufferPrinter::print_bytes(const std::string& name, const PrinterConfig& config, uint64_t argument,
+    const uint8_t* data, size_t size)
+{
+    std::stringstream stream;
+    stream << name << "=";
+    if (!config.print_no_addr)
+        stream << "0x" << std::hex << argument << ":";
+    stream << "\"" << escape_bytes(data, size) << "\"";
+    return stream.str();
+}
+
+std::string BufferPrinter::print_sized(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument, uint64_t length) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+    std::vector<uint8_t> data(std::min<uint64_t>(length, MAX_BYTES));
+    size_t got = 0;
+    if (!data.empty())
+    {
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3,
+            .addr = argument
+        );
+        vmi_reader_guard vmi(drakvuf);
+        // What precedes an unmapped page is printed: a partial buffer
+        vmi_read(vmi, &ctx, data.size(), data.data(), &got);
+    }
+    return print_bytes(name, config, argument, data.data(), got);
+}
+
+std::string WsaBufPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    // WSABUF { ULONG len; CHAR* buf; }: the pointer at 4 or 8
+    const bool is32 = drakvuf_process_is32bit(drakvuf, info);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument
+    );
+    uint32_t len = 0;
+    addr_t buf = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        if (vmi_read_32(vmi, &ctx, &len) != VMI_SUCCESS)
+            return ArgumentPrinter::print(drakvuf, info, argument);
+    }
+    ctx.addr = argument + (is32 ? 4 : 8);
+    if (drakvuf_read_addr(drakvuf, info, &ctx, &buf) != VMI_SUCCESS || !buf)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    std::vector<uint8_t> data(std::min<uint64_t>(len, BufferPrinter::MAX_BYTES));
+    size_t got = 0;
+    if (!data.empty())
+    {
+        ctx.addr = buf;
+        vmi_reader_guard vmi(drakvuf);
+        vmi_read(vmi, &ctx, data.size(), data.data(), &got);
+    }
+    return BufferPrinter::print_bytes(name, config, argument, data.data(), got);
+}
+
+std::string SecBufferDescPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    // SecBufferDesc { ULONG ulVersion; ULONG cBuffers; PSecBuffer pBuffers; }
+    // SecBuffer { ULONG cbBuffer; ULONG BufferType; PVOID pvBuffer; }: the
+    // pointers at 8 on both widths, a SecBuffer 12 bytes on 32-bit, 16 on 64
+    const bool is32 = drakvuf_process_is32bit(drakvuf, info);
+    const size_t secbuffer_size = is32 ? 12 : 16;
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument + 4
+    );
+    uint32_t count = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        if (vmi_read_32(vmi, &ctx, &count) != VMI_SUCCESS)
+            return ArgumentPrinter::print(drakvuf, info, argument);
+    }
+    addr_t buffers = 0;
+    ctx.addr = argument + 8;
+    if (drakvuf_read_addr(drakvuf, info, &ctx, &buffers) != VMI_SUCCESS || !buffers)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    for (uint32_t i = 0; i < std::min(count, MAX_BUFFERS); ++i)
+    {
+        const addr_t entry = buffers + i * secbuffer_size;
+        uint32_t header[2] = {};    // cbBuffer, BufferType
+        size_t got = 0;
+        ctx.addr = entry;
+        {
+            vmi_reader_guard vmi(drakvuf);
+            if (vmi_read(vmi, &ctx, sizeof(header), header, &got) != VMI_SUCCESS || got != sizeof(header))
+                break;
+        }
+        if ((header[1] & ~SECBUFFER_ATTRMASK) != SECBUFFER_DATA)
+            continue;
+
+        addr_t data_addr = 0;
+        ctx.addr = entry + 8;
+        if (drakvuf_read_addr(drakvuf, info, &ctx, &data_addr) != VMI_SUCCESS || !data_addr)
+            break;
+        std::vector<uint8_t> data(std::min<uint64_t>(header[0], BufferPrinter::MAX_BYTES));
+        got = 0;
+        if (!data.empty())
+        {
+            ctx.addr = data_addr;
+            vmi_reader_guard vmi(drakvuf);
+            vmi_read(vmi, &ctx, data.size(), data.data(), &got);
+        }
+        return BufferPrinter::print_bytes(name, config, argument, data.data(), got);
+    }
+    return ArgumentPrinter::print(drakvuf, info, argument);
+}
+
+std::string ClientIdPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    // CLIENT_ID { HANDLE UniqueProcess; HANDLE UniqueThread; }
+    const size_t width = drakvuf_get_process_address_width(drakvuf, info);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument
+    );
+    addr_t pid = 0, tid = 0;
+    if (drakvuf_read_addr(drakvuf, info, &ctx, &pid) != VMI_SUCCESS)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+    ctx.addr = argument + width;
+    if (drakvuf_read_addr(drakvuf, info, &ctx, &tid) != VMI_SUCCESS)
+        tid = 0;
+
+    std::stringstream stream;
+    stream << name << "=";
+    if (!config.print_no_addr)
+        stream << "0x" << std::hex << argument << ":";
+    stream << "\"" << std::dec << pid << ":" << tid << "\"";
+    return stream.str();
+}
+
+std::string LargeIntegerPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument
+    );
+    uint64_t value = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        if (vmi_read_64(vmi, &ctx, &value) != VMI_SUCCESS)
+            return ArgumentPrinter::print(drakvuf, info, argument);
+    }
+    std::stringstream stream;
+    stream << name << "=";
+    if (!config.print_no_addr)
+        stream << "0x" << std::hex << argument << ":";
+    stream << "\"" << std::dec << static_cast<int64_t>(value) << "\"";
+    return stream.str();
+}
+
+namespace
+{
+
+// Reads of one call's process memory, at its pointer width
+struct process_reader
+{
+    drakvuf_t drakvuf;
+    drakvuf_trap_info* info;
+    bool is32;
+
+    bool ptr(addr_t addr, addr_t& value) const
+    {
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3,
+            .addr = addr
+        );
+        value = 0;
+        return VMI_SUCCESS == drakvuf_read_addr(drakvuf, info, &ctx, &value);
+    }
+    size_t bytes(addr_t addr, void* buf, size_t size) const
+    {
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3,
+            .addr = addr
+        );
+        size_t got = 0;
+        vmi_reader_guard vmi(drakvuf);
+        vmi_read(vmi, &ctx, size, buf, &got);
+        return got;
+    }
+};
+
+// Lists walked at most: a resolver's answers, an argv
+constexpr unsigned MAX_NODES = 32;
+constexpr unsigned MAX_ARGV = 64;
+constexpr size_t MAX_ARGV_TEXT = 4096;
+
+std::string quoted(const std::string& name, const PrinterConfig& config, uint64_t argument, const std::string& text)
+{
+    std::stringstream stream;
+    stream << name << "=";
+    if (!config.print_no_addr)
+        stream << "0x" << std::hex << argument << ":";
+    stream << "\"" << escape_str(text) << "\"";
+    return stream.str();
+}
+
+// "203.0.113.7:443" -> "203.0.113.7", "[2001:db8::1]:0" -> "2001:db8::1"
+std::string address_only(const std::string& endpoint)
+{
+    auto colon = endpoint.rfind(':');
+    std::string ip = colon == std::string::npos ? endpoint : endpoint.substr(0, colon);
+    if (ip.size() > 1 && ip.front() == '[' && ip.back() == ']')
+        ip = ip.substr(1, ip.size() - 2);
+    return ip;
+}
+
+void add_unique(std::vector<std::string>& list, const std::string& value)
+{
+    if (!value.empty() && std::find(list.begin(), list.end(), value) == list.end())
+        list.push_back(value);
+}
+
+std::string joined(const std::vector<std::string>& list, const char* separator)
+{
+    std::string out;
+    for (const auto& item : list)
+        out += (out.empty() ? "" : separator) + item;
+    return out;
+}
+
+} // namespace
+
+AddrinfoPrinter::AddrinfoPrinter(std::string arg_name, bool ex, PrinterConfig config) :
+    ArgumentPrinter(std::move(arg_name), config), ex(ex)
+{
+    // intentionally empty
+}
+
+std::string AddrinfoPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    const bool linux = drakvuf_get_os_type(drakvuf) == VMI_OS_LINUX;
+    const process_reader read{ drakvuf, info, drakvuf_process_is32bit(drakvuf, info) };
+    const size_t p = read.is32 ? 4 : 8;
+    /*
+     * Four ints, then on Windows ai_addrlen (size_t), ai_canonname, ai_addr,
+     * [ADDRINFOEX: ai_blob, ai_bloblen, ai_provider,] ai_next; on Linux
+     * ai_addrlen (socklen_t, padded), ai_addr, ai_canonname, ai_next.
+     */
+    const addr_t addr_off = linux ? 24 : 16 + 2 * p;
+    const addr_t next_off = linux ? 40 : 16 + (ex ? 6 : 3) * p;
+
+    addr_t node = 0;
+    if (!argument || !read.ptr(argument, node))
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    std::vector<std::string> addresses;
+    for (unsigned i = 0; node && i < MAX_NODES; ++i)
+    {
+        addr_t sockaddr = 0;
+        if (read.ptr(node + addr_off, sockaddr) && sockaddr)
+        {
+            uint8_t buf[28] = {};
+            if (auto text = format_sockaddr(buf, read.bytes(sockaddr, buf, sizeof(buf)), linux))
+                add_unique(addresses, address_only(*text));
+        }
+        if (!read.ptr(node + next_off, node))
+            break;
+    }
+    return quoted(name, config, argument, joined(addresses, ","));
+}
+
+std::string DnsRecordPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    const process_reader read{ drakvuf, info, drakvuf_process_is32bit(drakvuf, info) };
+    const size_t p = read.is32 ? 4 : 8;
+    // DNS_RECORD: pNext, pName, WORD wType, WORD wDataLength, DWORD Flags,
+    // DWORD dwTtl, DWORD dwReserved, then Data
+    const addr_t type_off = 2 * p;
+    const addr_t data_off = 2 * p + 16;
+    constexpr uint16_t DNS_TYPE_A = 1, DNS_TYPE_AAAA = 28;
+
+    addr_t record = 0;
+    if (!argument || !read.ptr(argument, record))
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    std::vector<std::string> addresses;
+    for (unsigned i = 0; record && i < MAX_NODES; ++i)
+    {
+        uint16_t type = 0;
+        uint8_t data[16] = {};
+        char text[INET6_ADDRSTRLEN] = {};
+        if (read.bytes(record + type_off, &type, sizeof(type)) == sizeof(type))
+        {
+            if (type == DNS_TYPE_A && read.bytes(record + data_off, data, 4) == 4
+                && inet_ntop(AF_INET, data, text, sizeof(text)))
+                add_unique(addresses, text);
+            else if (type == DNS_TYPE_AAAA && read.bytes(record + data_off, data, 16) == 16
+                && inet_ntop(AF_INET6, data, text, sizeof(text)))
+                add_unique(addresses, text);
+        }
+        if (!read.ptr(record, record))
+            break;
+    }
+    return quoted(name, config, argument, joined(addresses, ","));
+}
+
+std::string ArgvPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    const process_reader read{ drakvuf, info, drakvuf_process_is32bit(drakvuf, info) };
+    const size_t p = read.is32 ? 4 : 8;
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    std::vector<std::string> args;
+    size_t total = 0;
+    for (unsigned i = 0; i < MAX_ARGV && total < MAX_ARGV_TEXT; ++i)
+    {
+        addr_t str = 0;
+        if (!read.ptr(argument + i * p, str) || !str)
+            break;
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3,
+            .addr = str
+        );
+        vmi_reader_guard vmi(drakvuf);
+        char* s = vmi_read_str(vmi, &ctx);
+        std::string arg = s ? s : "";
+        g_free(s);
+        arg.resize(std::min(arg.size(), MAX_ARGV_TEXT - total));
+        total += arg.size() + 1;
+        args.push_back(std::move(arg));
+    }
+    return quoted(name, config, argument, joined(args, " "));
+}
+
+std::string ContextPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+    const process_reader read{ drakvuf, info, drakvuf_process_is32bit(drakvuf, info) };
+
+    // CONTEXT: x64 Dr0-Dr3 at 0x48, Dr6 0x68, Dr7 0x70, Rip 0xf8; x86 Dr0-Dr3
+    // at 0x4, Dr6 0x14, Dr7 0x18, Eip 0xb8
+    struct reg
+    {
+        const char* name;
+        addr_t offset;
+    };
+    static const reg x64[] = { {"Dr0", 0x48}, {"Dr1", 0x50}, {"Dr2", 0x58}, {"Dr3", 0x60}, {"Dr6", 0x68}, {"Dr7", 0x70}, {"Rip", 0xf8} };
+    static const reg x86[] = { {"Dr0", 0x4}, {"Dr1", 0x8}, {"Dr2", 0xc}, {"Dr3", 0x10}, {"Dr6", 0x14}, {"Dr7", 0x18}, {"Eip", 0xb8} };
+
+    std::vector<std::string> fields;
+    for (const auto& r : read.is32 ? x86 : x64)
+    {
+        uint64_t value = 0;
+        const size_t size = read.is32 ? 4 : 8;
+        if (read.bytes(argument + r.offset, &value, size) != size)
+            return ArgumentPrinter::print(drakvuf, info, argument);
+        std::stringstream field;
+        field << r.name << "=0x" << std::hex << value;
+        fields.push_back(field.str());
+    }
+    return quoted(name, config, argument, joined(fields, ";"));
+}
+
+std::string print_argument(drakvuf_t drakvuf, drakvuf_trap_info* info,
+    const std::vector<std::unique_ptr<ArgumentPrinter>>& printers, const std::vector<uint64_t>& arguments,
+    size_t i, std::optional<uint64_t> return_value)
+{
+    const auto& printer = printers[i];
+    if (printer->length_from_return())
+    {
+        if (!return_value)
+            return printer->print(drakvuf, info, arguments[i]);
+        // A negative return is a failure (-1, SOCKET_ERROR): nothing was read.
+        // Windows' recv returns an int, so -1 is 0xffffffff in rax: a
+        // length of 2 GiB or more is not a buffer's.
+        if (static_cast<int64_t>(*return_value) < 0 || static_cast<int32_t>(*return_value) < 0)
+            return printer->print_sized(drakvuf, info, arguments[i], 0);
+        return printer->print_sized(drakvuf, info, arguments[i], *return_value);
+    }
+    if (auto length = printer->length_argument(); length && *length < arguments.size() && *length < printers.size())
+        return printer->print_sized(drakvuf, info, arguments[i],
+                printers[*length]->value(drakvuf, info, arguments[*length]));
+    return printer->print(drakvuf, info, arguments[i]);
 }
 
 std::string GuidPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const

@@ -193,6 +193,123 @@ START_TEST(test_parse_dll_hook_with_empty_args)
 }
 END_TEST
 
+START_TEST(test_narrow_integer_argument)
+{
+    // On x64 a DWORD comes in the low half of a register whose high half is
+    // whatever the caller left there
+    auto entry = test_parse_dll_entry("advapi32.dll,RegSetValueExW,log,hKey:lpvoid,lpValueName:lpcwstr,"
+            "Reserved:dword,dwType:dword,lpData:lpcstr,cbData:dword,Flag:bool,Lang:word");
+    const auto& printers = entry.argument_printers;
+
+    ck_assert(printers.size() == 8);
+    ck_assert(printers[5]->print(nullptr, nullptr, 0x4f00000010) == "cbData=0x10");
+    ck_assert(printers[6]->print(nullptr, nullptr, 0xffffffff00000001) == "Flag=0x1");
+    ck_assert(printers[7]->print(nullptr, nullptr, 0x12340409) == "Lang=0x409");
+    // A pointer keeps all of it
+    ck_assert(printers[0]->print(nullptr, nullptr, 0x4f00000010) == "hKey=0x4f00000010");
+}
+END_TEST
+
+START_TEST(test_output_arguments)
+{
+    // What the call writes through is read at its return
+    auto entry = test_parse_dll_entry("ntdll.dll,NtAllocateVirtualMemory,log,ProcessHandle:lpvoid,"
+            "BaseAddress:lpvoid*,ZeroBits:lpvoid,RegionSize:lpvoid*,AllocationType:dword,PageProtection:pulong,"
+            "Name:lpcwstr");
+    const auto& printers = entry.argument_printers;
+
+    ck_assert(!printers[0]->reads_output());
+    ck_assert(printers[1]->reads_output());
+    ck_assert(printers[3]->reads_output());
+    ck_assert(!printers[4]->reads_output());
+    ck_assert(printers[5]->reads_output());
+    ck_assert(!printers[6]->reads_output());
+
+    // A sockaddr is decoded, after the call: accept's is the call's to fill
+    auto connect = test_parse_dll_entry("ws2_32.dll,accept,log,s:lpvoid,addr:lpsockaddr,addrlen:pulong");
+    ck_assert(dynamic_cast<const SockaddrPrinter*>(connect.argument_printers[1].get()) != nullptr);
+    ck_assert(connect.argument_printers[1]->reads_output());
+}
+END_TEST
+
+START_TEST(test_buffer_arguments)
+{
+    // The length named before or after the buffer, or the return value
+    auto entry = test_parse_dll_entry("ws2_32.dll,send,log,s:lpvoid,buf:buffer[len],len:dword,flags:dword");
+    auto* buf = dynamic_cast<const BufferPrinter*>(entry.argument_printers[1].get());
+    ck_assert(buf && buf->length_argument() && *buf->length_argument() == 2 && !buf->reads_output());
+    // The length as its printer reads it: a DWORD cut to its 32 bits
+    ck_assert(entry.argument_printers[2]->value(nullptr, nullptr, 0x4f00000010) == 0x10);
+
+    auto read = test_parse_dll_entry("wininet.dll,InternetReadFile,log,hFile:lpvoid,lpBuffer:obuffer[lpdwNumberOfBytesRead],"
+            "dwNumberOfBytesToRead:dword,lpdwNumberOfBytesRead:pulong");
+    auto* out = dynamic_cast<const BufferPrinter*>(read.argument_printers[1].get());
+    ck_assert(out && *out->length_argument() == 3 && out->reads_output());
+
+    auto recv = test_parse_dll_entry("ws2_32.dll,recv,log,s:lpvoid,buf:obuffer[return],len:dword,flags:dword");
+    auto* ret = dynamic_cast<const BufferPrinter*>(recv.argument_printers[1].get());
+    ck_assert(ret && ret->length_from_return() && !ret->length_argument());
+
+    // A name no argument has: a plain pointer
+    auto typo = test_parse_dll_entry("ws2_32.dll,send,log,s:lpvoid,buf:buffer[length],len:dword");
+    ck_assert(!typo.argument_printers[1]->length_argument());
+    ck_assert(typo.argument_printers[1]->print(nullptr, nullptr, 0x1000) == "buf=0x1000");
+}
+END_TEST
+
+START_TEST(test_structure_arguments)
+{
+    auto entry = test_parse_dll_entry("ntdll.dll,NtOpenProcess,log,ProcessHandle:lpvoid*,DesiredAccess:dword,"
+            "ObjectAttributes:lpvoid,ClientId:pclient_id");
+    ck_assert(dynamic_cast<const ClientIdPrinter*>(entry.argument_printers[3].get()) != nullptr);
+    auto delay = test_parse_dll_entry("ntdll.dll,NtDelayExecution,log,Alertable:dword,DelayInterval:plarge_integer");
+    ck_assert(dynamic_cast<const LargeIntegerPrinter*>(delay.argument_printers[1].get()) != nullptr);
+    auto wsa = test_parse_dll_entry("ws2_32.dll,WSASend,log,s:lpvoid,lpBuffers:lpwsabuf,dwBufferCount:dword");
+    ck_assert(dynamic_cast<const WsaBufPrinter*>(wsa.argument_printers[1].get()) != nullptr);
+    // A NULL one is the pointer, nothing read
+    ck_assert(entry.argument_printers[3]->print(nullptr, nullptr, 0) == "ClientId=0x0");
+
+    // A resolver's answer and a thread context: the first read at the return
+    auto resolve = test_parse_dll_entry("ws2_32.dll,getaddrinfo,log,pNodeName:lpcstr,pServiceName:lpcstr,"
+            "pHints:lpvoid,ppResult:ppaddrinfo");
+    ck_assert(dynamic_cast<const AddrinfoPrinter*>(resolve.argument_printers[3].get()) != nullptr);
+    ck_assert(resolve.argument_printers[3]->reads_output());
+    auto query = test_parse_dll_entry("dnsapi.dll,DnsQuery_W,log,pszName:lpcwstr,wType:dword,Options:dword,"
+            "pExtra:lpvoid,ppQueryResults:ppdns_record,pReserved:lpvoid");
+    ck_assert(dynamic_cast<const DnsRecordPrinter*>(query.argument_printers[4].get()) != nullptr);
+    auto context = test_parse_dll_entry("ntdll.dll,NtSetContextThread,log,ThreadHandle:lpvoid,Context:pcontext");
+    ck_assert(dynamic_cast<const ContextPrinter*>(context.argument_printers[1].get()) != nullptr);
+    auto exec = test_parse_dll_entry("libc.so.6,execve,log,Path:lpcstr,argv:argv,envp:lpvoid");
+    ck_assert(dynamic_cast<const ArgvPrinter*>(exec.argument_printers[1].get()) != nullptr);
+
+    // A DATA_BLOB is read as a WSABUF; a SecBufferDesc at the hook for the
+    // message EncryptMessage is given, at the return for the one
+    // DecryptMessage made
+    auto protect = test_parse_dll_entry("crypt32.dll,CryptProtectData,log,pDataIn:pdata_blob,"
+            "szDataDescr:lpcwstr");
+    ck_assert(dynamic_cast<const WsaBufPrinter*>(protect.argument_printers[0].get()) != nullptr);
+    auto encrypt = test_parse_dll_entry("sspicli.dll,EncryptMessage,log,phContext:lpvoid,fQOP:dword,"
+            "pMessage:psecbufferdesc,MessageSeqNo:dword");
+    ck_assert(dynamic_cast<const SecBufferDescPrinter*>(encrypt.argument_printers[2].get()) != nullptr);
+    ck_assert(!encrypt.argument_printers[2]->reads_output());
+    auto decrypt = test_parse_dll_entry("sspicli.dll,DecryptMessage,log,phContext:lpvoid,"
+            "pMessage:opsecbufferdesc,MessageSeqNo:dword,pfQOP:lpvoid");
+    ck_assert(decrypt.argument_printers[1]->reads_output());
+    ck_assert(decrypt.argument_printers[1]->print(nullptr, nullptr, 0) == "pMessage=0x0");
+
+    // AcceptEx's addresses: where the call says each one is, read at the
+    // return; the data received with the connection, at the call
+    auto addresses = test_parse_dll_entry("mswsock.dll,GetAcceptExSockaddrs,log,"
+            "lpOutputBuffer:buffer[dwReceiveDataLength],dwReceiveDataLength:dword,"
+            "dwLocalAddressLength:dword,dwRemoteAddressLength:dword,LocalSockaddr:ppsockaddr,"
+            "LocalSockaddrLength:pulong,RemoteSockaddr:ppsockaddr,RemoteSockaddrLength:pulong");
+    ck_assert(dynamic_cast<const PointerToSockaddrPrinter*>(addresses.argument_printers[6].get()) != nullptr);
+    ck_assert(addresses.argument_printers[6]->reads_output());
+    ck_assert(!addresses.argument_printers[0]->reads_output());
+    ck_assert(addresses.argument_printers[6]->print(nullptr, nullptr, 0) == "RemoteSockaddr=0x0");
+}
+END_TEST
+
 static Suite* dll_hooks_parsing_suite(void)
 {
     Suite* s;
@@ -205,6 +322,10 @@ static Suite* dll_hooks_parsing_suite(void)
     tcase_add_test(tc_core, test_parse_dll_hook);
     tcase_add_test(tc_core, test_parse_dll_hook_with_offset);
     tcase_add_test(tc_core, test_parse_dll_hook_with_empty_args);
+    tcase_add_test(tc_core, test_narrow_integer_argument);
+    tcase_add_test(tc_core, test_output_arguments);
+    tcase_add_test(tc_core, test_buffer_arguments);
+    tcase_add_test(tc_core, test_structure_arguments);
     suite_add_tcase(s, tc_core);
 
     return s;

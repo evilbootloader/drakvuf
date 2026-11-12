@@ -54,10 +54,14 @@ libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output
           [this](drakvuf_t drakvuf_, drakvuf_trap_info_t* info, pending_call& call)
 {
     flush_translations(drakvuf_, info->regs->cr3);
-    this->print_call(drakvuf_, info, *call.config, call.so_path, call.arguments, info->regs->rax);
+    this->print_call(drakvuf_, info, *call.config, call.so_path, call.ret_addr, call.arguments, info->regs->rax);
 },
-// Serialized like the other callbacks of libmon, which share its state
-false)
+// On several vCPU threads at once, unlike the other callbacks of libmon,
+// which are serialized because they share its state (`libs`, the hooks). This
+// one reads the call's own payload and its hook's entry in `wanted_hooks`,
+// which nothing changes after the constructor: print_call must not go back to
+// resolve_module, or anything else that reads `libs`, while this is true.
+true)
     , no_retval(c->no_retval)
 {
     load_so_hook_config(c->so_hooks_list, c->print_no_addr, this->wanted_hooks);
@@ -798,23 +802,24 @@ void libmon::on_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const hooked_
     for (size_t i = 1; i <= config.argument_printers.size(); i++)
         arguments.push_back(drakvuf_get_function_argument(drakvuf, info, i));
 
-    if (this->no_retval || config.no_retval)
-    {
-        this->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
-        return;
-    }
-
     // One breakpoint per return address, shared by the calls returning there.
     // Kept between calls only in code mapped from a file: writing to the page
     // of a breakpoint pauses the VM to copy it again, which JIT code does a lot.
     addr_t ret_addr = drakvuf_get_function_return_address(drakvuf, info);
+
+    if (this->no_retval || config.no_retval)
+    {
+        this->print_call(drakvuf, info, config, target.so_path, ret_addr, arguments, std::nullopt);
+        return;
+    }
+
     bool transient = !this->in_mapped_file(info->proc_data.pid, ret_addr);
 #ifdef DRAKVUF_DEBUG
     if (ret_addr)
         this->count_return_page(drakvuf, info, ret_addr, transient);
 #endif
     auto result = ret_addr
-        ? this->returns.track(drakvuf, info, ret_addr, pending_call{ &config, target.so_path, arguments }, transient)
+        ? this->returns.track(drakvuf, info, ret_addr, pending_call{ &config, target.so_path, arguments, ret_addr }, transient)
         : return_track_result::untranslated;
     if (result != return_track_result::tracked)
     {
@@ -824,12 +829,12 @@ void libmon::on_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const hooked_
         PRINT_DEBUG("[LIBMON] pid %d: no return hook for %s, reporting at entry\n",
             info->proc_data.pid, config.function_name.c_str());
 
-        this->print_call(drakvuf, info, config, target.so_path, arguments, std::nullopt);
+        this->print_call(drakvuf, info, config, target.so_path, ret_addr, arguments, std::nullopt);
     }
 }
 
 void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
-    const plugin_target_config_entry_t& config, const std::string& so_path,
+    const plugin_target_config_entry_t& config, const std::string& so_path, addr_t ret_addr,
     const std::vector<uint64_t>& arguments, std::optional<uint64_t> return_value)
 {
     // The output formatters emit the trap's name as Method, and both the hook
@@ -844,8 +849,9 @@ void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     std::vector<fmt::Rstr<std::string>> fmt_args;
     fmt_args.reserve(arguments.size());
 
+    // A buffer with the length its length argument, or the return value, says
     for (size_t i = 0; i < arguments.size() && i < printers.size(); i++)
-        fmt_args.push_back(fmt::Rstr(printers[i]->print(drakvuf, &call_info, arguments[i])));
+        fmt_args.push_back(fmt::Rstr(print_argument(drakvuf, &call_info, printers, arguments, i, return_value)));
 
     std::optional<fmt::Xval<uint64_t>> fmt_retval;
     if (return_value)
@@ -855,18 +861,22 @@ void libmon::print_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     // return address when reporting at return -- so with return values on,
     // FromModule names whoever made the call, as it does in apimon.
     // Estr for the two paths: both are link_map.l_name, written by the process (review L-13)
-    std::optional<fmt::Estr<std::string>> fmt_module;
-    if (auto module = this->resolve_module(call_info.proc_data.pid, call_info.regs->rip))
-        fmt_module = fmt::Estr(*module);
+    // DISABLED SO WE CAN HAVE MT_SAFE = TRUE
+    //std::optional<fmt::Estr<std::string>> fmt_module;
+    //if (auto module = this->resolve_module(call_info.proc_data.pid, call_info.regs->rip))
+    //    fmt_module = fmt::Estr(*module);
 
     // No Function field: the output formatters already emit the trap's name
-    // as Method.
+    // as Method. Caller: where the call returns to -- not rip, the hooked
+    // function itself when reporting at entry. Not capemon's caller (the
+    // first return address outside the system libraries, apimon's): that
+    // takes unwinding with each library's .eh_frame, which nothing here does.
+    // No ParentCaller: no CAPE signature reads it (community, 2026-11-11).
     fmt::print(m_output_format, "libmon", drakvuf, &call_info,
         keyval("Event", fmt::Rstr("api_called")),
         keyval("Library", fmt::Estr(so_path)),
-        keyval("CalledFrom", fmt::Xval(call_info.regs->rip)),
+        keyval("Caller", fmt::Xval(ret_addr)),
         keyval("ReturnValue", fmt_retval),
-        keyval("FromModule", fmt_module),
         keyval("Arguments", fmt_args)
     );
 }

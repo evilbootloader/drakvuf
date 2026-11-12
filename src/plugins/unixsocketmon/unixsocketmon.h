@@ -105,6 +105,7 @@
 #ifndef UNIXSOCKETMON_H
 #define UNIXSOCKETMON_H
 
+#include <map>
 #include <string>
 #include <utility>
 #include <variant>
@@ -134,6 +135,27 @@ struct socket_endpoints
 
     using value_t = std::variant<fmt::Nval<int>, fmt::Estr<std::string>>;
     std::vector<std::pair<std::string, value_t>> keyvals() const;
+};
+
+// Where a message's bytes are, as its iterator said when the call started:
+// a receive fills them, and the kernel has advanced the iterator past them
+// by its return
+struct iter_snapshot
+{
+    uint8_t type = 0;
+    uint64_t count = 0;
+    addr_t ptr = 0;
+    uint64_t nr_segs = 0;
+    bool valid = false;
+};
+
+// A receive in progress, printed at its return
+struct recvmsg_result : PluginResult
+{
+    uint32_t family = 0;
+    socket_endpoints ep;
+    iter_snapshot iter;
+    addr_t msghdr = 0;
 };
 
 class unixsocketmon: public pluginex
@@ -173,17 +195,33 @@ public:
 
     std::unique_ptr<libhook::SyscallHook> sockethook;
     std::unique_ptr<libhook::SyscallHook> connecthook;
+    std::unique_ptr<libhook::SyscallHook> bindhook;
+    std::unique_ptr<libhook::SyscallHook> listenhook;
+    std::unique_ptr<libhook::SyscallHook> accepthook;
+    std::vector<std::unique_ptr<libhook::SyscallHook>> recvhooks;
+    // Receives in progress, by thread and stack pointer (make_hook_id)
+    std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
 
     unixsocketmon(drakvuf_t drakvuf, const unixsocketmon_config* config, output_format_t output);
     event_response_t sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
     event_response_t connect_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t bind_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t listen_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t graft_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t recvmsg_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t recvmsg_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
     std::vector<uint8_t> get_socket_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t* size);
+    iter_snapshot snapshot_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t msghdr);
+    std::vector<uint8_t> read_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const iter_snapshot& iter, uint64_t wanted);
+    void print_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint32_t family, const socket_endpoints& ep,
+        uint64_t size, const std::vector<uint8_t>& message);
     bool get_socket_family_type(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint32_t* family_type);
     bool find_iov_iter_layout(drakvuf_t drakvuf);
     void find_endpoint_layout(drakvuf_t drakvuf);
 
     // Both ends of a socket from its struct sock, and the protocol
     socket_endpoints read_endpoints(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t socket, uint32_t family);
+    socket_endpoints read_endpoints_sk(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t sk, uint32_t family);
     // A struct sockaddr, as the remote end
     void read_sockaddr(vmi_instance_t vmi, access_context_t* ctx, addr_t addr, uint32_t len, socket_endpoints& ep);
     // The path a Unix socket is bound to

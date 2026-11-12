@@ -121,8 +121,43 @@ public:
     bool register_hook(char* syscall_name, uint64_t syscall_number, const syscalls_ns::syscall_t* syscall_definition, bool is_x64);
     const syscalls_ns::syscall_t* lookup_syscall_for_dispatcher(drakvuf_trap_info_t* info, addr_t nr, const char** out_type, uint16_t* out_num);
 
+    /*
+     * Where a syscall was made from (get_origin in linux.cpp): pt_regs->ip, the instruction after
+     * `syscall` or `int 0x80`, and the file mapped there -- "" for memory no file backs, "[vdso]"
+     * for the vDSO, nothing when it could not be looked up. `bitness` the process's, for a 32-bit
+     * syscall: 64 when a 64-bit process made it. 0 when unknown.
+     */
+    struct syscall_origin
+    {
+        addr_t caller = 0;
+        std::optional<std::string> module;
+        int bitness = 0;
+    };
+    // The files mapped in an address space, by process and mm_struct: an exec replaces the
+    // mm_struct, not the pid. Never pruned: what is cached is only where syscalls were made
+    // from, a few files a process.
+    struct mapping
+    {
+        addr_t start;
+        addr_t end;
+        std::string name;
+    };
+    std::mutex mappings_mtx;
+    std::map<std::pair<vmi_pid_t, addr_t>, std::vector<mapping>> mappings;
+    addr_t task_mm = 0;             // task_struct.mm
+    addr_t mm_vdso = 0;             // mm_struct.context.vdso
+    addr_t mm_vdso_image = 0;       // mm_struct.context.vdso_image
+    addr_t vdso_image_size = 0;     // vdso_image.size
+    addr_t file_dentry = 0;         // file.f_path.dentry
+    addr_t vdso_image_32 = 0;       // the kernel's vdso_image_32: a 32-bit process's vDSO
+    addr_t vdso_image_64 = 0;       // vdso_image_64 and vdso_image_x32: a 64-bit process's
+    addr_t vdso_image_x32 = 0;
+    bool setup_origin(drakvuf_t drakvuf);
+    std::optional<std::string> resolve_module(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t mm, addr_t addr);
+    syscall_origin get_origin(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t pt_regs_addr, const char* syscall_type);
+
     // Print information
-    void print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::syscall_t* sc, uint16_t syscall_num, const char* syscall_type, std::vector<uint64_t> arguments);
+    void print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const syscalls_ns::syscall_t* sc, uint16_t syscall_num, const char* syscall_type, std::vector<uint64_t> arguments, const syscall_origin& origin);
     void print_kernel_sysret(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const pending_syscall& call) override;
     // The syscall's result when the hooked function returns: read from result_va, or rax when 0
     uint64_t syscall_result(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t result_va);
@@ -364,8 +399,8 @@ SYSCALL(connect, linux_int,
 );
 SYSCALL(accept, linux_int,
     "sockfd",  "", DIR_IN, linux_int,
-    "addr",    "", DIR_IN, linux_sockaddr_ptr,
-    "addrlen", "", DIR_IN, linux_socklen_t_ptr,
+    "addr",    "", DIR_OUT, linux_sockaddr_ptr,
+    "addrlen", "", DIR_INOUT, linux_socklen_t_ptr,
 );
 SYSCALL(sendto, linux_ssize_t,
     "sockfd",    "", DIR_IN, linux_int,
@@ -380,8 +415,8 @@ SYSCALL(recvfrom, linux_int,
     "buf",      "", DIR_IN, linux_void_ptr,
     "len",      "", DIR_IN, linux_size_t,
     "flags",    "", DIR_IN, linux_int,
-    "src_addr", "", DIR_IN, linux_sockaddr_ptr,
-    "addrlen",  "", DIR_IN, linux_socklen_t_ptr,
+    "src_addr", "", DIR_OUT, linux_sockaddr_ptr,
+    "addrlen",  "", DIR_INOUT, linux_socklen_t_ptr,
 );
 SYSCALL(sendmsg, linux_ssize_t,
     "sockfd", "", DIR_IN, linux_int,
@@ -390,7 +425,7 @@ SYSCALL(sendmsg, linux_ssize_t,
 );
 SYSCALL(recvmsg, linux_int,
     "sockfd", "", DIR_IN, linux_int,
-    "msg",    "", DIR_IN, linux_msghdr_ptr,
+    "msg",    "", DIR_INOUT, linux_msghdr_ptr,
     "flags",  "", DIR_IN, linux_int,
 );
 SYSCALL(shutdown, linux_int,
@@ -408,13 +443,13 @@ SYSCALL(listen, linux_int,
 );
 SYSCALL(getsockname, linux_int,
     "sockfd",  "", DIR_IN, linux_int,
-    "addr",    "", DIR_IN, linux_sockaddr_ptr,
-    "addrlen", "", DIR_IN, linux_socklen_t_ptr,
+    "addr",    "", DIR_OUT, linux_sockaddr_ptr,
+    "addrlen", "", DIR_INOUT, linux_socklen_t_ptr,
 );
 SYSCALL(getpeername, linux_int,
     "sockfd",  "", DIR_IN, linux_int,
-    "addr",    "", DIR_IN, linux_sockaddr_ptr,
-    "addrlen", "", DIR_IN, linux_socklen_t_ptr,
+    "addr",    "", DIR_OUT, linux_sockaddr_ptr,
+    "addrlen", "", DIR_INOUT, linux_socklen_t_ptr,
 );
 SYSCALL(socketpair, linux_int,
     "domain",   "", DIR_IN, linux_int,
@@ -1135,8 +1170,8 @@ SYSCALL(timerfd_gettime, linux_int,
 );
 SYSCALL(accept4, linux_int,
     "sockfd",  "", DIR_IN, linux_int,
-    "addr",    "", DIR_IN, linux_sockaddr_ptr,
-    "addrlen", "", DIR_IN, linux_socklen_t_ptr,
+    "addr",    "", DIR_OUT, linux_sockaddr_ptr,
+    "addrlen", "", DIR_INOUT, linux_socklen_t_ptr,
     "flags",   "", DIR_IN, linux_int,
 );
 SYSCALL(signalfd4, linux_int);

@@ -102,7 +102,11 @@
  *                                                                         *
  ***************************************************************************/
 
+#include <cstring>
 #include <sstream>
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
 
 #include "utils.hpp"
 
@@ -141,4 +145,84 @@ std::string escape_str(const std::string& s)
     }
 
     return os.str();
+}
+
+std::string escape_bytes(const uint8_t* data, size_t size)
+{
+    char const* const hexdig = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(size);
+    for (size_t i = 0; i < size; ++i)
+    {
+        const unsigned char c = data[i];
+        switch (c)
+        {
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '"':
+                out += "\\\"";
+                break;
+            default:
+                if (c < ' ' || c > '~')
+                {
+                    out += "\\x";
+                    out += hexdig[c >> 4];
+                    out += hexdig[c & 0xF];
+                }
+                else
+                    out += static_cast<char>(c);
+                break;
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> format_sockaddr(const uint8_t* buf, size_t len, bool linux)
+{
+    if (len < 2)
+        return {};
+
+    // sa_family: a little-endian 16-bit number on both systems
+    const unsigned family = buf[0] | (buf[1] << 8);
+    const unsigned af_inet6 = linux ? 10 : 23;
+    auto port = [&]()
+    {
+        return std::to_string((buf[2] << 8) | buf[3]);
+    };
+    char text[INET6_ADDRSTRLEN] = {};
+
+    if (family == 2 && len >= 8)
+    {
+        if (!inet_ntop(AF_INET, buf + 4, text, sizeof(text)))
+            return {};
+        return std::string(text) + ":" + port();
+    }
+    if (family == af_inet6 && len >= 24)
+    {
+        if (!inet_ntop(AF_INET6, buf + 8, text, sizeof(text)))
+            return {};
+        return "[" + std::string(text) + "]:" + port();
+    }
+    if (family == 1 && len > 2)
+    {
+        // sun_path: NUL-terminated, or on Linux a NUL then an abstract name
+        const char* path = reinterpret_cast<const char*>(buf + 2);
+        const size_t max = len - 2;
+        if (path[0])
+            return std::string(path, strnlen(path, max));
+        if (linux && max > 1 && path[1])
+            return "@" + std::string(path + 1, strnlen(path + 1, max - 1));
+        return {};
+    }
+    return {};
 }

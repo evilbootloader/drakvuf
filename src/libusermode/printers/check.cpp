@@ -104,6 +104,8 @@
 
 #include "utils.hpp"
 
+#include <vector>
+
 #include <check.h>
 
 START_TEST(test_escape_basic)
@@ -142,6 +144,63 @@ START_TEST(test_escape_utf_8_binary)
 }
 END_TEST
 
+START_TEST(test_escape_bytes)
+{
+    const uint8_t data[] = { 'M', 'Z', 0x90, 0x00, '\r', '\n', '"', '\\', 0x7f, 'a' };
+    ck_assert(escape_bytes(data, sizeof(data)) == std::string("MZ\\x90\\x00\\r\\n\\\"\\\\\\x7Fa"));
+    ck_assert(escape_bytes(data, 0).empty());
+}
+END_TEST
+
+static bool sockaddr_is(std::vector<uint8_t> bytes, bool linux, const char* expect)
+{
+    auto text = format_sockaddr(bytes.data(), bytes.size(), linux);
+    return expect ? text && *text == expect : !text;
+}
+
+START_TEST(test_sockaddr_in)
+{
+    // AF_INET, port 443, 203.0.113.7, zero padding
+    const std::vector<uint8_t> in = { 2, 0, 0x01, 0xbb, 203, 0, 113, 7, 0, 0, 0, 0, 0, 0, 0, 0 };
+    ck_assert(sockaddr_is(in, false, "203.0.113.7:443"));
+    ck_assert(sockaddr_is(in, true, "203.0.113.7:443"));
+    // Short of an address
+    ck_assert(sockaddr_is({ 2, 0, 0x01, 0xbb, 203 }, false, nullptr));
+}
+END_TEST
+
+START_TEST(test_sockaddr_in6)
+{
+    std::vector<uint8_t> in6 = { 0, 0, 0x00, 0x50, 0, 0, 0, 0,
+                                 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                                 0, 0, 0, 0
+                               };
+    in6[0] = 23;    // Windows' AF_INET6
+    ck_assert(sockaddr_is(in6, false, "[2001:db8::1]:80"));
+    ck_assert(sockaddr_is(in6, true, nullptr));
+    in6[0] = 10;    // Linux's
+    ck_assert(sockaddr_is(in6, true, "[2001:db8::1]:80"));
+}
+END_TEST
+
+START_TEST(test_sockaddr_un)
+{
+    std::vector<uint8_t> path = { 1, 0 };
+    for (char c : std::string("/run/x.sock"))
+        path.push_back(c);
+    path.push_back(0);
+    path.push_back('z');    // past the terminator: not the path's
+    ck_assert(sockaddr_is(path, true, "/run/x.sock"));
+
+    // Linux's abstract namespace: a NUL, then the name
+    std::vector<uint8_t> abstract = { 1, 0, 0, 'b', 'u', 's', 0 };
+    ck_assert(sockaddr_is(abstract, true, "@bus"));
+    ck_assert(sockaddr_is(abstract, false, nullptr));
+
+    ck_assert(sockaddr_is({ 17, 0, 1, 2, 3 }, true, nullptr));    // AF_PACKET: not decoded
+}
+END_TEST
+
 Suite* escape_str_suite(void)
 {
     Suite* s;
@@ -158,6 +217,10 @@ Suite* escape_str_suite(void)
     tcase_add_test(tc_core, test_escape_utf_8);
     tcase_add_test(tc_core, test_escape_utf_8_multiline);
     tcase_add_test(tc_core, test_escape_utf_8_binary);
+    tcase_add_test(tc_core, test_escape_bytes);
+    tcase_add_test(tc_core, test_sockaddr_in);
+    tcase_add_test(tc_core, test_sockaddr_in6);
+    tcase_add_test(tc_core, test_sockaddr_un);
 
     suite_add_tcase(s, tc_core);
 

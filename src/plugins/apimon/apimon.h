@@ -112,10 +112,13 @@
 #include <unordered_map>
 #include <optional>
 
+#include <chrono>
+
 #include <glib.h>
 #include <libusermode/userhook.hpp>
 #include "plugins/plugins_ex.h"
 #include "plugins/helpers/return_tracker.h"
+#include "unwind.h"
 
 struct apimon_config
 {
@@ -128,13 +131,39 @@ struct apimon_module
     std::string name;
     addr_t base;
     size_t size;
+    // Mapped from \Windows\System32, \SysWOW64 or \WinSxS: what capemon
+    // counts as the DLL ranges a caller is looked for outside of
+    bool system;
+};
+
+// One entry of a call's Arguments: text printed at the hook, or the index of
+// an argument whose printer reads an out parameter, printed when the call is
+// reported -- at its return
+struct apimon_argument
+{
+    std::string text;
+    std::optional<size_t> index;
 };
 
 // A hooked call in progress, reported at its return
 struct apimon_call
 {
     hook_target_entry_t* target;
-    std::vector<uint64_t> arguments;
+    std::vector<apimon_argument> args;
+    // Every argument's raw value, read at the hook (print_argument)
+    std::vector<uint64_t> raw;
+    // Where the hooked function returns to, and the first return address on
+    // the stack outside the system DLLs (apimon::find_caller)
+    addr_t ret_addr;
+    addr_t caller;
+    std::optional<std::string> module_name;
+};
+
+// A module's .pdata, or when it could not be read, since when
+struct apimon_unwind_table
+{
+    std::shared_ptr<const std::vector<x64_unwind::runtime_function>> table;
+    std::chrono::steady_clock::time_point failed_at;
 };
 
 class apimon: public pluginex
@@ -150,9 +179,18 @@ public:
 
     virtual bool stop_impl() override;
 
-    std::optional<std::string> resolve_module(drakvuf_t drakvuf, addr_t process, addr_t addr, vmi_pid_t pid);
+    // .pdata per process and module base, read when a caller is first
+    // unwound through the module
+    std::mutex unwind_mtx;
+    std::map<std::pair<vmi_pid_t, addr_t>, apimon_unwind_table> unwind_tables;
 
-    void usermode_print(drakvuf_trap_info*, std::vector<uint64_t>&, hook_target_entry_t*);
+    std::optional<apimon_module> find_module(drakvuf_t drakvuf, addr_t process, addr_t addr, vmi_pid_t pid);
+    std::optional<std::string> resolve_module(drakvuf_t drakvuf, addr_t process, addr_t addr, vmi_pid_t pid);
+    std::shared_ptr<const std::vector<x64_unwind::runtime_function>> unwind_table(
+        drakvuf_t drakvuf, drakvuf_trap_info* info, const apimon_module& module);
+    addr_t find_caller(drakvuf_t drakvuf, drakvuf_trap_info* info, addr_t ret_addr);
+
+    void usermode_print(drakvuf_trap_info*, const apimon_call&, std::optional<uint64_t> return_value);
 
     // One breakpoint per return address, shared by the calls returning there
     return_tracker<apimon_call> returns;

@@ -113,19 +113,14 @@
 #include <libinjector/libinjector.h>
 
 #include "win.h"
+#include "origin.h"
+#include "plugins/helpers/object_attributes.h"
 
 using namespace syscalls_ns;
+using namespace syscalls_origin;
 
-// This is the list of system libraries that use syscalls.
-//
-static std::string whitelisted_libraries[] =
-{
-    "windows\\system32\\gdi32.dll",
-    "windows\\system32\\imm32.dll",
-    "windows\\system32\\ntdll.dll",
-    "windows\\system32\\user32.dll",
-    "windows\\system32\\wow64win.dll"
-};
+// _MMVAD_FLAGS.VadType of an executable image mapped by the loader or NtMapViewOfSection
+#define VAD_TYPE_IMAGE_MAP 2
 
 static bool enum_modules_cb(drakvuf_t dravkuf, const module_info_t* module_info, bool* need_free, bool* need_stop, void* ctx)
 {
@@ -244,11 +239,37 @@ static std::vector<uint64_t> extract_args(drakvuf_t drakvuf, drakvuf_trap_info_t
     return args;
 }
 
-static std::optional<std::string> resolve_module(drakvuf_t drakvuf, addr_t addr, addr_t process, vmi_pid_t pid, win_syscalls* s)
+// A file directly in System32 or SysWOW64, its path lowercased. Windows maps such an image at one
+// base in every process, chosen once a boot.
+static bool is_system_dll(const std::string& path)
+{
+    for (const char* dir : { "\\windows\\system32\\", "\\windows\\syswow64\\" })
+    {
+        const size_t length = strlen(dir);
+        if (path.compare(0, length, dir) == 0 && path.find('\\', length) == std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * The module an address lies in: for pid 4 a driver's name, otherwise the path of the file mapped
+ * there, volume relative (\Windows\System32\ntdll.dll), or "" for memory no file backs -- private
+ * memory, a section backed by the pagefile. Nothing when it could not be looked up: the address is
+ * in no VAD, or an image's file name could not be read. An image without a name is never "", so
+ * that a read failure cannot pass for shellcode.
+ *
+ * `copy` is set for a system DLL mapped at another base than the first mapping of it seen, in any
+ * process: a copy of ntdll a sample mapped to make its syscalls from, or a file at a system DLL's
+ * path on another volume, a mounted image -- another file, mapped at another base.
+ * KNOWN GAP: a system DLL Windows itself had to relocate in a process, where something else held
+ * its base, is reported a copy there.
+ */
+static std::optional<syscalls_module> resolve_module(drakvuf_t drakvuf, addr_t addr, addr_t process, vmi_pid_t pid, win_syscalls* s)
 {
     // The cache is shared by all vCPU threads. It isn't locked while resolving,
     // the drakvuf functions take the VMI lock and enum_modules_cb takes procs_mtx.
-    auto lookup = [&]() -> std::optional<std::string>
+    auto lookup = [&]() -> std::optional<syscalls_module>
     {
         std::lock_guard<std::mutex> lock(s->procs_mtx);
         const auto& mods = s->procs.find(pid);
@@ -258,15 +279,15 @@ static std::optional<std::string> resolve_module(drakvuf_t drakvuf, addr_t addr,
             {
                 if (addr >= module.base && addr < module.base + module.size)
                 {
-                    return module.name;
+                    return module;
                 }
             }
         }
         return {};
     };
-    if (auto name = lookup())
+    if (auto cached = lookup())
     {
-        return name;
+        return cached;
     }
     // Didn't find in cache, try to resolve.
     //
@@ -280,81 +301,271 @@ static std::optional<std::string> resolve_module(drakvuf_t drakvuf, addr_t addr,
     }
     else if (mmvad_info_t mmvad{}; drakvuf_find_mmvad(drakvuf, process, addr, &mmvad))
     {
-        if (mmvad.file_name_ptr)
+        // Not cached: memory no file backs is freed and allocated again, and a DLL may be mapped
+        // where it was
+        if (!mmvad.file_name_ptr)
         {
-            if (auto u_name = drakvuf_read_unicode_va(drakvuf, mmvad.file_name_ptr, 0))
+            if (drakvuf_mmvad_type(drakvuf, &mmvad) == VAD_TYPE_IMAGE_MAP)
+                return {};
+            return syscalls_module{ .name = "", .base = 0, .size = 0 };
+        }
+        if (auto u_name = drakvuf_read_unicode_va(drakvuf, mmvad.file_name_ptr, 0))
+        {
+            // ending_vpn is the VAD's last page, not the one past it
+            syscalls_module module
             {
-                std::string name = (const char*)u_name->contents;
-                vmi_free_unicode_str(u_name);
+                .name = (const char*)u_name->contents,
+                .base = mmvad.starting_vpn << 12,
+                .size = (mmvad.ending_vpn - mmvad.starting_vpn + 1) << 12
+            };
+            vmi_free_unicode_str(u_name);
 
-                std::lock_guard<std::mutex> lock(s->procs_mtx);
-                s->procs[pid].push_back(
-                {
-                    .name = name,
-                    .base = mmvad.starting_vpn << 12,
-                    .size = (mmvad.ending_vpn - mmvad.starting_vpn) << 12
-                });
-                return name;
+            gchar* lowered = g_ascii_strdown(module.name.c_str(), -1);
+            const std::string path = lowered ? lowered : "";
+            g_free(lowered);
+
+            std::lock_guard<std::mutex> lock(s->procs_mtx);
+            if (is_system_dll(path))
+            {
+                auto [known, first] = s->system_dll_bases.emplace(path, module.base);
+                if (!first && known->second != module.base)
+                    module.copy = module.base;
             }
+            s->procs[pid].push_back(module);
+            return module;
         }
     }
     return {};
 }
 
-static std::optional<std::string> resolve_parent_module(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s)
+// `addr` and the module it lies in, in the process
+static win_syscalls::frame resolve_frame(drakvuf_t drakvuf, addr_t addr, addr_t process, vmi_pid_t pid, win_syscalls* s)
+{
+    win_syscalls::frame out;
+    out.address = addr;
+    if (addr)
+    {
+        if (auto module = resolve_module(drakvuf, addr, process, pid, s))
+        {
+            out.module = std::move(module->name);
+            out.copy = module->copy;
+        }
+    }
+    return out;
+}
+
+// Up to `size` bytes at `addr` in the address space the thread runs in; how many were read, up to
+// the first page that is not present when the read fails there (vmi_read)
+static size_t read_user(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t addr, void* buffer, size_t size)
 {
     vmi_reader_guard vmi(drakvuf);
-    addr_t rsp, top;
-    if (VMI_SUCCESS != vmi_read_addr_va(vmi, drakvuf_get_rspbase(drakvuf, info) - 0x10, 0, &rsp) ||
-        VMI_SUCCESS != vmi_read_addr_va(vmi, rsp, info->attached_proc_data.pid, &top))
-    {
-        PRINT_DEBUG("[SYSCALLS] Failed to resolve top of the stack\n");
-        return {};
-    }
-    return resolve_module(drakvuf, top, info->attached_proc_data.base_addr, info->attached_proc_data.pid, s);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = addr
+    );
+    size_t got = 0;
+    vmi_read(vmi, &ctx, size, buffer, &got);
+    return got;
 }
 
-/// Get module that called Nt (syscall) function, from where the syscall returns to.
-///
-static std::tuple<privilege_mode_t, std::optional<std::string>, std::optional<std::string>>
-    resolve_retinfo(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s, privilege_mode_t mode, addr_t ret)
+// syscalls_origin's reader, over the address space the thread runs in
+static syscalls_origin::reader user_reader(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
+    return [drakvuf, info](addr_t at, void* buffer, size_t size)
+    {
+        return read_user(drakvuf, info, at, buffer, size);
+    };
+}
+
+// The service the thread asked for, its eax at `syscall`: KTHREAD.SystemCallNumber, which
+// KiSystemServiceUser stores for calls from user mode
+static std::optional<uint32_t> thread_service(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s)
+{
+    const addr_t thread = s->thread_syscall_number ? drakvuf_get_current_thread(drakvuf, info) : 0;
+    if (!thread)
+        return {};
+    uint32_t number = 0;
+    vmi_reader_guard vmi(drakvuf);
+    if (VMI_SUCCESS != vmi_read_32_va(vmi, thread + s->thread_syscall_number, 0, &number))
+        return {};
+    return number;
+}
+
+// The frame of what the call before `ret` called, when that makes the syscall indirect
+// (syscalls_origin::indirect_call); nothing otherwise
+static win_syscalls::frame indirect_target(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s,
+    addr_t ret, addr_t stub, addr_t stub_size, bool is32)
+{
+    const addr_t target = syscalls_origin::indirect_call(user_reader(drakvuf, info), ret, stub, stub_size, is32);
+    if (!target)
+        return {};
+    return resolve_frame(drakvuf, target, info->attached_proc_data.base_addr, info->attached_proc_data.pid, s);
+}
+
+/*
+ * The 32-bit call a WoW64 process's syscall serves. wow64cpu saves the 32-bit registers when the
+ * thread enters 64-bit mode through Wow64Transition: Eip, the address the call to it returns to,
+ * popped off the 32-bit stack, and Esp, the stack after that pop. The dword below Esp is then Eip
+ * again, and the dword at Esp what the 32-bit stub returns to: frames 0 and 1 of the 32-bit call.
+ *
+ * Saved by anything else -- an exception in 32-bit code, NtSetContextThread -- Eip is not a return
+ * address and the dword below Esp almost never equals it: false then. The registers stay until
+ * the next transition, so this is the thread's last 32-bit call: get_origin takes it only for a
+ * syscall made through WoW64's own 64-bit code.
+ */
+static bool wow64_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s, win_syscalls::syscall_origin& origin)
+{
+    // No --json-wow profile
+    if (!s->wow64_context_eip || !s->wow64_context_esp)
+        return false;
+
+    addr_t thread = drakvuf_get_current_thread(drakvuf, info);
+    addr_t context = 0;
+    if (!thread || !drakvuf_get_wow_context(drakvuf, thread, &context))
+        return false;
+
+    uint32_t eip = 0, esp = 0;
+    uint32_t stack[2] = {};
+    if (read_user(drakvuf, info, context + s->wow64_context_eip, &eip, sizeof(eip)) != sizeof(eip) || !eip ||
+        read_user(drakvuf, info, context + s->wow64_context_esp, &esp, sizeof(esp)) != sizeof(esp) ||
+        esp < sizeof(uint32_t) ||
+        read_user(drakvuf, info, esp - sizeof(uint32_t), stack, sizeof(stack)) != sizeof(stack) ||
+        stack[0] != eip)
+        return false;
+
+    const addr_t process = info->attached_proc_data.base_addr;
+    const vmi_pid_t pid = info->attached_proc_data.pid;
+    origin.caller = resolve_frame(drakvuf, eip, process, pid, s);
+    origin.parent = resolve_frame(drakvuf, stack[1], process, pid, s);
+    // Not compared: WoW64 makes syscalls of its own for a 32-bit call, for other services
+    origin.stub_syscall.reset();
+    // Only a call into the stub past its start: 32-bit stubs have no `mov r10, rcx` to match
+    // code that looks like a stub of its own by
+    origin.call_target = {};
+    if (stack[1] && is_stub32(user_reader(drakvuf, info), eip))
+        origin.call_target = indirect_target(drakvuf, info, s, stack[1], eip - STUB32_CALLER, STUB32_CALLER, true);
+    return true;
+}
+
+// The file name of a frame's module directly in System32, lowercased, when it is Windows' own
+// mapping of it; "" otherwise
+static std::string system32_name(const win_syscalls::frame& f)
+{
+    static const std::string system32 = "\\windows\\system32\\";
+    if (!f.address || !f.module || f.copy)
+        return {};
+    gchar* lowered = g_ascii_strdown(f.module->c_str(), -1);
+    const std::string path = lowered ? lowered : "";
+    g_free(lowered);
+    if (path.compare(0, system32.size(), system32) != 0 || path.find('\\', system32.size()) != std::string::npos)
+        return {};
+    return path.substr(system32.size());
+}
+
+/*
+ * A WoW64 process's syscall made through WoW64's own 64-bit code, for 32-bit code: `syscall` in
+ * ntdll's or win32u's stub, the stub of the service called, called by ntdll or a wow64*.dll --
+ * or in a wow64cpu.dll turbo thunk, which is jumped to and has no caller to check. Anything else
+ * is 64-bit code the process runs itself (Heaven's Gate). syscall_origin.py's WOW64_LAYER is
+ * this list.
+ */
+static bool through_wow64(const win_syscalls::syscall_origin& origin)
+{
+    const std::string site = system32_name(origin.caller);
+    if (site == "wow64cpu.dll")
+        return true;
+    if ((site != "ntdll.dll" && site != "win32u.dll") || origin.stub_syscall || origin.call_target.address)
+        return false;
+    const std::string from = system32_name(origin.parent);
+    for (const char* layer : { "ntdll.dll", "wow64.dll", "wow64win.dll", "wow64cpu.dll", "wow64base.dll", "wow64con.dll" })
+        if (from == layer)
+            return true;
+    return false;
+}
+
+/*
+ * Who made the syscall. From the kernel: the driver that called the Zw function (`caller`, from
+ * the dispatcher_caller or the hooked routine's return address). From user mode: the first two
+ * frames of the thread's user stack as it entered the kernel -- frame 0 the instruction after
+ * `syscall` (KTRAP_FRAME.Rip, `caller`), frame 1 the qword at KTRAP_FRAME.Rsp, which the stub
+ * that ran `syscall` returns to (`parent`). That is ntdll's or win32u's stub and its caller, unless
+ * the syscall was made elsewhere: Hell's Gate and SysWhispers run `syscall` from their own code
+ * (frame 0); an indirect syscall jumps to the instruction in ntdll's stub, so that frame 1 never
+ * called the stub (`call_target`) or called another service's (`stub_syscall`). Which ones are,
+ * is for the analysis to say (cape_plugin/syscall_origin.py).
+ *
+ * A WoW64 process's syscall made through WoW64's own 64-bit code has those frames of the 32-bit
+ * call instead (`bitness` 32): the 64-bit ones are ntdll's stub and wow64.dll every time. Made by
+ * 64-bit code of the process's own, or with no 32-bit call to show, they are the 64-bit ones
+ * (`bitness` 64).
+ */
+static win_syscalls::syscall_origin get_origin(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s,
+    privilege_mode_t mode, addr_t caller)
+{
+    win_syscalls::syscall_origin origin;
     if (mode == KERNEL_MODE)
     {
-        return { mode, resolve_module(drakvuf, ret, info->proc_data.base_addr, 4, s), {} };
+        origin.mode = mode;
+        origin.caller = resolve_frame(drakvuf, caller, info->proc_data.base_addr, 4, s);
+        return origin;
     }
-    else if (mode == USER_MODE)
+    if (mode != USER_MODE)
+        return origin;
+
+    const addr_t process = info->attached_proc_data.base_addr;
+    const vmi_pid_t pid = info->attached_proc_data.pid;
+    origin.mode = mode;
+    origin.caller = resolve_frame(drakvuf, caller, process, pid, s);
+
+    // KTRAP_FRAME.Rsp is the second qword below the top of the kernel stack (win_get_syscall_retaddr)
+    if (addr_t rspbase = drakvuf_get_rspbase(drakvuf, info))
     {
-        auto module = resolve_module(drakvuf, ret, info->attached_proc_data.base_addr, info->attached_proc_data.pid, s);
-        // Check if module is a dll.
-        //
-        if (module.has_value())
+        addr_t rsp = 0, parent = 0;
         {
-            auto resolved_lib = module.value();
-            for (auto& c : resolved_lib)
-                c = std::tolower(c);
-            for (const auto& lib : whitelisted_libraries)
+            vmi_reader_guard vmi(drakvuf);
+            if (VMI_SUCCESS != vmi_read_addr_va(vmi, rspbase - 0x10, 0, &rsp) ||
+                VMI_SUCCESS != vmi_read_addr_va(vmi, rsp, pid, &parent))
             {
-                if (resolved_lib.length() >= lib.length() &&
-                    resolved_lib.compare(resolved_lib.length() - lib.length(), lib.length(), lib) == 0)
-                {
-                    return { mode, std::move(resolved_lib), resolve_parent_module(drakvuf, info, s) };
-                }
+                PRINT_DEBUG("[SYSCALLS] Failed to resolve top of the stack\n");
+                parent = 0;
             }
         }
-        return { mode, std::move(module), {} };
+        origin.parent = resolve_frame(drakvuf, parent, process, pid, s);
     }
-    return { MAXIMUM_MODE, {}, {} };
+
+    if (auto service = stub64_service(user_reader(drakvuf, info), caller))
+    {
+        auto called = thread_service(drakvuf, info, s);
+        if (called && (*called & SERVICE_MASK) != (*service & SERVICE_MASK))
+            origin.stub_syscall = *service;
+        if (origin.parent.address)
+            origin.call_target = indirect_target(drakvuf, info, s, origin.parent.address,
+                    caller - STUB64_CALLER, STUB64_SIZE, false);
+    }
+
+    // A 32-bit process on a 64-bit kernel
+    if (!s->is32bit && info->attached_proc_data.bitness == PROC_TYPE_32)
+    {
+        win_syscalls::syscall_origin call32 = origin;
+        if (through_wow64(origin) && wow64_call(drakvuf, info, s, call32))
+        {
+            origin = std::move(call32);
+            origin.bitness = 32;
+        }
+        else
+            origin.bitness = 64;
+    }
+    return origin;
 }
 
-/// Get module that called Nt (syscall) function and previous mode.
+/// Who made the syscall, in the thread's previous mode. Nothing on a 32-bit kernel.
 ///
-static std::tuple<privilege_mode_t, std::optional<std::string>, std::optional<std::string>>
-    get_syscall_retinfo(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s)
+static win_syscalls::syscall_origin get_syscall_origin(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s)
 {
     if (s->is32bit)
     {
-        return { MAXIMUM_MODE, {}, {} };
+        return {};
     }
 
     privilege_mode_t mode = MAXIMUM_MODE;
@@ -362,7 +573,7 @@ static std::tuple<privilege_mode_t, std::optional<std::string>, std::optional<st
     {
         PRINT_DEBUG("[SYSCALLS] Failed to get previous mode\n");
     }
-    return resolve_retinfo(drakvuf, info, s, mode, drakvuf_get_syscall_retaddr(drakvuf, info, mode));
+    return get_origin(drakvuf, info, s, mode, drakvuf_get_syscall_retaddr(drakvuf, info, mode));
 }
 
 // Where the syscall returns to: ntdll for calls from user mode, the caller of the Nt function otherwise.
@@ -399,8 +610,8 @@ static event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     auto num_args = sc ? sc->num_args : 0;
 
     auto args = extract_args(drakvuf, info, s->register_size, num_args);
-    auto [mode, module, parent_module] = get_syscall_retinfo(drakvuf, info, s);
-    s->print_syscall(drakvuf, info, w->num, w->type, sc, std::move(args), mode, std::move(module), std::move(parent_module));
+    auto origin = get_syscall_origin(drakvuf, info, s);
+    s->print_syscall(drakvuf, info, w->num, w->type, sc, std::move(args), origin);
 
     if (s->disable_sysret || s->is_stopping())
         return VMI_EVENT_RESPONSE_NONE;
@@ -418,7 +629,7 @@ static event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 
     //Save the address of the target thread, address of the rsp (this was the rip-address, which we used for construction) and the value of the CR3 register to the params.
     addr_t user_rsp = 0;
-    bool has_user_rsp = mode == USER_MODE && drakvuf_get_user_rsp(drakvuf, info, &user_rsp);
+    bool has_user_rsp = origin.mode == USER_MODE && drakvuf_get_user_rsp(drakvuf, info, &user_rsp);
 
     //wrapper extends from call_result_t which extends from plugin_params
     //The params are filled in before the trap is added: other threads returning to the same address may hit it
@@ -539,7 +750,7 @@ event_response_t win_syscalls::dispatcher_cb(drakvuf_t drakvuf, drakvuf_trap_inf
     privilege_mode_t mode = MAXIMUM_MODE;
     if (!drakvuf_get_current_thread_previous_mode(drakvuf, info, &mode))
         PRINT_DEBUG("[SYSCALLS] Failed to get previous mode\n");
-    auto [ret_mode, module, parent_module] = resolve_retinfo(drakvuf, info, this, mode, dispatcher_caller(drakvuf, info, this, mode));
+    auto origin = get_origin(drakvuf, info, this, mode, dispatcher_caller(drakvuf, info, this, mode));
 
     // Named after the syscall so Method shows it, as its own breakpoint was. The dispatcher's is
     // shared by all syscalls and vCPU threads, so a copy is named.
@@ -547,7 +758,7 @@ event_response_t win_syscalls::dispatcher_cb(drakvuf_t drakvuf, drakvuf_trap_inf
     trap.name = target.name;
     drakvuf_trap_info_t named_info = *info;
     named_info.trap = &trap;
-    this->print_syscall(drakvuf, &named_info, target.num, type, target.sc, std::move(args), ret_mode, std::move(module), std::move(parent_module));
+    this->print_syscall(drakvuf, &named_info, target.num, type, target.sc, std::move(args), origin);
 
     if (this->disable_sysret || this->is_stopping())
         return VMI_EVENT_RESPONSE_NONE;
@@ -747,6 +958,27 @@ win_syscalls::win_syscalls(drakvuf_t drakvuf, const syscalls_config* config, out
     {
         PRINT_DEBUG("[SYSCALLS] Failed to get ImagePathName from _RTL_USER_PROCESS_PARAMETERS\n");
         throw -1;
+    }
+
+    // The 32-bit registers WoW64 saves, from the 32-bit ntdll's profile (--json-wow). Without it a
+    // WoW64 process's syscalls are reported with their 64-bit frames only.
+    if (json_object* json_wow = this->is32bit ? nullptr : drakvuf_get_json_wow(drakvuf))
+    {
+        if (!json_get_struct_member_rva(drakvuf, json_wow, "_CONTEXT", "Eip", &this->wow64_context_eip) ||
+            !json_get_struct_member_rva(drakvuf, json_wow, "_CONTEXT", "Esp", &this->wow64_context_esp))
+        {
+            this->wow64_context_eip = this->wow64_context_esp = 0;
+        }
+    }
+    if (!this->is32bit && !this->wow64_context_eip)
+        PRINT_DEBUG("[SYSCALLS] No WoW64 profile (--json-wow): the 32-bit side of WoW64 syscalls is not reported\n");
+
+    // The service a thread called, to compare with the stub its syscall ran in (get_origin);
+    // without it the comparison is not made. Dispatcher mode needs it as well (setup_dispatcher).
+    if (!this->is32bit &&
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "_KTHREAD", "SystemCallNumber", &this->thread_syscall_number))
+    {
+        this->thread_syscall_number = 0;
     }
 
     // Per-call sysret mode places each return breakpoint from the return address of the service
@@ -957,9 +1189,7 @@ event_response_t win_syscalls::delete_process_cb(drakvuf_t drakvuf, drakvuf_trap
 void win_syscalls::print_syscall(
     drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     int nr, const char* module, const syscall_t* sc,
-    std::vector<uint64_t> args, privilege_mode_t mode,
-    std::optional<std::string> from_dll,
-    std::optional<std::string> from_parent_dll
+    std::vector<uint64_t> args, const syscall_origin& origin
 )
 {
     // The trap is already named after the syscall when it is known
@@ -969,28 +1199,65 @@ void win_syscalls::print_syscall(
     {
         for (size_t i = 0; i < args.size(); ++i)
         {
+            uint64_t val = transform_value(drakvuf, info, sc->args[i], args[i]);
+            if ( sc->args[i].type == POBJECT_ATTRIBUTES )
+            {
+                // The pointer, and the object it names -- a file, a key, a
+                // mutex... -- under capemon's name for it. At the kernel's
+                // entry the structure has the kernel's layout, also for WoW64.
+                fmt_args.push_back(keyval(sc->args[i].name, fmt::Xval(val)));
+                if ( sc->args[i].dir == DIR_IN || sc->args[i].dir == DIR_INOUT )
+                {
+                    if (auto object = read_object_attributes(drakvuf, info, sc->name, sc->args[i].name,
+                                args[i], drakvuf_get_address_width(drakvuf) == 4))
+                        fmt_args.push_back(keyval(object->label, fmt::Estr(std::move(object->name))));
+                }
+                continue;
+            }
             auto str = this->parse_argument(drakvuf, info, sc->args[i], args[i]);
-            if ( !str.empty() )
+            if ( !str.empty() && !strcmp((sc->args[i]).name, "FileHandle") ){
+                fmt_args.push_back(keyval(sc->args[i].name, fmt::Xval(val)));
+                fmt_args.push_back(keyval("FileName", fmt::Estr(str)));
+            }
+            else if ( !str.empty() )
                 fmt_args.push_back(keyval(sc->args[i].name, fmt::Estr(str)));
             else
             {
-                uint64_t val = transform_value(drakvuf, info, sc->args[i], args[i]);
                 fmt_args.push_back(keyval(sc->args[i].name, fmt::Xval(val)));
             }
         }
     }
 
-    std::optional<fmt::Estr<std::string>> from_dll_opt, from_parent_dll_opt;
     std::optional<fmt::Rstr<const char*>> priv_mode_opt;
+    if (origin.mode != MAXIMUM_MODE)
+        priv_mode_opt = fmt::Rstr(origin.mode == USER_MODE ? "User" : "Kernel");
 
-    if (from_dll.has_value())
-        from_dll_opt = fmt::Estr(std::move(*from_dll));
-
-    if (from_parent_dll.has_value())
-        from_parent_dll_opt = fmt::Estr(std::move(*from_parent_dll));
-
-    if (mode != MAXIMUM_MODE)
-        priv_mode_opt = fmt::Rstr(mode == USER_MODE ? "User" : "Kernel");
+    // Each frame (get_origin) as an address, its module and, for a second mapping of a system DLL,
+    // that mapping's base (`...Copy`). An address is left out when unknown (0); a module when it
+    // could not be looked up, and "" for memory no file backs: the analysis tells the two apart.
+    // StubSyscall, the call target and the copies are printed only when there is one.
+    auto address = [](addr_t value)
+    {
+        std::optional<fmt::Xval<addr_t>> out;
+        if (value)
+            out = fmt::Xval(value);
+        return out;
+    };
+    auto module_of = [](const frame& f)
+    {
+        std::optional<fmt::Estr<std::string>> out;
+        if (f.address && f.module)
+            out = fmt::Estr(*f.module);
+        return out;
+    };
+    std::optional<fmt::Xval<uint32_t>> stub_syscall;
+    if (origin.stub_syscall)
+        stub_syscall = fmt::Xval(*origin.stub_syscall);
+    // A WoW64 process's: 32 when the frames are the 32-bit call's, 64 when they are 64-bit code's.
+    // Left out for a 64-bit process.
+    std::optional<fmt::Nval<int>> bitness;
+    if (origin.bitness)
+        bitness = fmt::Nval(origin.bitness);
 
     fmt::print(this->m_output_format, "syscall", drakvuf, info,
         keyval("Module", fmt::Qstr(std::move(module))),
@@ -999,8 +1266,16 @@ void win_syscalls::print_syscall(
         keyval("Syscall", fmt::Nval(nr)),
         keyval("NArgs", fmt::Nval(args.size())),
         keyval("PreviousMode", priv_mode_opt),
-        keyval("FromModule", from_dll_opt),
-        keyval("FromParentModule", from_parent_dll_opt),
+        keyval("Bitness", bitness),
+        keyval("Caller", address(origin.caller.address)),
+        keyval("FromModule", module_of(origin.caller)),
+        keyval("FromModuleCopy", address(origin.caller.copy)),
+        keyval("ParentCaller", address(origin.parent.address)),
+        keyval("FromParentModule", module_of(origin.parent)),
+        keyval("FromParentModuleCopy", address(origin.parent.copy)),
+        keyval("StubSyscall", stub_syscall),
+        keyval("ParentCallTarget", address(origin.call_target.address)),
+        keyval("ParentCallTargetModule", module_of(origin.call_target)),
         std::move(fmt_args)
     );
 }

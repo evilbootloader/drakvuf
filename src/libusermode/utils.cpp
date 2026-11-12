@@ -197,6 +197,67 @@ std::unique_ptr<ArgumentPrinter> make_arg_printer(
     {
         return std::make_unique<Binary16StringPrinter>(name, config);
     }
+    else if (type == "lpsockaddr" || type == "psockaddr" || type == "sockaddr*")
+    {
+        return std::make_unique<SockaddrPrinter>(name, config);
+    }
+    else if (type == "ppsockaddr" || type == "sockaddr**")
+    {
+        return std::make_unique<PointerToSockaddrPrinter>(name, config);
+    }
+    else if (type == "lpwsabuf" || type == "pdata_blob")
+    {
+        // A DATA_BLOB (CryptProtectData's) is a WSABUF: a 32-bit length,
+        // then the pointer
+        return std::make_unique<WsaBufPrinter>(name, config);
+    }
+    else if (type == "psecbufferdesc" || type == "opsecbufferdesc")
+    {
+        return std::make_unique<SecBufferDescPrinter>(name, type == "opsecbufferdesc", config);
+    }
+    else if (type == "pclient_id")
+    {
+        return std::make_unique<ClientIdPrinter>(name, config);
+    }
+    else if (type == "plarge_integer")
+    {
+        return std::make_unique<LargeIntegerPrinter>(name, config);
+    }
+    else if (type == "ppaddrinfo" || type == "ppaddrinfoex")
+    {
+        return std::make_unique<AddrinfoPrinter>(name, type == "ppaddrinfoex", config);
+    }
+    else if (type == "ppdns_record")
+    {
+        return std::make_unique<DnsRecordPrinter>(name, config);
+    }
+    else if (type == "argv")
+    {
+        return std::make_unique<ArgvPrinter>(name, config);
+    }
+    else if (type == "pcontext")
+    {
+        return std::make_unique<ContextPrinter>(name, config);
+    }
+    // buffer[Len] / obuffer[Len]: Len is resolved to an index by parse_arguments
+    else if ((type.rfind("buffer[", 0) == 0 || type.rfind("obuffer[", 0) == 0) && type.back() == ']')
+    {
+        const bool output = type[0] == 'o';
+        const size_t open = type.find('[');
+        return std::make_unique<BufferPrinter>(name, type.substr(open + 1, type.size() - open - 2), output, config);
+    }
+    // Integers narrower than a register. Not `long`/`ulong`: 32 bits on
+    // Windows, 64 on Linux, and a hook list does not say which it is for.
+    // Not `byte` either: hooks.txt gives that type to buffer pointers.
+    else if (type == "dword" || type == "int" || type == "uint" || type == "bool"
+        || type == "regsam" || type == "access_mask" || type == "alg_id" || type == "lcid")
+    {
+        return std::make_unique<NarrowIntegerPrinter>(name, 32, config);
+    }
+    else if (type == "word" || type == "short" || type == "ushort" || type == "langid")
+    {
+        return std::make_unique<NarrowIntegerPrinter>(name, 16, config);
+    }
 
     return std::make_unique<ArgumentPrinter>(name, config);
 }
@@ -228,7 +289,21 @@ std::vector<std::unique_ptr<ArgumentPrinter>> parse_arguments(
             arg_type = arg.substr(pos + 1);
         }
 
-        argument_printers.emplace_back(make_arg_printer(config, arg_type, arg_name));
+        auto printer = make_arg_printer(config, arg_type, arg_name);
+        printer->set_type(arg_type);
+        argument_printers.emplace_back(std::move(printer));
+    }
+
+    // A buffer's length argument, by name: before or after it in the line.
+    // An unknown name leaves the buffer a plain pointer.
+    for (auto& printer : argument_printers)
+    {
+        auto* buffer = dynamic_cast<BufferPrinter*>(printer.get());
+        if (!buffer || buffer->length_from_return())
+            continue;
+        for (size_t i = 0; i < argument_printers.size(); ++i)
+            if (argument_printers[i]->get_name() == buffer->get_length_name())
+                buffer->set_length_index(i);
     }
     return argument_printers;
 }

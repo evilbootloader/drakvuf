@@ -276,7 +276,130 @@ std::vector<uint64_t> linux_syscalls::build_arguments_buffer(drakvuf_t drakvuf, 
     return arguments;
 }
 
-void linux_syscalls::print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* entry_info, const syscalls_ns::syscall_t* sc, uint16_t syscall_num, const char* syscall_type, std::vector<uint64_t> arguments)
+/*
+ * What get_origin reads, from the kernel profile: the vDSO of an mm_struct and its size, the
+ * dentry of a struct file, and the kernel's vDSO images, which tell a 32-bit process from a 64-bit
+ * one. False when one is missing: syscalls are reported without where they came from then.
+ */
+bool linux_syscalls::setup_origin(drakvuf_t drakvuf)
+{
+    addr_t mm_context = 0, context_vdso = 0, context_vdso_image = 0, file_path = 0, path_dentry = 0;
+    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "task_struct", "mm", &this->task_mm) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "mm_struct", "context", &mm_context) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "mm_context_t", "vdso", &context_vdso) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "mm_context_t", "vdso_image", &context_vdso_image) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "vdso_image", "size", &this->vdso_image_size) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "file", "f_path", &file_path) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "path", "dentry", &path_dentry))
+        return false;
+    this->mm_vdso = mm_context + context_vdso;
+    this->mm_vdso_image = mm_context + context_vdso_image;
+    this->file_dentry = file_path + path_dentry;
+
+    // A kernel without the compat ABIs has no vdso_image_32 or vdso_image_x32
+    auto vmi = vmi_lock_guard(drakvuf);
+    if (VMI_SUCCESS != vmi_translate_ksym2v(vmi, "vdso_image_64", &this->vdso_image_64))
+        return false;
+    vmi_translate_ksym2v(vmi, "vdso_image_32", &this->vdso_image_32);
+    vmi_translate_ksym2v(vmi, "vdso_image_x32", &this->vdso_image_x32);
+    return true;
+}
+
+/*
+ * The file mapped at `addr`: its path, or "" for memory no file backs; nothing when it could not
+ * be looked up -- the VMA list, which only kernels before 6.1 have (drakvuf_linux_find_vma), or
+ * the file's path. A file is cached by its VMA's range; memory no file backs is not, since it is
+ * unmapped and mapped again, and a file may be mapped where it was.
+ */
+std::optional<std::string> linux_syscalls::resolve_module(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t mm, addr_t addr)
+{
+    const auto key = std::make_pair(info->proc_data.pid, mm);
+    {
+        std::lock_guard<std::mutex> lock(this->mappings_mtx);
+        if (auto it = this->mappings.find(key); it != this->mappings.end())
+        {
+            for (const auto& m : it->second)
+                if (addr >= m.start && addr < m.end)
+                    return m.name;
+        }
+    }
+
+    const addr_t task = info->proc_data.base_addr;
+    addr_t file = 0;
+    if (!drakvuf_linux_find_vma_file(drakvuf, task, addr, &file))
+        return {};
+    if (!file)
+        return std::string();
+
+    addr_t dentry = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        if (VMI_SUCCESS != vmi_read_addr_va(vmi, file + this->file_dentry, 0, &dentry) || !dentry)
+            return {};
+    }
+    char* path = drakvuf_get_filepath_from_dentry(drakvuf, dentry);
+    if (!path)
+        return {};
+    std::string name = path;
+    g_free(path);
+
+    addr_t start = 0, end = 0;
+    if (drakvuf_linux_find_vma(drakvuf, task, addr, &start, &end))
+    {
+        std::lock_guard<std::mutex> lock(this->mappings_mtx);
+        this->mappings[key].push_back({ start, end, name });
+    }
+    return name;
+}
+
+/*
+ * Where a syscall was made from: pt_regs->ip, the instruction after the one that entered the
+ * kernel, and the file mapped there. That is libc, the dynamic linker, the vDSO or the program
+ * itself -- static and Go programs make their syscalls from their own code, so a program's own
+ * file says nothing -- or memory no file backs: shellcode, injected code, a packer's unpacked
+ * program. No frame 1 as on Windows: a libc wrapper that is a cancellation point keeps a frame
+ * of its own, so the word at the stack pointer is not always a return address, and nothing here
+ * unwinds with .eh_frame.
+ *
+ * For a 32-bit syscall, the process's bitness, by its vDSO -- the kernel maps vdso_image_32 for a
+ * 32-bit process -- since a 64-bit process making one (int 0x80) goes past what traces only the
+ * 64-bit syscall table, and past seccomp filters written for it. pt_regs->cs would not say: the
+ * sysenter and compat syscall entries store a constant there.
+ */
+linux_syscalls::syscall_origin linux_syscalls::get_origin(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t pt_regs_addr, const char* syscall_type)
+{
+    syscall_origin origin;
+    if (!this->task_mm || !pt_regs_addr)
+        return origin;
+
+    addr_t mm = 0, vdso = 0, vdso_image = 0, vdso_size = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        if (VMI_SUCCESS != vmi_read_addr_va(vmi, pt_regs_addr + this->regs[PT_REGS_RIP], 0, &origin.caller) ||
+            VMI_SUCCESS != vmi_read_addr_va(vmi, info->proc_data.base_addr + this->task_mm, 0, &mm) || !mm)
+            return {};
+        if (VMI_SUCCESS == vmi_read_addr_va(vmi, mm + this->mm_vdso, 0, &vdso) &&
+            VMI_SUCCESS == vmi_read_addr_va(vmi, mm + this->mm_vdso_image, 0, &vdso_image) && vdso_image &&
+            VMI_SUCCESS != vmi_read_addr_va(vmi, vdso_image + this->vdso_image_size, 0, &vdso_size))
+            vdso_size = 0;
+    }
+
+    if (vdso && origin.caller >= vdso && origin.caller < vdso + vdso_size)
+        origin.module = "[vdso]";
+    else if (origin.caller)
+        origin.module = this->resolve_module(drakvuf, info, mm, origin.caller);
+
+    if (!strcmp(syscall_type, SYSCALL_TYPE_LINUX_X32) && vdso_image)
+    {
+        if (vdso_image == this->vdso_image_32)
+            origin.bitness = 32;
+        else if (vdso_image == this->vdso_image_64 || vdso_image == this->vdso_image_x32)
+            origin.bitness = 64;
+    }
+    return origin;
+}
+
+void linux_syscalls::print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* entry_info, const syscalls_ns::syscall_t* sc, uint16_t syscall_num, const char* syscall_type, std::vector<uint64_t> arguments, const syscall_origin& origin)
 {
     // Name the trap after the syscall so Method shows it. The dispatcher hooks are shared by all
     // syscalls and may run on several vCPU threads at once, so a copy of the trap is named.
@@ -304,6 +427,17 @@ void linux_syscalls::print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* entry
     std::string thread_name = tmp ?: "";
     g_free(tmp);
 
+    // Where it was made from (get_origin): left out when unknown
+    std::optional<fmt::Xval<addr_t>> caller;
+    if (origin.caller)
+        caller = fmt::Xval(origin.caller);
+    std::optional<fmt::Estr<std::string>> from_module;
+    if (origin.caller && origin.module)
+        from_module = fmt::Estr(*origin.module);
+    std::optional<fmt::Nval<int>> bitness;
+    if (origin.bitness)
+        bitness = fmt::Nval(origin.bitness);
+
     fmt::print(this->m_output_format, "syscall", drakvuf, info,
         keyval("ThreadName", fmt::Estr(thread_name)),
         keyval("Module", fmt::Qstr(std::move(info->trap->breakpoint.module))),
@@ -312,6 +446,9 @@ void linux_syscalls::print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* entry
         keyval("Syscall", fmt::Nval((uint64_t)syscall_num)),
         keyval("NArgs", fmt::Nval(sc->num_args)),
         keyval("Type", fmt::Rstr(syscall_type)),
+        keyval("Bitness", bitness),
+        keyval("Caller", caller),
+        keyval("FromModule", from_module),
         fmt_args
     );
 }
@@ -439,7 +576,8 @@ event_response_t linux_syscalls::linux_cb(drakvuf_t drakvuf, drakvuf_trap_info_t
     }
 
     auto arguments = build_arguments_buffer(drakvuf, info, pt_regs_addr, nr, syscall_def, syscall_type);
-    this->print_syscall(drakvuf, info, syscall_def, syscall_num, syscall_type, arguments);
+    this->print_syscall(drakvuf, info, syscall_def, syscall_num, syscall_type, arguments,
+        this->get_origin(drakvuf, info, pt_regs_addr, syscall_type));
 
     if (this->disable_sysret || this->is_stopping())
         return VMI_EVENT_RESPONSE_NONE;
@@ -660,6 +798,12 @@ linux_syscalls::linux_syscalls(drakvuf_t drakvuf, const syscalls_config* config,
             __PT_REGS_MAX - __PT_REGS_REQUIRED, this->regs.data() + __PT_REGS_REQUIRED))
     {
         fprintf(stderr, "[SYSCALLS] Warning: optional pt_regs offsets unavailable (cs/ss)\n");
+    }
+
+    if (!this->setup_origin(drakvuf))
+    {
+        this->task_mm = 0;
+        fprintf(stderr, "[SYSCALLS] Warning: the kernel profile lacks the vDSO or file offsets: syscalls are reported without where they were made from\n");
     }
 
     if (!this->trap_syscall_table_entries(drakvuf))

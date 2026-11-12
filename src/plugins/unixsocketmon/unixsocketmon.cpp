@@ -173,33 +173,55 @@ bool unixsocketmon::get_socket_family_type(drakvuf_t drakvuf, drakvuf_trap_info_
  */
 std::vector<uint8_t> unixsocketmon::get_socket_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t* ret_size)
 {
-    if (!this->have_message)
+    iter_snapshot iter = snapshot_message(drakvuf, info, drakvuf_get_function_argument(drakvuf, info, 2));
+    if (!iter.valid)
         return {};
+    if (ret_size)
+        *ret_size = iter.count;
+    return read_message(drakvuf, info, iter, std::min(iter.count, this->print_max_size));
+}
 
-    addr_t iter = drakvuf_get_function_argument(drakvuf, info, 2) + this->msghdr_msg_iter;
+iter_snapshot unixsocketmon::snapshot_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t msghdr)
+{
+    iter_snapshot out;
+    if (!this->have_message || !msghdr)
+        return out;
+
+    addr_t iter = msghdr + this->msghdr_msg_iter;
+    auto vmi = vmi_lock_guard(drakvuf);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3
+    );
+    ctx.addr = iter + this->iov_iter_type;
+    if (VMI_FAILURE == vmi_read_8(vmi, &ctx, &out.type))
+        return out;
+    ctx.addr = iter + this->iov_iter_count;
+    if (VMI_FAILURE == vmi_read_64(vmi, &ctx, &out.count))
+        return out;
+    ctx.addr = iter + this->iov_iter_iov;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &out.ptr))
+        return out;
+    if (out.type != this->iter_ubuf)
+    {
+        ctx.addr = iter + this->iov_iter_nr_segs;
+        if (VMI_FAILURE == vmi_read_64(vmi, &ctx, &out.nr_segs))
+            out.nr_segs = 0;
+    }
+    out.valid = true;
+    return out;
+}
+
+std::vector<uint8_t> unixsocketmon::read_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const iter_snapshot& iter, uint64_t wanted)
+{
+    const uint8_t type = iter.type;
+    const addr_t ptr = iter.ptr;
 
     auto vmi = vmi_lock_guard(drakvuf);
     ACCESS_CONTEXT(ctx,
         .translate_mechanism = VMI_TM_PROCESS_DTB,
         .dtb = info->regs->cr3
     );
-
-    uint8_t type = 0;
-    uint64_t count = 0;
-    addr_t ptr = 0;
-    ctx.addr = iter + this->iov_iter_type;
-    if (VMI_FAILURE == vmi_read_8(vmi, &ctx, &type))
-        return {};
-    ctx.addr = iter + this->iov_iter_count;
-    if (VMI_FAILURE == vmi_read_64(vmi, &ctx, &count))
-        return {};
-    ctx.addr = iter + this->iov_iter_iov;
-    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &ptr))
-        return {};
-    if (ret_size)
-        *ret_size = count;
-
-    uint64_t wanted = std::min(count, this->print_max_size);
     std::vector<uint8_t> data;
     auto append = [&](addr_t buf, uint64_t len) -> bool
     {
@@ -223,12 +245,7 @@ std::vector<uint8_t> unixsocketmon::get_socket_message(drakvuf_t drakvuf, drakvu
     if (type != this->iter_iovec && type != this->iter_kvec)
         return data;
 
-    uint64_t nr_segs = 0;
-    ctx.addr = iter + this->iov_iter_nr_segs;
-    if (VMI_FAILURE == vmi_read_64(vmi, &ctx, &nr_segs))
-        return data;
-
-    for (uint64_t i = 0; i < nr_segs && i < MAX_SEGMENTS && data.size() < wanted; i++)
+    for (uint64_t i = 0; i < iter.nr_segs && i < MAX_SEGMENTS && data.size() < wanted; i++)
     {
         addr_t seg = ptr + i * this->iovec_size;
         addr_t base = 0;
@@ -371,6 +388,24 @@ void unixsocketmon::read_sockaddr(vmi_instance_t vmi, access_context_t* ctx, add
 
 socket_endpoints unixsocketmon::read_endpoints(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t socket, uint32_t family)
 {
+    addr_t sk = 0;
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3,
+            .addr = socket + this->socket_sk
+        );
+        if (!this->have_inet && !this->have_unix)
+            return {};
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &sk) || !sk)
+            return {};
+    }
+    return read_endpoints_sk(drakvuf, info, sk, family);
+}
+
+socket_endpoints unixsocketmon::read_endpoints_sk(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t sk, uint32_t family)
+{
     socket_endpoints ep;
     bool inet = family == AF_INET || family == AF_INET6;
     if (!(inet && this->have_inet) && !(family == AF_LOCAL && this->have_unix))
@@ -381,11 +416,6 @@ socket_endpoints unixsocketmon::read_endpoints(drakvuf_t drakvuf, drakvuf_trap_i
         .translate_mechanism = VMI_TM_PROCESS_DTB,
         .dtb = info->regs->cr3
     );
-
-    addr_t sk = 0;
-    ctx.addr = socket + this->socket_sk;
-    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &sk) || !sk)
-        return ep;
 
     if (family == AF_LOCAL)
     {
@@ -440,8 +470,6 @@ event_response_t unixsocketmon::sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap
     uint32_t family_type;
     if (!get_socket_family_type(drakvuf, info, &family_type))
         return VMI_EVENT_RESPONSE_NONE;
-    auto socket_family_str = socket_family_to_str((socket_family_t)family_type);
-
     uint64_t size = 0;
     auto message = get_socket_message(drakvuf, info, &size);
 
@@ -467,14 +495,24 @@ event_response_t unixsocketmon::sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap
         }
     }
 
+    print_message(drakvuf, info, family_type, ep, size, message);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+// A message's record, sent or received: its endpoints, size and first
+// print_max_size bytes, as text when they are, else as a binary string
+void unixsocketmon::print_message(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint32_t family,
+    const socket_endpoints& ep, uint64_t size, const std::vector<uint8_t>& message)
+{
+    auto socket_family_str = socket_family_to_str((socket_family_t)family);
     unicode_string_t msg =
     {
         .length = message.size(),
-        .contents = message.data(),
+        .contents = const_cast<uint8_t*>(message.data()),
         .encoding = "UTF-8"
     };
 
-    unicode_string_t out;
+    unicode_string_t out{};
     status_t rc = vmi_convert_str_encoding(&msg, &out, "UTF-8");
 
     if (VMI_FAILURE == rc || !is_printable_string(message))
@@ -497,8 +535,6 @@ event_response_t unixsocketmon::sock_send_msg_cb(drakvuf_t drakvuf, drakvuf_trap
     }
 
     g_free(out.contents);
-
-    return VMI_EVENT_RESPONSE_NONE;
 }
 
 /*
@@ -545,6 +581,190 @@ event_response_t unixsocketmon::connect_cb(drakvuf_t drakvuf, drakvuf_trap_info_
         keyval("Type", fmt::Rstr(socket_family_to_str((socket_family_t)family_type))),
         ep.keyvals()
     );
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+/*
+ * int security_socket_bind(struct socket *sock, struct sockaddr *address, int addrlen)
+ *
+ * The address the socket is about to be bound to, copied into the kernel:
+ * its local end, which a listening socket keeps. A port 0 is the kernel's to
+ * choose, and is printed as 0.
+ */
+event_response_t unixsocketmon::bind_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    uint32_t family_type;
+    if (!get_socket_family_type(drakvuf, info, &family_type))
+        return VMI_EVENT_RESPONSE_NONE;
+    if (family_type != AF_INET && family_type != AF_INET6 && family_type != AF_LOCAL)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    addr_t sock = drakvuf_get_function_argument(drakvuf, info, 1);
+    addr_t address = drakvuf_get_function_argument(drakvuf, info, 2);
+    uint32_t addrlen = (uint32_t)drakvuf_get_function_argument(drakvuf, info, 3);
+
+    // The protocol, from the socket; the address, from the call
+    socket_endpoints ep = read_endpoints(drakvuf, info, sock, family_type);
+    socket_endpoints bound;
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3
+        );
+        if (address && addrlen)
+            read_sockaddr(vmi, &ctx, address, addrlen, bound);
+    }
+    ep.local_ip = bound.remote_ip;
+    ep.local_port = bound.remote_port;
+    ep.local_path = bound.remote_path;
+    ep.remote_ip.clear();
+    ep.remote_port = -1;
+    ep.remote_path.clear();
+    ep.connected = -1;
+
+    fmt::print(this->m_output_format, "unixsocketmon", drakvuf, info,
+        keyval("Type", fmt::Rstr(socket_family_to_str((socket_family_t)family_type))),
+        ep.keyvals()
+    );
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+/*
+ * int security_socket_listen(struct socket *sock, int backlog)
+ *
+ * The socket is bound by now (an unbound one is bound to an ephemeral port
+ * first): its local end is the one connections will come to.
+ */
+event_response_t unixsocketmon::listen_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    uint32_t family_type;
+    if (!get_socket_family_type(drakvuf, info, &family_type))
+        return VMI_EVENT_RESPONSE_NONE;
+    if (family_type != AF_INET && family_type != AF_INET6 && family_type != AF_LOCAL)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    addr_t sock = drakvuf_get_function_argument(drakvuf, info, 1);
+    int backlog = (int)drakvuf_get_function_argument(drakvuf, info, 2);
+    socket_endpoints ep = read_endpoints(drakvuf, info, sock, family_type);
+    ep.remote_ip.clear();
+    ep.remote_port = -1;
+    ep.remote_path.clear();
+    ep.connected = -1;
+
+    fmt::print(this->m_output_format, "unixsocketmon", drakvuf, info,
+        keyval("Type", fmt::Rstr(socket_family_to_str((socket_family_t)family_type))),
+        ep.keyvals(),
+        keyval("Backlog", fmt::Nval(backlog))
+    );
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+/*
+ * void security_sock_graft(struct sock *sk, struct socket *parent)
+ *
+ * An accepted connection joined to the socket accept() returns: inet_accept
+ * and unix_accept (sock_graft) call it once the connection exists, so its
+ * struct sock has both ends -- what security_socket_accept, called before
+ * any connection is taken, cannot know.
+ */
+event_response_t unixsocketmon::graft_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    // The family from the struct sock itself: trusted only where
+    // find_endpoint_layout found sock_common where it expects it
+    if (!this->have_inet)
+        return VMI_EVENT_RESPONSE_NONE;
+    addr_t sk = drakvuf_get_function_argument(drakvuf, info, 1);
+    uint16_t family = 0;
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3,
+            .addr = sk + SKC_FAMILY
+        );
+        if (!sk || VMI_FAILURE == vmi_read_16(vmi, &ctx, &family))
+            return VMI_EVENT_RESPONSE_NONE;
+    }
+    if (family != AF_INET && family != AF_INET6 && family != AF_LOCAL)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    socket_endpoints ep = read_endpoints_sk(drakvuf, info, sk, family);
+    fmt::print(this->m_output_format, "unixsocketmon", drakvuf, info,
+        keyval("Type", fmt::Rstr(socket_family_to_str((socket_family_t)family))),
+        ep.keyvals()
+    );
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+/*
+ * int inet_recvmsg(struct socket *sock, struct msghdr *msg, size_t size, int flags)
+ * and the same for inet6, unix stream and unix datagram sockets
+ *
+ * The protocols' own recvmsg, called through sock->ops: not inlined, as
+ * sock_recvmsg is into its callers. The bytes exist only at the return,
+ * where the message's iterator has moved past them: where they go is taken
+ * here, and read there.
+ */
+event_response_t unixsocketmon::recvmsg_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    uint32_t family_type;
+    if (!get_socket_family_type(drakvuf, info, &family_type))
+        return VMI_EVENT_RESPONSE_NONE;
+    if (family_type != AF_INET && family_type != AF_INET6 && family_type != AF_LOCAL)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    addr_t sock = drakvuf_get_function_argument(drakvuf, info, 1);
+    addr_t msghdr = drakvuf_get_function_argument(drakvuf, info, 2);
+
+    auto hook = this->createReturnHook<recvmsg_result>(info, &unixsocketmon::recvmsg_ret_cb, "sock_recvmsg");
+    if (!hook)
+        return VMI_EVENT_RESPONSE_NONE;
+    auto params = libhook::GetTrapParams<recvmsg_result>(hook->trap_);
+    params->family = family_type;
+    params->ep = read_endpoints(drakvuf, info, sock, family_type);
+    params->iter = snapshot_message(drakvuf, info, msghdr);
+    params->msghdr = msghdr;
+    this->ret_hooks[make_hook_id(info, params->target_rsp)] = std::move(hook);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+event_response_t unixsocketmon::recvmsg_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    auto params = libhook::GetTrapParams<recvmsg_result>(info);
+    if (!params->verifyResultCallParams(drakvuf, info))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    // An int: the bytes received, or -errno
+    const int received = (int)info->regs->rax;
+    if (received > 0)
+    {
+        socket_endpoints ep = params->ep;
+        // An unconnected socket learns the sender per message (recvfrom)
+        if ((ep.inet || ep.unix_socket) && ep.connected != 1 && this->have_msg_name && params->msghdr)
+        {
+            auto vmi = vmi_lock_guard(drakvuf);
+            ACCESS_CONTEXT(ctx,
+                .translate_mechanism = VMI_TM_PROCESS_DTB,
+                .dtb = info->regs->cr3
+            );
+            addr_t name = 0;
+            uint32_t namelen = 0;
+            ctx.addr = params->msghdr + this->msghdr_msg_name;
+            if (VMI_SUCCESS == vmi_read_addr(vmi, &ctx, &name) && name)
+            {
+                ctx.addr = params->msghdr + this->msghdr_msg_namelen;
+                if (VMI_SUCCESS == vmi_read_32(vmi, &ctx, &namelen) && namelen)
+                    read_sockaddr(vmi, &ctx, name, namelen, ep);
+            }
+        }
+        std::vector<uint8_t> message;
+        if (params->iter.valid)
+            message = read_message(drakvuf, info, params->iter, std::min<uint64_t>(received, this->print_max_size));
+        print_message(drakvuf, info, params->family, ep, received, message);
+    }
+
+    this->ret_hooks.erase(make_hook_id(info, params->target_rsp));
     return VMI_EVENT_RESPONSE_NONE;
 }
 
@@ -674,4 +894,21 @@ unixsocketmon::unixsocketmon(drakvuf_t drakvuf, const unixsocketmon_config* conf
         sockethook = createSyscallHook("sock_sendmsg", &unixsocketmon::sock_send_msg_cb);
     if (!sockethook)
         fprintf(stderr, "[UNIXSOCKETMON] Failed to hook security_socket_sendmsg and sock_sendmsg\n");
+
+    // The rest of a socket's life, for what the syscall plugin would have:
+    // where it is bound and listens, what it accepts, what it receives.
+    // LSM hooks for the same reason as above; the receives in the protocols.
+    bindhook = createSyscallHook("security_socket_bind", &unixsocketmon::bind_cb, "bind");
+    listenhook = createSyscallHook("security_socket_listen", &unixsocketmon::listen_cb, "listen");
+    accepthook = createSyscallHook("security_sock_graft", &unixsocketmon::graft_cb, "accept");
+    if (!bindhook || !listenhook || !accepthook)
+        fprintf(stderr, "[UNIXSOCKETMON] Failed to hook security_socket_bind/listen or security_sock_graft, "
+            "binds, listens or accepts are not recorded\n");
+    for (const char* recv : { "inet_recvmsg", "inet6_recvmsg", "unix_stream_recvmsg", "unix_dgram_recvmsg" })
+    {
+        if (auto hook = createSyscallHook(recv, &unixsocketmon::recvmsg_cb, "sock_recvmsg"))
+            recvhooks.push_back(std::move(hook));
+        else
+            fprintf(stderr, "[UNIXSOCKETMON] Failed to hook %s, its receives are not recorded\n", recv);
+    }
 }

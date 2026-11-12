@@ -106,8 +106,24 @@
 #define LIBUSERMODE_PRINTERS_UTILS_H
 
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 std::string escape_str(const std::string& s);
+
+// Bytes as escape_str would print text, but every byte that is not
+// printable ASCII as \xHH, 0x80 and above included: a buffer is not UTF-8
+std::string escape_bytes(const uint8_t* data, size_t size);
+
+/*
+ * The address a sockaddr holds, as text: "203.0.113.7:443",
+ * "[2001:db8::1]:443", an AF_UNIX path, or "@name" for a Linux abstract
+ * socket. Nothing for another family, or for fewer bytes than the family's
+ * structure. `linux`: the guest's family numbers -- AF_INET6 is 23 on
+ * Windows and 10 on Linux; AF_INET (2) and AF_UNIX (1) are the same.
+ */
+std::optional<std::string> format_sockaddr(const uint8_t* buf, size_t len, bool linux);
 
 #endif

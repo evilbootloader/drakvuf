@@ -105,8 +105,12 @@
 #ifndef PRINTERS_H
 #define PRINTERS_H
 
-#include <string>
+#include <cstddef>
 #include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 #include <libvmi/libvmi.h>
 #include <libdrakvuf/libdrakvuf.h>
 
@@ -130,12 +134,58 @@ class ArgumentPrinter
 protected:
     PrinterConfig config;
     std::string name;
+    std::string type;
 public:
     ArgumentPrinter(std::string arg_name, PrinterConfig config = PrinterConfig{});
 
     std::string get_name() const;
+    const std::string& get_type() const { return type; }
+    void set_type(const std::string& t) { type = t; }
     virtual std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    // Whether print() reads a value the call may write through the argument
+    // (an out parameter). Such an argument means something only once the
+    // call has returned: printed at entry, NtAllocateVirtualMemory's
+    // BaseAddress is the 0 the caller passed, not the region it got.
+    virtual bool reads_output() const
+    {
+        return false;
+    }
+    // The number the argument stands for, which is what a buffer's length
+    // argument is read as: the register itself, cut to its width, or what
+    // it points to for a printer that dereferences one (pulong...).
+    virtual uint64_t value(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+    {
+        return argument;
+    }
+    // A buffer's: the index of the argument holding its length, or that
+    // the call's return value is (BufferPrinter). See print_argument.
+    virtual std::optional<size_t> length_argument() const
+    {
+        return {};
+    }
+    virtual bool length_from_return() const
+    {
+        return false;
+    }
+    // Printed with the length a buffer has; for anything else as print()
+    virtual std::string print_sized(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument, uint64_t length) const
+    {
+        return print(drakvuf, info, argument);
+    }
     virtual ~ArgumentPrinter();
+};
+
+// An integer narrower than the register it is passed in. On x64 only the
+// low bits of the register are the argument and the rest is whatever the
+// caller left there: a DWORD 0x10 printed as the register reads 0x4f00000010.
+class NarrowIntegerPrinter : public ArgumentPrinter
+{
+    unsigned bits;
+public:
+    NarrowIntegerPrinter(std::string arg_name, unsigned bits, PrinterConfig config = PrinterConfig{});
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    uint64_t value(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
 };
 
 class StringPrinterInterface : public ArgumentPrinter
@@ -188,6 +238,11 @@ public:
     using ArgumentPrinter::ArgumentPrinter;
 
     std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    uint64_t value(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    bool reads_output() const
+    {
+        return true;
+    }
 };
 
 class UlongLongPrinter : public ArgumentPrinter
@@ -196,6 +251,11 @@ public:
     using ArgumentPrinter::ArgumentPrinter;
 
     std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    uint64_t value(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    bool reads_output() const
+    {
+        return true;
+    }
 };
 
 class GuidPrinter : public ArgumentPrinter
@@ -210,6 +270,213 @@ class PointerToPointerPrinter : public ArgumentPrinter
 {
 public:
     using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    uint64_t value(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    bool reads_output() const
+    {
+        return true;
+    }
+};
+
+/*
+ * Bytes at the argument, as many as another argument says -- `buffer[Len]`
+ * in a hook list, Len an argument's name -- or as the call returns
+ * (`[return]`: recv, SSL_read). Printed like a string, every byte that is
+ * not printable ASCII as \xHH, up to MAX_BYTES. `buffer` is read at the
+ * hook (what the call is given: send's, CryptEncrypt's plaintext),
+ * `obuffer` at the return (what it filled: InternetReadFile's, recv's,
+ * CryptDecrypt's plaintext). Without its length, a plain pointer.
+ */
+class BufferPrinter : public ArgumentPrinter
+{
+    std::string length_name;
+    std::optional<size_t> length_index;
+    bool output;
+public:
+    // capemon logs a buffer up to a cap as well (buffer_log_max)
+    static constexpr size_t MAX_BYTES = 4096;
+
+    BufferPrinter(std::string arg_name, std::string length_name, bool output, PrinterConfig config = PrinterConfig{});
+
+    const std::string& get_length_name() const
+    {
+        return length_name;
+    }
+    void set_length_index(size_t index)
+    {
+        length_index = index;
+    }
+    std::optional<size_t> length_argument() const
+    {
+        return length_index;
+    }
+    bool length_from_return() const
+    {
+        return length_name == "return";
+    }
+    bool reads_output() const
+    {
+        return output;
+    }
+    std::string print_sized(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument, uint64_t length) const;
+
+    static std::string print_bytes(const std::string& name, const PrinterConfig& config, uint64_t argument,
+        const uint8_t* data, size_t size);
+};
+
+// A WSABUF array (WSASend's, WSARecv's lpBuffers): the first buffer's bytes,
+// as BufferPrinter prints them. Read at the return, where WSARecv's is filled.
+class WsaBufPrinter : public ArgumentPrinter
+{
+public:
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    bool reads_output() const
+    {
+        return true;
+    }
+};
+
+// A SecBufferDesc (EncryptMessage's, DecryptMessage's pMessage): the bytes
+// of its first SECBUFFER_DATA buffer, as BufferPrinter prints them -- the
+// message itself, beside the header, trailer and padding tokens. Both
+// calls work in place: `psecbufferdesc` is read at the hook (the plaintext
+// EncryptMessage is given), `opsecbufferdesc` at the return (the
+// plaintext DecryptMessage made).
+class SecBufferDescPrinter : public ArgumentPrinter
+{
+    bool output;
+public:
+    static constexpr uint32_t SECBUFFER_DATA = 1;
+    // BufferType's high bits are attributes (SECBUFFER_READONLY...)
+    static constexpr uint32_t SECBUFFER_ATTRMASK = 0xF0000000;
+    // More than a message ever has (SChannel's: four); bounds the walk
+    static constexpr uint32_t MAX_BUFFERS = 16;
+
+    SecBufferDescPrinter(std::string arg_name, bool output, PrinterConfig config = PrinterConfig{})
+        : ArgumentPrinter(std::move(arg_name), config), output(output) {}
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    bool reads_output() const
+    {
+        return output;
+    }
+};
+
+// A CLIENT_ID (NtOpenProcess's, NtOpenThread's, RtlCreateUserThread's) as
+// "pid:tid", in decimal: name=0xADDR:"1234:0".
+class ClientIdPrinter : public ArgumentPrinter
+{
+public:
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    bool reads_output() const
+    {
+        return true;
+    }
+};
+
+// A LARGE_INTEGER, signed, in decimal: NtDelayExecution's interval is
+// negative 100 ns units for a relative delay (-50000000 is 5 s).
+class LargeIntegerPrinter : public ArgumentPrinter
+{
+public:
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+};
+
+/*
+ * A resolver's answer, from the pointer the call writes it through
+ * (getaddrinfo's, GetAddrInfoW's res; GetAddrInfoExW's ppResult): the
+ * addresses of the list's nodes, comma-separated -- "203.0.113.7,2001:db8::1".
+ * `ex`: ADDRINFOEX, with its blob and provider before ai_next. Read at the
+ * return, where the list exists.
+ */
+class AddrinfoPrinter : public ArgumentPrinter
+{
+    bool ex;
+public:
+    AddrinfoPrinter(std::string arg_name, bool ex, PrinterConfig config = PrinterConfig{});
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    bool reads_output() const
+    {
+        return true;
+    }
+};
+
+// DnsQuery_*'s answer (ppQueryResults): the A and AAAA records' addresses,
+// as AddrinfoPrinter prints them
+class DnsRecordPrinter : public ArgumentPrinter
+{
+public:
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    bool reads_output() const
+    {
+        return true;
+    }
+};
+
+// A NULL-terminated array of strings (execve's argv), joined by spaces
+class ArgvPrinter : public ArgumentPrinter
+{
+public:
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+};
+
+// A thread CONTEXT (NtSetContextThread's, SetThreadContext's): the debug
+// registers and the instruction pointer, "Dr0=0x0;...;Dr7=0x0;Rip=0x..."
+class ContextPrinter : public ArgumentPrinter
+{
+public:
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+};
+
+/*
+ * Argument `i` of a call printed by its printer, a buffer with the length
+ * its length argument stands for (that printer's value()) or the call's
+ * return value. `arguments` are the call's raw arguments, read at the hook;
+ * `return_value` is none when printing at the hook.
+ */
+std::string print_argument(drakvuf_t drakvuf, drakvuf_trap_info* info,
+    const std::vector<std::unique_ptr<ArgumentPrinter>>& printers, const std::vector<uint64_t>& arguments,
+    size_t i, std::optional<uint64_t> return_value);
+
+// A sockaddr -- connect's, sendto's, accept's... -- printed as the address it
+// holds (format_sockaddr), like a string: name=0xADDR:"203.0.113.7:443". As
+// a plain pointer when it holds none this decodes.
+class SockaddrPrinter : public ArgumentPrinter
+{
+public:
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+    // accept's, recvfrom's and getpeername's are the call's to fill; the
+    // ones a call reads are the caller's, unchanged by the return
+    bool reads_output() const
+    {
+        return true;
+    }
+};
+
+// A pointer to a sockaddr pointer the call fills (GetAcceptExSockaddrs's
+// LocalSockaddr and RemoteSockaddr: where in AcceptEx's buffer each address
+// is): the address that one holds, as SockaddrPrinter prints it. Read at
+// the return.
+class PointerToSockaddrPrinter : public SockaddrPrinter
+{
+public:
+    using SockaddrPrinter::SockaddrPrinter;
 
     std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
 };
