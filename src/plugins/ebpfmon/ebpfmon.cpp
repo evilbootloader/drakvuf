@@ -197,10 +197,16 @@ event_response_t ebpfmon::sys_bpf_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* inf
 ebpfmon::ebpfmon(drakvuf_t drakvuf, output_format_t output)
     : pluginex(drakvuf, output)
 {
+    // Since 5.14 the compiler usually folds __do_sys_bpf into its caller and
+    // the body is __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size). A
+    // bpfptr_t travels in two registers, pointer first, so cmd and the
+    // attribute pointer are the first two arguments of both.
     ebpfhook = createSyscallHook("__do_sys_bpf", &ebpfmon::sys_bpf_cb, "bpf");
     if (nullptr == ebpfhook)
+        ebpfhook = createSyscallHook("__sys_bpf", &ebpfmon::sys_bpf_cb, "bpf");
+    if (nullptr == ebpfhook)
     {
-        PRINT_DEBUG("[EBPFMON] Method __do_sys_bpf not found.\n");
+        fprintf(stderr, "[EBPFMON] Neither __do_sys_bpf nor __sys_bpf found, ebpfmon disabled\n");
         return;
     }
 }
