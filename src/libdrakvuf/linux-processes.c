@@ -273,59 +273,8 @@ static void prepend_path(drakvuf_t drakvuf, addr_t path, addr_t root, GString* b
         return;
     }
 
-    while (dentry != root_dentry || vfsmnt != root_mnt)
-    {
-        addr_t mnt_mnt_root;
-        ctx.addr = vfsmnt + drakvuf->offsets[VFSMOUNT_MNT_ROOT];
-        if (VMI_FAILURE == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &mnt_mnt_root))
-        {
-            PRINT_DEBUG("Can't read path->mnt->mnt_root from vfsmnt\n");
-            return;
-        }
-
-        addr_t dentry_parent;
-        ctx.addr = dentry + drakvuf->offsets[DENTRY_D_PARENT];
-        if (VMI_FAILURE == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &dentry_parent))
-        {
-            PRINT_DEBUG("Can't read path->dentry->d_parent\n");
-            return;
-        }
-
-        // End of cycle
-        if (dentry == mnt_mnt_root || dentry == dentry_parent)
-            break;
-
-        addr_t qname_addr;
-        ctx.addr = dentry + drakvuf->offsets[DENTRY_D_NAME] + drakvuf->offsets[QSTR_NAME];
-        if (VMI_FAILURE == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &qname_addr))
-        {
-            PRINT_DEBUG("Can't read path->dentry->qstr->name pointer\n");
-            return;
-        }
-
-        ctx.addr = qname_addr;
-        gchar* res = vmi_read_str(drakvuf_vmi(drakvuf), &ctx);
-        if (!res)
-        {
-            PRINT_DEBUG("Can't read path->dentry->qstr->name string\n");
-            return;
-        }
-
-        g_string_prepend(b, res);
-        g_string_prepend(b, "/");
-
-        g_free(res);
-
-        addr_t parent;
-        ctx.addr = dentry + drakvuf->offsets[DENTRY_D_PARENT];
-        if (VMI_FAILURE == vmi_read_addr(drakvuf_vmi(drakvuf), &ctx, &parent))
-        {
-            PRINT_DEBUG("Can't read path->dentry->d_parent\n");
-            return;
-        }
-
-        dentry = parent;
-    }
+    // Across mounts: a program run from /dev/shm is not "/<name>"
+    linux_prepend_path(drakvuf, dentry, vfsmnt, root_dentry, root_mnt, b);
 }
 
 static bool get_fs_root_rcu(drakvuf_t drakvuf, addr_t process_base, addr_t* root)

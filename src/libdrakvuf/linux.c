@@ -268,6 +268,134 @@ char* linux_get_filepath_from_dentry(drakvuf_t drakvuf, addr_t dentry_addr)
     return g_string_free(b, 0);
 }
 
+/*
+ * struct mount is private to fs/, so a profile may lack it, and the offsets
+ * table does not say which members it found. Its first member is mnt_hash:
+ * none of the three is at 0.
+ */
+static bool linux_knows_mounts(drakvuf_t drakvuf)
+{
+    return drakvuf->offsets[MOUNT_MNT] && drakvuf->offsets[MOUNT_MNT_PARENT] && drakvuf->offsets[MOUNT_MNT_MOUNTPOINT];
+}
+
+/**
+ * @brief The kernel's prepend_path(): the names from `dentry` of mount
+ * `vfsmnt` up to a root, prepended to `b`. At a filesystem's root the walk
+ * goes on from where it is mounted (mount.mnt_mountpoint in mnt_parent),
+ * until the mount that is its own parent: /dev/null is "null" on devtmpfs,
+ * which is mounted on "dev" of the root filesystem.
+ * https://elixir.bootlin.com/linux/v5.15/source/fs/d_path.c#L94
+ *
+ * @param root_dentry, root_mnt where to stop before that: a task's
+ * fs->root, as d_path() does. 0 for the mount namespace's root.
+ * @return true at a root. False for a dentry in no tree (a pipe, a socket,
+ * an anon inode: the kernel names those with d_dname), at a failed read or
+ * past the bound; `b` holds what was walked. Without a vfsmount, or on a
+ * profile without struct mount, the filesystem's root is where it ends.
+ */
+bool linux_prepend_path(drakvuf_t drakvuf, addr_t dentry, addr_t vfsmnt, addr_t root_dentry, addr_t root_mnt, GString* b)
+{
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = drakvuf->kpgd);
+
+    // Bounded as linux_get_filepath_from_dentry is: mounts count as components
+    for (unsigned depth = 0; depth < DENTRY_WALK_MAX; depth++)
+    {
+        if (root_dentry && dentry == root_dentry && vfsmnt == root_mnt)
+            return true;
+
+        addr_t mnt_root = 0;
+        ctx.addr = vfsmnt + drakvuf->offsets[VFSMOUNT_MNT_ROOT];
+        if (vfsmnt && VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mnt_root))
+            return false;
+
+        if (vfsmnt && dentry == mnt_root)
+        {
+            if (!linux_knows_mounts(drakvuf))
+                return true;
+
+            // container_of(vfsmnt, struct mount, mnt)
+            addr_t mount = vfsmnt - drakvuf->offsets[MOUNT_MNT];
+            addr_t mnt_parent = 0;
+            addr_t mountpoint = 0;
+            ctx.addr = mount + drakvuf->offsets[MOUNT_MNT_PARENT];
+            if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mnt_parent) || !mnt_parent)
+                return false;
+            if (mnt_parent == mount)
+                return true;
+
+            ctx.addr = mount + drakvuf->offsets[MOUNT_MNT_MOUNTPOINT];
+            if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mountpoint) || !mountpoint)
+                return false;
+
+            dentry = mountpoint;
+            vfsmnt = mnt_parent + drakvuf->offsets[MOUNT_MNT];
+            continue;
+        }
+
+        addr_t parent = 0;
+        ctx.addr = dentry + drakvuf->offsets[DENTRY_D_PARENT];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &parent) || parent == dentry)
+            return false;
+
+        addr_t qstr_str_addr = 0;
+        ctx.addr = dentry + drakvuf->offsets[DENTRY_D_NAME] + drakvuf->offsets[QSTR_NAME];
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &qstr_str_addr))
+            return false;
+
+        ctx.addr = qstr_str_addr;
+        gchar* name = vmi_read_str(vmi, &ctx);
+        if (!name)
+            return false;
+
+        // This strlen is bounded by `vmi_read_str` implementation
+        if (strlen(name) > 0)
+        {
+            g_string_prepend(b, name);
+            g_string_prepend(b, "/");
+        }
+        g_free(name);
+
+        dentry = parent;
+    }
+
+    return false;
+}
+
+/**
+ * @brief The absolute path of a "struct path" -- a file's f_path, a task's
+ * fs->pwd -- in its mount namespace, where linux_get_filepath_from_dentry
+ * gives the path within the filesystem: "/dev/null" for its "/null".
+ *
+ * @param path_addr address of "struct path"
+ * @return char* - absolute path, "/" for the root itself, "" for a file in
+ * no tree as linux_get_filepath_from_dentry returns
+ */
+char* linux_get_filepath_from_path(drakvuf_t drakvuf, addr_t path_addr)
+{
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = drakvuf->kpgd,
+        .addr = path_addr + drakvuf->offsets[PATH_DENTRY]);
+
+    addr_t dentry = 0;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &dentry) || !dentry)
+        return NULL;
+
+    addr_t vfsmnt = 0;
+    ctx.addr = path_addr + drakvuf->offsets[PATH_MNT];
+    if (!linux_knows_mounts(drakvuf) || VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vfsmnt) || !vfsmnt)
+        return linux_get_filepath_from_dentry(drakvuf, dentry);
+
+    GString* b = g_string_new(NULL);
+    if (linux_prepend_path(drakvuf, dentry, vfsmnt, 0, 0, b) && !b->len)
+        g_string_assign(b, "/");
+    return g_string_free(b, 0);
+}
+
 bool linux_get_kernel_symbol_va(drakvuf_t drakvuf, const char* function, addr_t* va)
 {
     if (!linux_get_kernel_symbol_rva(drakvuf, function, va))
@@ -429,6 +557,7 @@ bool set_os_linux(drakvuf_t drakvuf)
     drakvuf->osi.get_kernel_symbol_va = linux_get_kernel_symbol_va;
     drakvuf->osi.get_kernel_version = linux_get_kernel_version;
     drakvuf->osi.get_filepath_from_dentry = linux_get_filepath_from_dentry;
+    drakvuf->osi.get_filepath_from_path = linux_get_filepath_from_path;
 
 #ifdef DRAKVUF_DEBUG
     char* banner = linux_get_banner(drakvuf);

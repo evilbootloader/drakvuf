@@ -891,6 +891,14 @@ char* drakvuf_get_filename_from_object_attributes( drakvuf_t drakvuf,
 char* drakvuf_get_filepath_from_dentry(drakvuf_t drakvuf,
     addr_t dentry_addr) NOEXCEPT;
 
+/* Linux: the path of a `struct path` (a file's f_path, a task's fs->pwd) as
+ * the kernel resolves it, across mounts: "/dev/null", where the dentry alone
+ * gives "/null", the path within devtmpfs. "/" for the root; "" for a file
+ * in no tree (a pipe, a socket). The dentry's path on a profile without
+ * struct mount. NULL on Windows or when the path cannot be read. */
+char* drakvuf_get_filepath_from_path(drakvuf_t drakvuf,
+    addr_t path_addr) NOEXCEPT;
+
 // Reads 'length' characters from array of UTF_16 charachters into unicode_string_t object with UTF_8 encoding
 unicode_string_t* drakvuf_read_wchar_array(drakvuf_t drakvuf, const access_context_t* ctx, size_t length) NOEXCEPT;
 

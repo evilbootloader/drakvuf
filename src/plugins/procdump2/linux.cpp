@@ -439,7 +439,6 @@ void linux_procdump::read_vma_info(drakvuf_t drakvuf, vmi_instance_t vmi, addr_t
 
     vm_area_info info = {};
     addr_t vm_file = 0;
-    addr_t dentry_addr = 0;
     uint32_t flags = 0;
 
     if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &info.vm_start))
@@ -476,14 +475,9 @@ void linux_procdump::read_vma_info(drakvuf_t drakvuf, vmi_instance_t vmi, addr_t
         return;
     }
 
-    ctx.addr = vm_file + this->offsets[_FILE_F_PATH] + this->offsets[_PATH_DENTRY];
-    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &dentry_addr))
-    {
-        dentry_addr = 0;
-    }
-
-    //get mapped filename if file has been mapped
-    char* tmp = drakvuf_get_filepath_from_dentry(drakvuf, dentry_addr);
+    //get mapped filename if file has been mapped: across mounts, as the
+    //process's own path is
+    char* tmp = vm_file ? drakvuf_get_filepath_from_path(drakvuf, vm_file + this->offsets[_FILE_F_PATH]) : nullptr;
     info.filename = tmp ?: "";
     g_free(tmp);
 
@@ -810,6 +804,7 @@ event_response_t linux_procdump::do_exit_cb(drakvuf_t drakvuf, drakvuf_trap_info
 linux_procdump::linux_procdump(drakvuf_t drakvuf, const procdump2_config* config, output_format_t output)
     : pluginex(drakvuf, output)
     , timeout{config->timeout}
+    , dump_process_on_finish(config->dump_process_on_finish)
     , dump_new_processes_on_finish(config->dump_new_processes_on_finish)
     , procdump_dir{config->procdump_dir ?: ""}
     , dump_compression{config->dump_compression}
@@ -855,6 +850,9 @@ linux_procdump::linux_procdump(drakvuf_t drakvuf, const procdump2_config* config
         PRINT_DEBUG("[PROCDUMP] Method do_exit not found.\n");
         throw -1;
     }
+
+    if (dump_new_processes_on_finish)
+        running_processes_on_start = get_running_processes();
 }
 
 bool linux_procdump::stop_impl()
@@ -865,12 +863,26 @@ bool linux_procdump::stop_impl()
     if (!begin_stop_at)
         begin_stop_at = g_get_real_time() / G_USEC_PER_SEC;
 
+    // As the Windows side (start_dump_processes_on_stop): the injected
+    // process, and with --procdump-new-processes-on-finish the processes
+    // started since the plugin was -- not every process of the guest, which
+    // is what this dumped. One that exited was dumped then, or is gone.
+    std::vector<vmi_pid_t> pids;
+    if (dump_process_on_finish)
+        pids.push_back(dump_process_on_finish);
     if (dump_new_processes_on_finish)
     {
-        auto running_processes = get_running_processes();
-        for (auto pid : running_processes)
-            start_dump_process(pid, 0);
+        for (auto pid : get_running_processes())
+        {
+            auto it = std::find(running_processes_on_start.begin(), running_processes_on_start.end(), pid);
+            if (it == running_processes_on_start.end() && pid != dump_process_on_finish)
+                pids.push_back(pid); // pid is a new process
+        }
     }
+
+    for (auto pid : pids)
+        if (!is_process_handled(pid))
+            start_dump_process(pid, 0);
 
     return true;
 }

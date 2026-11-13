@@ -116,6 +116,7 @@
 #include <cstring>
 #include <functional>
 #include <optional>
+#include <vector>
 
 namespace syscalls_origin
 {
@@ -174,8 +175,33 @@ inline bool is_stub32(const reader& read, address caller)
         code[0] == 0xb8 && code[5] == 0xba && code[10] == 0xff && code[11] == 0xd2;
 }
 
-// KTHREAD.SystemCallNumber and a stub's eax: the table's bit and the number in it
+// A stub's eax: the table's bit, set for win32k's, and the number in that table
 constexpr uint32_t SERVICE_MASK = 0x1fff;
+constexpr uint32_t SERVICE_WIN32K = 0x1000;
+
+// A service routine's entry as a stub's eax names it
+inline uint32_t service_of(uint32_t number, bool ntos)
+{
+    return (ntos ? 0 : SERVICE_WIN32K) | (number & (SERVICE_WIN32K - 1));
+}
+
+/*
+ * Whether a stub for `stub` ran a syscall the kernel dispatched to another service's routine:
+ * `dispatched` is every entry of the routine about to run, since the linker folds identical
+ * routines into one and its address does not say which entry was asked for. Compared with what
+ * is dispatched and not with KTHREAD.SystemCallNumber: on a thread's first win32k syscall the
+ * kernel converts it to a GUI thread first, and the callbacks and Zw calls of that overwrite the
+ * number before the service is dispatched.
+ */
+inline bool other_service(uint32_t stub, const std::vector<uint32_t>& dispatched)
+{
+    if (dispatched.empty())
+        return false;
+    for (uint32_t service : dispatched)
+        if ((service & SERVICE_MASK) == (stub & SERVICE_MASK))
+            return false;
+    return true;
+}
 
 /*
  * The address the call instruction that ends at `ret` called, past the jump thunks it went

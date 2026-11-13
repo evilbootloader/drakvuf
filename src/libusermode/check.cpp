@@ -269,6 +269,13 @@ START_TEST(test_structure_arguments)
     // A NULL one is the pointer, nothing read
     ck_assert(entry.argument_printers[3]->print(nullptr, nullptr, 0) == "ClientId=0x0");
 
+    // A function resolved by ordinal has no name: the NULL pointer is printed
+    auto resolve_export = test_parse_dll_entry("ntdll.dll,LdrGetProcedureAddress,log,DllHandle:lpvoid,"
+            "ProcedureName:pansi_string,ProcedureNumber:dword,ProcedureAddress:lpvoid");
+    ck_assert(dynamic_cast<const AnsiStringPrinter*>(resolve_export.argument_printers[1].get()) != nullptr);
+    ck_assert(!resolve_export.argument_printers[1]->reads_output());
+    ck_assert(resolve_export.argument_printers[1]->print(nullptr, nullptr, 0) == "ProcedureName=0x0");
+
     // A resolver's answer and a thread context: the first read at the return
     auto resolve = test_parse_dll_entry("ws2_32.dll,getaddrinfo,log,pNodeName:lpcstr,pServiceName:lpcstr,"
             "pHints:lpvoid,ppResult:ppaddrinfo");

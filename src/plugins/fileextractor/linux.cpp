@@ -114,6 +114,7 @@
 
 #include "linux.h"
 #include "plugins/output_format.h"
+#include "plugins/helpers/linux_compat_syscall.h"
 
 /* x86_64 syscall numbers */
 #define __NR_write      1
@@ -174,6 +175,7 @@ linux_fileextractor::linux_fileextractor(drakvuf_t drakvuf, const fileextractor_
     : pluginex(drakvuf, output)
     , dump_folder(config->dump_folder)
     , extract_size(config->extract_size)
+    , exclude{config->exclude_file, "[FILEEXTRACTOR]"}
 {
     PRINT_DEBUG("[FILEEXTRACTOR-LINUX] Initializing Linux fileextractor\n");
     PRINT_DEBUG("[FILEEXTRACTOR-LINUX] Dump folder: %s\n", dump_folder ? dump_folder : "(null)");
@@ -209,6 +211,12 @@ linux_fileextractor::linux_fileextractor(drakvuf_t drakvuf, const fileextractor_
         PRINT_DEBUG("[FILEEXTRACTOR-LINUX] Warning: Failed to get some Linux offsets, fd resolution may not work\n");
     }
 
+    this->has_inode_mode =
+        drakvuf_get_kernel_struct_member_rva(drakvuf, "file", "f_inode", &this->file_f_inode) &&
+        drakvuf_get_kernel_struct_member_rva(drakvuf, "inode", "i_mode", &this->inode_i_mode);
+    if (!this->has_inode_mode)
+        fprintf(stderr, "[FILEEXTRACTOR-LINUX] Warning: the kernel profile lacks file.f_inode or inode.i_mode: writes to sockets and pipes are not told from writes to files\n");
+
     /* Register syscall hook - try do_syscall_64 first (reliable on FRED kernels
      * where x64_sys_call may be called via static_call, bypassing INT3 at entry) */
     syscall_hook = createSyscallHook("do_syscall_64", &linux_fileextractor::syscall_cb, "do_syscall_64", UNLIMITED_TTL, true);
@@ -231,6 +239,20 @@ linux_fileextractor::linux_fileextractor(drakvuf_t drakvuf, const fileextractor_
             throw -1;
         }
     }
+
+    /* The syscalls of 32-bit processes, through the dispatcher the syscalls
+     * plugin hooks for them */
+    for (const char* dispatcher : linux_compat::dispatchers)
+    {
+        compat_syscall_hook = createSyscallHook(dispatcher, &linux_fileextractor::compat_syscall_cb, dispatcher, UNLIMITED_TTL, true);
+        if (compat_syscall_hook)
+        {
+            PRINT_DEBUG("[FILEEXTRACTOR-LINUX] Hooked %s\n", dispatcher);
+            break;
+        }
+    }
+    if (!compat_syscall_hook)
+        fprintf(stderr, "[FILEEXTRACTOR-LINUX] No 32-bit syscall dispatcher found, the files 32-bit processes write are not extracted\n");
 }
 
 bool linux_fileextractor::stop_impl()
@@ -283,27 +305,28 @@ bool linux_fileextractor::read_pt_regs_arg(drakvuf_t drakvuf, addr_t pt_regs_add
     return VMI_SUCCESS == vmi_read_addr_va(vmi, pt_regs_addr + this->regs[arg_offsets[arg_index]], 0, value);
 }
 
-std::string linux_fileextractor::get_filename_from_fd(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int fd)
+/* The struct file behind a descriptor of the calling task, 0 when there is none */
+addr_t linux_fileextractor::get_file_from_fd(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int fd)
 {
     if (fd < 0)
-        return "";
+        return 0;
 
     vmi_reader_guard vmi(drakvuf);
 
     /* Get current task_struct */
     addr_t task = drakvuf_get_current_process(drakvuf, info);
     if (!task)
-        return "";
+        return 0;
 
     /* task->files */
     addr_t files_struct;
     if (VMI_FAILURE == vmi_read_addr_va(vmi, task + this->offsets[FE_LINUX_TASK_STRUCT_FILES], 0, &files_struct) || !files_struct)
-        return "";
+        return 0;
 
     /* files->fdt */
     addr_t fdtable;
     if (VMI_FAILURE == vmi_read_addr_va(vmi, files_struct + this->offsets[FE_LINUX_FILES_STRUCT_FDT], 0, &fdtable) || !fdtable)
-        return "";
+        return 0;
 
     /* fdt->max_fds, then the index against it (2026-11-03, review M-4). The
      * fd is the sample's number: past the table it indexes whatever follows
@@ -311,33 +334,51 @@ std::string linux_fileextractor::get_filename_from_fd(drakvuf_t drakvuf, drakvuf
      * the dentry walk as a struct file. */
     uint32_t max_fds = 0;
     if (VMI_FAILURE == vmi_read_32_va(vmi, fdtable + this->offsets[FE_LINUX_FDTABLE_MAX_FDS], 0, &max_fds))
-        return "";
+        return 0;
     if (fd < 0 || static_cast<uint64_t>(fd) >= max_fds)
-        return "";
+        return 0;
 
     /* fdt->fd (array of struct file*) */
     addr_t fd_array;
     if (VMI_FAILURE == vmi_read_addr_va(vmi, fdtable + this->offsets[FE_LINUX_FDTABLE_FD], 0, &fd_array) || !fd_array)
-        return "";
+        return 0;
 
     /* fd_array[fd] -> struct file* */
     addr_t file_struct;
     if (VMI_FAILURE == vmi_read_addr_va(vmi, fd_array + fd * sizeof(addr_t), 0, &file_struct) || !file_struct)
+        return 0;
+
+    return file_struct;
+}
+
+/* The file's path as the kernel resolves it, across mounts (file->f_path).
+ * "" for what is in no tree: a socket, a pipe, a memfd. */
+std::string linux_fileextractor::get_filename(drakvuf_t drakvuf, addr_t file_struct)
+{
+    if (!file_struct)
         return "";
 
-    /* file->f_path.dentry */
-    addr_t dentry;
-    if (VMI_FAILURE == vmi_read_addr_va(vmi, file_struct + this->offsets[FE_LINUX_FILE_F_PATH] + this->offsets[FE_LINUX_PATH_DENTRY], 0, &dentry) || !dentry)
-        return "";
-
-    /* Use drakvuf helper to get full path from dentry */
-    char* path = drakvuf_get_filepath_from_dentry(drakvuf, dentry);
+    char* path = drakvuf_get_filepath_from_path(drakvuf, file_struct + this->offsets[FE_LINUX_FILE_F_PATH]);
     if (!path)
         return "";
 
     std::string result(path);
     g_free(path);
     return result;
+}
+
+/* file->f_inode->i_mode: the file's type and permissions. False when it
+ * cannot be read. */
+bool linux_fileextractor::get_file_mode(drakvuf_t drakvuf, addr_t file_struct, uint16_t* mode)
+{
+    if (!file_struct || !this->has_inode_mode)
+        return false;
+
+    vmi_reader_guard vmi(drakvuf);
+    addr_t inode = 0;
+    if (VMI_FAILURE == vmi_read_addr_va(vmi, file_struct + this->file_f_inode, 0, &inode) || !inode)
+        return false;
+    return VMI_SUCCESS == vmi_read_16_va(vmi, inode + this->inode_i_mode, 0, mode);
 }
 
 bool linux_fileextractor::read_user_buffer(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t user_addr, size_t size, std::vector<uint8_t>& buffer)
@@ -457,6 +498,14 @@ void linux_fileextractor::print_extraction_info(drakvuf_t drakvuf, drakvuf_trap_
         g_free(const_cast<char*>(process_name));
 }
 
+void linux_fileextractor::print_extraction_exclusion(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const std::string& filename)
+{
+    fmt::print(this->m_output_format, "fileextractor_skip", drakvuf, info,
+        keyval("FileName", fmt::Estr(filename)),
+        keyval("Message", fmt::Qstr("Excluded by filter"))
+    );
+}
+
 /* How long a descriptor found to be a pipe, socket or device is skipped for */
 #define IGNORED_FD_US (G_USEC_PER_SEC)
 
@@ -470,43 +519,78 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
     if (!get_pt_regs_and_nr(drakvuf, info, &pt_regs_addr, &nr))
         return VMI_EVENT_RESPONSE_NONE;
 
+    /* Every other syscall returns here, without a read or a lock */
+    if (nr != __NR_close && !is_write_syscall(nr))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    uint64_t args[4] = {};
+    if (!read_pt_regs_arg(drakvuf, pt_regs_addr, 0, &args[0]))
+        return VMI_EVENT_RESPONSE_NONE;
+    if (nr != __NR_close)
+    {
+        read_pt_regs_arg(drakvuf, pt_regs_addr, 1, &args[1]); /* buf */
+        read_pt_regs_arg(drakvuf, pt_regs_addr, 2, &args[2]); /* count */
+        if (nr == __NR_pwrite64)
+            read_pt_regs_arg(drakvuf, pt_regs_addr, 3, &args[3]); /* offset for pwrite64 */
+    }
+
+    handle_syscall(drakvuf, info, nr, args);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+/* A 32-bit process's close, write or pwrite64, handled as the x86-64 one.
+ * Runs on several vCPU threads at once, as syscall_cb. */
+event_response_t linux_fileextractor::compat_syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    addr_t pt_regs_addr = 0;
+    uint64_t nr = 0;
+
+    if (!linux_compat::get_pt_regs_and_nr(drakvuf, info, this->regs[FE_PT_REGS_ORIG_RAX], &pt_regs_addr, &nr))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    const auto* translation = linux_compat::find(nr);
+    if (!translation || (translation->x64 != __NR_close && !is_write_syscall(translation->x64)))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    const size_t arg_regs[6] =
+    {
+        this->regs[FE_PT_REGS_RBX], this->regs[FE_PT_REGS_RCX], this->regs[FE_PT_REGS_RDX],
+        this->regs[FE_PT_REGS_RSI], this->regs[FE_PT_REGS_RDI], this->regs[FE_PT_REGS_RBP]
+    };
+    uint64_t args[6] = {};
+    if (!linux_compat::read_args(drakvuf, pt_regs_addr, arg_regs, args))
+        return VMI_EVENT_RESPONSE_NONE;
+    linux_compat::to_x64_args(nr, args);
+
+    handle_syscall(drakvuf, info, translation->x64, args);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+void linux_fileextractor::handle_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t nr, const uint64_t args[4])
+{
+    const uint64_t fd_val = args[0], buf_addr = args[1], offset = args[3];
+    uint64_t count = args[2];
+
     /* A closed descriptor can be reused for another file, which must not be
      * appended to the dump of this one */
     if (nr == __NR_close)
     {
-        uint64_t fd_val = 0;
-        if (read_pt_regs_arg(drakvuf, pt_regs_addr, 0, &fd_val))
-        {
-            auto key = std::make_pair(static_cast<uint64_t>(info->proc_data.pid), (int)fd_val);
-            std::lock_guard<std::mutex> lock(this->write_mtx);
-            this->tracked_files.erase(key);
-            this->ignored_fds.erase(key);
-        }
-        return VMI_EVENT_RESPONSE_NONE;
+        auto key = std::make_pair(static_cast<uint64_t>(info->proc_data.pid), (int)fd_val);
+        std::lock_guard<std::mutex> lock(this->write_mtx);
+        this->tracked_files.erase(key);
+        this->ignored_fds.erase(key);
+        return;
     }
-
-    /* Only handle write syscalls */
-    if (!is_write_syscall(nr))
-        return VMI_EVENT_RESPONSE_NONE;
-
-    /* Read syscall arguments from pt_regs */
-    uint64_t fd_val = 0, buf_addr = 0, count = 0, offset = 0;
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 0, &fd_val);  /* fd */
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 1, &buf_addr); /* buf */
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 2, &count);    /* count */
-
-    if (nr == __NR_pwrite64)
-        read_pt_regs_arg(drakvuf, pt_regs_addr, 3, &offset); /* offset for pwrite64 */
 
     int fd = (int)fd_val;
 
     /* Skip stdin/stdout/stderr and invalid fds */
     if (fd < 3)
-        return VMI_EVENT_RESPONSE_NONE;
+        return;
 
     /* Skip very small writes (noise) and very large writes */
     if (count < 1 || count > 16 * 1024 * 1024)
-        return VMI_EVENT_RESPONSE_NONE;
+        return;
 
     /* Apply extract_size limit if set */
     if (extract_size > 0 && count > extract_size)
@@ -522,14 +606,14 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
     /* Past the per-trace cap nothing more is extracted: not even tracked,
      * since a tracking entry costs a path walk per new descriptor. */
     if (this->total_capped)
-        return VMI_EVENT_RESPONSE_NONE;
+        return;
 
     gint64 now = g_get_monotonic_time();
     auto ignored = ignored_fds.find(file_key);
     if (ignored != ignored_fds.end())
     {
         if (now - ignored->second < IGNORED_FD_US)
-            return VMI_EVENT_RESPONSE_NONE;
+            return;
         ignored_fds.erase(ignored);
     }
 
@@ -538,28 +622,50 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
     if (it == tracked_files.end())
     {
         /* New file - resolve filename and create tracking entry */
-        std::string filename = get_filename_from_fd(drakvuf, info, fd);
+        addr_t file_struct = get_file_from_fd(drakvuf, info, fd);
+        std::string filename = get_filename(drakvuf, file_struct);
+
+        /* What is not a file is not extracted, by the inode's type and
+         * whether or not it has a name: a socket, a pipe and an anon inode
+         * (an eventfd; no type bits at all) are in no tree and have none,
+         * so no name could have told them, and each request wget wrote to
+         * its socket was "extracted" as unknown_fd_4. A character device is
+         * a terminal or /dev/null. A regular file without a name is kept:
+         * a memfd is one. Block devices are kept as they were. */
+        uint16_t mode = 0;
+        if (get_file_mode(drakvuf, file_struct, &mode) &&
+            (S_ISSOCK(mode) || S_ISFIFO(mode) || S_ISCHR(mode) || !(mode & S_IFMT)))
+        {
+            ignored_fds[file_key] = now;
+            return;
+        }
+
         if (filename.empty())
             filename = "unknown_fd_" + std::to_string(fd);
 
-        /* Skip certain paths that generate too much noise */
-        if (filename.find("/dev/") == 0 ||
-            filename.find("/proc/") == 0 ||
-            filename.find("/sys/") == 0 ||
-            filename.find("socket:") == 0 ||
-            filename.find("pipe:") == 0 ||
-            filename.find("anon_inode:") == 0)
+        /* Skip certain paths that generate too much noise. Not /dev/, whose
+         * devices the type has told: what is left there are the files of
+         * /dev/shm, which were extracted when its paths lacked the mount. */
+        if (filename.find("/proc/") == 0 ||
+            filename.find("/sys/") == 0)
         {
             ignored_fds[file_key] = now;
-            return VMI_EVENT_RESPONSE_NONE;
+            return;
         }
 
         file_info_t file_info;
         file_info.filename = filename;
-        file_info.sequence_num = sequence_number++;
-        file_info.dump_path = make_dump_filename(filename, file_info.sequence_num);
         file_info.total_bytes = 0;
         file_info.is_new = true;
+        /* As on Windows: the whole name against each regexp, said once */
+        file_info.excluded = exclude.match(filename);
+        if (file_info.excluded)
+            print_extraction_exclusion(drakvuf, info, filename);
+        else
+        {
+            file_info.sequence_num = sequence_number++;
+            file_info.dump_path = make_dump_filename(filename, file_info.sequence_num);
+        }
 
         it = tracked_files.emplace(file_key, std::move(file_info)).first;
 
@@ -569,8 +675,8 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
 
     file_info_t& file_info = it->second;
 
-    if (file_info.capped)
-        return VMI_EVENT_RESPONSE_NONE;
+    if (file_info.capped || file_info.excluded)
+        return;
 
     /* Where this write ends in the dump, and what it adds on Dom0's disk: a
      * positioned write adds only what reaches past the current extent, so a
@@ -587,7 +693,7 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
         file_info.capped = true;
         print_extraction_info(drakvuf, info, file_info.filename, extent,
             file_info.dump_path, "WriteFile past the per-file cap; this file is no longer extracted");
-        return VMI_EVENT_RESPONSE_NONE;
+        return;
     }
     const uint64_t added = extent > file_info.size ? extent - file_info.size : 0;
     if (added > MAX_TOTAL_BYTES - this->extracted_total)
@@ -595,7 +701,7 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
         this->total_capped = true;
         print_extraction_info(drakvuf, info, file_info.filename, this->extracted_total + added,
             file_info.dump_path, "per-trace extraction cap reached; nothing more is extracted");
-        return VMI_EVENT_RESPONSE_NONE;
+        return;
     }
 
     /* Read buffer from guest memory */
@@ -603,7 +709,7 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
     if (!read_user_buffer(drakvuf, info, buf_addr, count, buffer))
     {
         PRINT_DEBUG("[FILEEXTRACTOR-LINUX] Failed to read buffer from guest\n");
-        return VMI_EVENT_RESPONSE_NONE;
+        return;
     }
 
     /* Save to file */
@@ -627,6 +733,4 @@ event_response_t linux_fileextractor::syscall_cb(drakvuf_t drakvuf, drakvuf_trap
     {
         PRINT_DEBUG("[FILEEXTRACTOR-LINUX] Failed to save chunk to %s\n", file_info.dump_path.c_str());
     }
-
-    return VMI_EVENT_RESPONSE_NONE;
 }

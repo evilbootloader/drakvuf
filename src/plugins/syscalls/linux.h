@@ -148,7 +148,7 @@ public:
     addr_t mm_vdso = 0;             // mm_struct.context.vdso
     addr_t mm_vdso_image = 0;       // mm_struct.context.vdso_image
     addr_t vdso_image_size = 0;     // vdso_image.size
-    addr_t file_dentry = 0;         // file.f_path.dentry
+    addr_t file_path = 0;           // file.f_path
     addr_t vdso_image_32 = 0;       // the kernel's vdso_image_32: a 32-bit process's vDSO
     addr_t vdso_image_64 = 0;       // vdso_image_64 and vdso_image_x32: a 64-bit process's
     addr_t vdso_image_x32 = 0;
@@ -473,10 +473,23 @@ SYSCALL(getsockopt, linux_int,
 );
 // We can ignore these syscalls because there is a better interpretation going on in the procmon plugin
 // procmon
-SYSCALL(clone, linux_void);
+// The arguments of the kernel's prototypes, as for the ones below that had none: a failed exec
+// leaves no other trace of what was tried, procmon's hook being past the binary format's check.
+// x86_64's order; i386's clone has tls before child_tidptr (ia32_clone).
+SYSCALL(clone, linux_void,
+    "clone_flags",   "", DIR_IN, linux_unsigned_long,
+    "newsp",         "", DIR_IN, linux_unsigned_long,
+    "parent_tidptr", "", DIR_IN, linux_int_ptr,
+    "child_tidptr",  "", DIR_IN, linux_int_ptr,
+    "tls",           "", DIR_IN, linux_unsigned_long,
+);
 SYSCALL(fork, linux_void);
 SYSCALL(vfork, linux_void);
-SYSCALL(execve, linux_void);
+SYSCALL(execve, linux_void,
+    "filename", "", DIR_IN, linux_char_ptr,
+    "argv",     "", DIR_IN, linux_void_ptr, // char *[]
+    "envp",     "", DIR_IN, linux_void_ptr, // char *[]
+);
 SYSCALL(exit, linux_void);
 // end procmon
 SYSCALL(wait4, linux_pid_t,
@@ -647,7 +660,10 @@ SYSCALL(setregid, linux_int,
     "egid", "", DIR_IN, linux_gid_t,
 );
 SYSCALL(getgroups, linux_int);
-SYSCALL(setgroups, linux_int);
+SYSCALL(setgroups, linux_int,
+    "gidsetsize", "", DIR_IN, linux_int,
+    "grouplist",  "", DIR_IN, linux_void_ptr, // gid_t *
+);
 SYSCALL(setresuid, linux_int,
     "ruid", "", DIR_IN, linux_uid_t,
     "euid", "", DIR_IN, linux_uid_t,
@@ -660,19 +676,33 @@ SYSCALL(setresgid, linux_int,
     "sgid", "", DIR_IN, linux_gid_t,
 );
 SYSCALL(getresgid, linux_int);
-SYSCALL(getpgid, linux_pid_t);
+SYSCALL(getpgid, linux_pid_t,
+    "pid", "", DIR_IN, linux_pid_t,
+);
 SYSCALL(setfsuid, linux_int,
     "fsuid", "", DIR_IN, linux_uid_t,
 );
 SYSCALL(setfsgid, linux_int,
     "fsgid", "", DIR_IN, linux_gid_t,
 );
-SYSCALL(getsid, linux_pid_t);
-SYSCALL(capget, linux_int);
-SYSCALL(capset, linux_int);
+SYSCALL(getsid, linux_pid_t,
+    "pid", "", DIR_IN, linux_pid_t,
+);
+SYSCALL(capget, linux_int,
+    "header",  "", DIR_IN, linux_void_ptr, // cap_user_header_t
+    "dataptr", "", DIR_IN, linux_void_ptr, // cap_user_data_t
+);
+SYSCALL(capset, linux_int,
+    "header", "", DIR_IN, linux_void_ptr, // cap_user_header_t
+    "data",   "", DIR_IN, linux_void_ptr, // cap_user_data_t
+);
 SYSCALL(rt_sigpending, linux_int);
 SYSCALL(rt_sigtimedwait, linux_int);
-SYSCALL(rt_sigqueueinfo, linux_int);
+SYSCALL(rt_sigqueueinfo, linux_int,
+    "pid",   "", DIR_IN, linux_pid_t,
+    "sig",   "", DIR_IN, linux_int,
+    "uinfo", "", DIR_IN, linux_void_ptr, // siginfo_t *
+);
 SYSCALL(rt_sigsuspend, linux_int);
 SYSCALL(sigaltstack, linux_int);
 SYSCALL(utime, linux_int,
@@ -948,8 +978,16 @@ SYSCALL(futex, linux_int,
     "uaddr2",    "", DIR_IN, linux_void_ptr,
     "val3",      "", DIR_IN, linux_unsigned_int,
 );
-SYSCALL(sched_setaffinity, linux_int);
-SYSCALL(sched_getaffinity, linux_int);
+SYSCALL(sched_setaffinity, linux_int,
+    "pid",           "", DIR_IN, linux_pid_t,
+    "len",           "", DIR_IN, linux_unsigned_int,
+    "user_mask_ptr", "", DIR_IN, linux_unsigned_long_ptr,
+);
+SYSCALL(sched_getaffinity, linux_int,
+    "pid",           "", DIR_IN, linux_pid_t,
+    "len",           "", DIR_IN, linux_unsigned_int,
+    "user_mask_ptr", "", DIR_IN, linux_unsigned_long_ptr,
+);
 SYSCALL(set_thread_area, linux_int);
 SYSCALL(io_setup, linux_int);
 SYSCALL(io_destroy, linux_int);
@@ -1009,8 +1047,19 @@ SYSCALL(mq_timedsend, linux_void);
 SYSCALL(mq_timedreceive, linux_void);
 SYSCALL(mq_notify, linux_void);
 SYSCALL(mq_getsetattr, linux_void);
-SYSCALL(kexec_load, linux_void);
-SYSCALL(waitid, linux_void);
+SYSCALL(kexec_load, linux_void,
+    "entry",       "", DIR_IN, linux_unsigned_long,
+    "nr_segments", "", DIR_IN, linux_unsigned_long,
+    "segments",    "", DIR_IN, linux_void_ptr, // struct kexec_segment *
+    "flags",       "", DIR_IN, linux_unsigned_long,
+);
+SYSCALL(waitid, linux_void,
+    "which",   "", DIR_IN, linux_int,
+    "pid",     "", DIR_IN, linux_pid_t,
+    "infop",   "", DIR_IN, linux_void_ptr, // struct siginfo *
+    "options", "", DIR_IN, linux_int,
+    "ru",      "", DIR_IN, linux_rusage_ptr,
+);
 SYSCALL(add_key, linux_key_serial_t,
     "type",        "", DIR_IN, linux_char_ptr,
     "description", "", DIR_IN, linux_char_ptr,
@@ -1126,7 +1175,14 @@ SYSCALL(unshare, linux_int,
 );
 SYSCALL(set_robust_list, linux_void);
 SYSCALL(get_robust_list, linux_void);
-SYSCALL(splice, linux_void);
+SYSCALL(splice, linux_void,
+    "fd_in",   "", DIR_IN, linux_int,
+    "off_in",  "", DIR_IN, linux_off64_t_ptr,
+    "fd_out",  "", DIR_IN, linux_int,
+    "off_out", "", DIR_IN, linux_off64_t_ptr,
+    "len",     "", DIR_IN, linux_size_t,
+    "flags",   "", DIR_IN, linux_unsigned_int,
+);
 SYSCALL(tee, linux_long,
     "fd_in",  "", DIR_IN, linux_int,
     "fd_out", "", DIR_IN, linux_int,
@@ -1134,7 +1190,12 @@ SYSCALL(tee, linux_long,
     "flags",  "", DIR_IN, linux_unsigned_int,
 );
 SYSCALL(sync_file_range, linux_void);
-SYSCALL(vmsplice, linux_void);
+SYSCALL(vmsplice, linux_void,
+    "fd",      "", DIR_IN, linux_int,
+    "iov",     "", DIR_IN, linux_iovec_ptr,
+    "nr_segs", "", DIR_IN, linux_unsigned_long,
+    "flags",   "", DIR_IN, linux_unsigned_int,
+);
 SYSCALL(move_pages, linux_void);
 SYSCALL(utimensat, linux_int,
     "dirfd",    "", DIR_IN, linux_int,
@@ -1187,15 +1248,47 @@ SYSCALL(dup3, linux_int,
     "newfd", "", DIR_IN, linux_int,
     "flags", "", DIR_IN, linux_int,
 );
-SYSCALL(pipe2, linux_int);
+SYSCALL(pipe2, linux_int,
+    "fildes", "", DIR_IN, linux_void_ptr, // int[2]
+    "flags",  "", DIR_IN, linux_int,
+);
 SYSCALL(inotify_init1, linux_int,
     "flags", "", DIR_IN, linux_int,
 );
-SYSCALL(preadv, linux_int);
-SYSCALL(pwritev, linux_int);
-SYSCALL(rt_tgsigqueueinfo, linux_int);
-SYSCALL(perf_event_open, linux_int);
-SYSCALL(recvmmsg, linux_int);
+SYSCALL(preadv, linux_int,
+    "fd",    "", DIR_IN, linux_unsigned_long,
+    "vec",   "", DIR_IN, linux_iovec_ptr,
+    "vlen",  "", DIR_IN, linux_unsigned_long,
+    "pos_l", "", DIR_IN, linux_unsigned_long,
+    "pos_h", "", DIR_IN, linux_unsigned_long,
+);
+SYSCALL(pwritev, linux_int,
+    "fd",    "", DIR_IN, linux_unsigned_long,
+    "vec",   "", DIR_IN, linux_iovec_ptr,
+    "vlen",  "", DIR_IN, linux_unsigned_long,
+    "pos_l", "", DIR_IN, linux_unsigned_long,
+    "pos_h", "", DIR_IN, linux_unsigned_long,
+);
+SYSCALL(rt_tgsigqueueinfo, linux_int,
+    "tgid",  "", DIR_IN, linux_pid_t,
+    "pid",   "", DIR_IN, linux_pid_t,
+    "sig",   "", DIR_IN, linux_int,
+    "uinfo", "", DIR_IN, linux_void_ptr, // siginfo_t *
+);
+SYSCALL(perf_event_open, linux_int,
+    "attr_uptr", "", DIR_IN, linux_void_ptr, // struct perf_event_attr *
+    "pid",       "", DIR_IN, linux_pid_t,
+    "cpu",       "", DIR_IN, linux_int,
+    "group_fd",  "", DIR_IN, linux_int,
+    "flags",     "", DIR_IN, linux_unsigned_long,
+);
+SYSCALL(recvmmsg, linux_int,
+    "sockfd",  "", DIR_IN, linux_int,
+    "msgvec",  "", DIR_IN, linux_mmsghdr_ptr,
+    "vlen",    "", DIR_IN, linux_unsigned_int,
+    "flags",   "", DIR_IN, linux_unsigned_int,
+    "timeout", "", DIR_IN, linux_timespec_ptr,
+);
 SYSCALL(fanotify_init, linux_int,
     "flags",         "", DIR_IN, linux_unsigned_int,
     "event_f_flags", "", DIR_IN, linux_unsigned_int,
@@ -1207,7 +1300,12 @@ SYSCALL(fanotify_mark, linux_int,
     "dirfd",       "", DIR_IN, linux_int,
     "pathname",    "", DIR_IN, linux_char_ptr,
 );
-SYSCALL(prlimit64, linux_int);
+SYSCALL(prlimit64, linux_int,
+    "pid",      "", DIR_IN, linux_pid_t,
+    "resource", "", DIR_IN, linux_unsigned_int,
+    "new_rlim", "", DIR_IN, linux_void_ptr, // struct rlimit64 *
+    "old_rlim", "", DIR_IN, linux_void_ptr, // struct rlimit64 *
+);
 SYSCALL(name_to_handle_at, linux_int,
     "dirfd",    "", DIR_IN, linux_int,
     "pathname", "", DIR_IN, linux_char_ptr,
@@ -1278,7 +1376,11 @@ SYSCALL(seccomp, linux_int,
     "flags",     "", DIR_IN, linux_unsigned_int,
     "args",      "", DIR_IN, linux_void_ptr,
 );
-SYSCALL(getrandom, linux_void);
+SYSCALL(getrandom, linux_void,
+    "buf",   "", DIR_IN, linux_void_ptr,
+    "count", "", DIR_IN, linux_size_t,
+    "flags", "", DIR_IN, linux_unsigned_int,
+);
 // filetracer
 SYSCALL(memfd_create, linux_int,
     "name",  "", DIR_IN, linux_char_ptr,
@@ -1299,15 +1401,46 @@ SYSCALL(bpf, linux_int,
     "size", "", DIR_IN, linux_unsigned_int,
 );
 // ebpfmon
-SYSCALL(execveat, linux_void);
+SYSCALL(execveat, linux_void,
+    "dfd",      "", DIR_IN, linux_int,
+    "filename", "", DIR_IN, linux_char_ptr,
+    "argv",     "", DIR_IN, linux_void_ptr, // char *[]
+    "envp",     "", DIR_IN, linux_void_ptr, // char *[]
+    "flags",    "", DIR_IN, linux_int,
+);
 SYSCALL(userfaultfd, linux_int,
     "flags", "", DIR_IN, linux_int,
 );
 SYSCALL(membarrier, linux_int);
-SYSCALL(mlock2, linux_int);
-SYSCALL(copy_file_range, linux_int);
-SYSCALL(preadv2, linux_int);
-SYSCALL(pwritev2, linux_int);
+SYSCALL(mlock2, linux_int,
+    "start", "", DIR_IN, linux_unsigned_long,
+    "len",   "", DIR_IN, linux_size_t,
+    "flags", "", DIR_IN, linux_int,
+);
+SYSCALL(copy_file_range, linux_int,
+    "fd_in",   "", DIR_IN, linux_int,
+    "off_in",  "", DIR_IN, linux_off64_t_ptr,
+    "fd_out",  "", DIR_IN, linux_int,
+    "off_out", "", DIR_IN, linux_off64_t_ptr,
+    "len",     "", DIR_IN, linux_size_t,
+    "flags",   "", DIR_IN, linux_unsigned_int,
+);
+SYSCALL(preadv2, linux_int,
+    "fd",    "", DIR_IN, linux_unsigned_long,
+    "vec",   "", DIR_IN, linux_iovec_ptr,
+    "vlen",  "", DIR_IN, linux_unsigned_long,
+    "pos_l", "", DIR_IN, linux_unsigned_long,
+    "pos_h", "", DIR_IN, linux_unsigned_long,
+    "flags", "", DIR_IN, linux_int,
+);
+SYSCALL(pwritev2, linux_int,
+    "fd",    "", DIR_IN, linux_unsigned_long,
+    "vec",   "", DIR_IN, linux_iovec_ptr,
+    "vlen",  "", DIR_IN, linux_unsigned_long,
+    "pos_l", "", DIR_IN, linux_unsigned_long,
+    "pos_h", "", DIR_IN, linux_unsigned_long,
+    "flags", "", DIR_IN, linux_int,
+);
 SYSCALL(pkey_mprotect, linux_int,
     "addr", "", DIR_IN, linux_void_ptr,
     "len",  "", DIR_IN, linux_size_t,
@@ -2018,6 +2151,7 @@ static const syscall_t* linux_syscalls_table_x64[] =
  * These have their own, prefixed ia32_:
  * - the i386-only ones: socketcall, ipc, mmap2, stat64, the *32 uid calls...
  * - mmap (90) and select (82), which take one pointer to their arguments
+ * - clone (120), whose last two arguments are the other way around
  * - the sys_ia32_* ones and fanotify_mark, which pass each 64-bit argument in
  *   two registers, low half first
  */
@@ -2519,6 +2653,14 @@ SYSCALL_EX(ia32_pidfd_open, pidfd_open, linux_long,
     "pid",   "", DIR_IN, linux_pid_t,
     "flags", "", DIR_IN, linux_unsigned_int,
 );
+// CONFIG_CLONE_BACKWARDS: tls before child_tidptr
+SYSCALL_EX(ia32_clone, clone, linux_long,
+    "clone_flags",   "", DIR_IN, linux_unsigned_long,
+    "newsp",         "", DIR_IN, linux_unsigned_long,
+    "parent_tidptr", "", DIR_IN, linux_int_ptr,
+    "tls",           "", DIR_IN, linux_unsigned_long,
+    "child_tidptr",  "", DIR_IN, linux_int_ptr,
+);
 SYSCALL_EX(ia32_clone3, clone3, linux_long,
     "uargs", "", DIR_IN, linux_void_ptr,
     "size",  "", DIR_IN, linux_size_t,
@@ -2865,7 +3007,7 @@ static const syscall_t* linux_syscalls_table_ia32[] =
     [117] = &ia32_ipc,
     [118] = &fsync,
     [119] = &ia32_sigreturn,
-    [120] = &clone,
+    [120] = &ia32_clone,
     [121] = &setdomainname,
     [122] = &uname,
     [123] = &modify_ldt,

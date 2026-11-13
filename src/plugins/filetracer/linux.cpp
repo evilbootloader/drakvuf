@@ -103,6 +103,7 @@
  ***************************************************************************/
 
 #include <libvmi/libvmi.h>
+#include <fcntl.h>
 #include <atomic>
 #include <map>
 #include <string>
@@ -111,6 +112,7 @@
 #include "private.h"
 #include "linux.h"
 #include "plugins/output_format.h"
+#include "plugins/helpers/linux_compat_syscall.h"
 
 using namespace filetracer_ns;
 
@@ -133,18 +135,7 @@ bool linux_filetracer::get_file_info(drakvuf_t drakvuf, drakvuf_trap_info_t* inf
     if (!file_addr)
         return false;
 
-    auto vmi = vmi_lock_guard(drakvuf);
-
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = info->regs->cr3,
-        .addr = file_addr + this->offsets[_FILE_F_PATH] + this->offsets[_PATH_DENTRY]);
-
-    addr_t dentry_addr = 0;
-    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &dentry_addr))
-        return false;
-
-    return get_dentry_info(drakvuf, info, params, dentry_addr);
+    return get_path_info(drakvuf, info, params, file_addr + this->offsets[_FILE_F_PATH]);
 }
 
 bool linux_filetracer::get_path_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, linux_data* params, addr_t path_addr)
@@ -152,18 +143,30 @@ bool linux_filetracer::get_path_info(drakvuf_t drakvuf, drakvuf_trap_info_t* inf
     if (!path_addr)
         return false;
 
-    auto vmi = vmi_lock_guard(drakvuf);
-
-    ACCESS_CONTEXT(ctx,
-        .translate_mechanism = VMI_TM_PROCESS_DTB,
-        .dtb = info->regs->cr3,
-        .addr = path_addr + this->offsets[_PATH_DENTRY]);
-
     addr_t dentry_addr = 0;
-    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &dentry_addr))
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3,
+            .addr = path_addr + this->offsets[_PATH_DENTRY]);
+
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &dentry_addr) || !dentry_addr)
+            return false;
+    }
+
+    // A path has its mount, so the name is the one the kernel resolves:
+    // "/dev/null", where the dentry alone gives "/null"
+    char* tmp = drakvuf_get_filepath_from_path(drakvuf, path_addr);
+    params->filename = tmp ?: "";
+    g_free(tmp);
+
+    if (params->filename.empty())
         return false;
 
-    return get_dentry_info(drakvuf, info, params, dentry_addr);
+    get_inode_info(drakvuf, info, params, dentry_addr);
+    return true;
 }
 
 bool linux_filetracer::get_dentry_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, linux_data* params, addr_t dentry_addr)
@@ -178,6 +181,12 @@ bool linux_filetracer::get_dentry_info(drakvuf_t drakvuf, drakvuf_trap_info_t* i
     if (params->filename.empty())
         return false;
 
+    get_inode_info(drakvuf, info, params, dentry_addr);
+    return true;
+}
+
+void linux_filetracer::get_inode_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, linux_data* params, addr_t dentry_addr)
+{
     auto vmi = vmi_lock_guard(drakvuf);
 
     ACCESS_CONTEXT(ctx,
@@ -211,8 +220,6 @@ bool linux_filetracer::get_dentry_info(drakvuf_t drakvuf, drakvuf_trap_info_t* i
         if (VMI_SUCCESS == vmi_read_32(vmi, &ctx, &gid) && gid)
             params->gid = gid;
     }
-
-    return true;
 }
 
 void linux_filetracer::print_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, linux_data* params)
@@ -1259,13 +1266,37 @@ std::string linux_filetracer::get_filename_from_fd(drakvuf_t drakvuf, drakvuf_tr
     if (VMI_FAILURE == vmi_read_addr_va(vmi, fd_array + fd * sizeof(addr_t), 0, &file_struct) || !file_struct)
         return "";
 
-    // file->f_path.dentry
-    addr_t dentry;
-    if (VMI_FAILURE == vmi_read_addr_va(vmi, file_struct + this->offsets[_FILE_F_PATH] + this->offsets[_PATH_DENTRY], 0, &dentry) || !dentry)
+    // file->f_path, dentry and mount: the path as the kernel resolves it,
+    // "/proc/meminfo" and not the "/meminfo" it is within procfs
+    char* path = drakvuf_get_filepath_from_path(drakvuf, file_struct + this->offsets[_FILE_F_PATH]);
+    if (!path)
         return "";
 
-    // Use drakvuf helper to get full path from dentry
-    char* path = drakvuf_get_filepath_from_dentry(drakvuf, dentry);
+    std::string result(path);
+    g_free(path);
+    return result;
+}
+
+// The working directory of the calling task, fs->pwd: what a relative path
+// is resolved from. "" when it cannot be read.
+std::string linux_filetracer::get_cwd(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    // The offsets table does not say which members it found; neither is at 0
+    if (!this->offsets[_TASK_STRUCT_FS] || !this->offsets[_FS_STRUCT_PWD])
+        return "";
+
+    addr_t task = drakvuf_get_current_process(drakvuf, info);
+    if (!task)
+        return "";
+
+    addr_t fs = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        if (VMI_FAILURE == vmi_read_addr_va(vmi, task + this->offsets[_TASK_STRUCT_FS], 0, &fs) || !fs)
+            return "";
+    }
+
+    char* path = drakvuf_get_filepath_from_path(drakvuf, fs + this->offsets[_FS_STRUCT_PWD]);
     if (!path)
         return "";
 
@@ -1280,6 +1311,8 @@ void linux_filetracer::print_syscall_info(drakvuf_t drakvuf, drakvuf_trap_info_t
 
     if (!params->filename.empty())
         extra_args.emplace_back(keyval("FileName", fmt::Estr(params->filename)));
+    if (!params->cwd.empty())
+        extra_args.emplace_back(keyval("Cwd", fmt::Estr(params->cwd)));
     if (params->file_handle)
         extra_args.emplace_back(keyval("FileHandle", fmt::Nval(static_cast<uint64_t>(params->file_handle))));
     for (auto& arg : params->args)
@@ -1317,15 +1350,63 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
     if (!is_file_syscall(nr))
         return VMI_EVENT_RESPONSE_NONE;
 
-    const char* syscall_name = get_syscall_name(nr);
-    linux_data params;
-
     // Read syscall arguments from pt_regs
-    uint64_t arg0 = 0, arg1 = 0, arg2 = 0, arg3 = 0;
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 0, &arg0);
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 1, &arg1);
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 2, &arg2);
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 3, &arg3);
+    uint64_t args[4] = {};
+    for (int i = 0; i < 4; i++)
+        read_pt_regs_arg(drakvuf, pt_regs_addr, i, &args[i]);
+
+    handle_syscall(drakvuf, info, nr, get_syscall_name(nr), args);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+/*
+ * A 32-bit process's syscall, handled as the x86-64 syscall doing the same
+ * and printed under its own name: an i386 `open` is an `open`, `stat64` is
+ * handled as `stat` is. Runs on several vCPU threads at once, as syscall_cb.
+ */
+event_response_t linux_filetracer::compat_syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    addr_t pt_regs_addr = 0;
+    uint64_t nr = 0;
+
+    if (!linux_compat::get_pt_regs_and_nr(drakvuf, info, this->regs[PT_REGS_ORIG_RAX], &pt_regs_addr, &nr))
+    {
+        PRINT_DEBUG("[FILETRACER] linux_compat::get_pt_regs_and_nr failed\n");
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    const auto* translation = linux_compat::find(nr);
+    if (!translation || !is_file_syscall(translation->x64))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    const size_t arg_regs[6] =
+    {
+        this->regs[PT_REGS_RBX], this->regs[PT_REGS_RCX], this->regs[PT_REGS_RDX],
+        this->regs[PT_REGS_RSI], this->regs[PT_REGS_RDI], this->regs[PT_REGS_RBP]
+    };
+    uint64_t args[6] = {};
+    if (!linux_compat::read_args(drakvuf, pt_regs_addr, arg_regs, args))
+        return VMI_EVENT_RESPONSE_NONE;
+    linux_compat::to_x64_args(nr, args);
+
+    handle_syscall(drakvuf, info, translation->x64, translation->name, args);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+void linux_filetracer::handle_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t nr, const char* syscall_name, const uint64_t args[4])
+{
+    linux_data params;
+    const uint64_t arg0 = args[0], arg1 = args[1], arg2 = args[2], arg3 = args[3];
+
+    // A relative path is resolved from the working directory, unless a
+    // dirfd says from where: FileName stays as the process passed it, and
+    // Cwd says what it is relative to.
+    bool relative = false;
+    auto from_cwd = [&relative](const char* path, int dirfd = AT_FDCWD)
+    {
+        if (path && path[0] && path[0] != '/' && dirfd == AT_FDCWD)
+            relative = true;
+    };
 
     // Extract file information based on syscall type
     switch (nr)
@@ -1361,6 +1442,7 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
             if (pathname)
             {
                 params.filename = pathname;
+                from_cwd(pathname);
                 g_free(pathname);
             }
             params.args["flags"] = std::to_string(arg1);
@@ -1377,6 +1459,7 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
             if (pathname)
             {
                 params.filename = pathname;
+                from_cwd(pathname, (int)arg0);
                 g_free(pathname);
             }
             params.args["flags"] = std::to_string(arg2);
@@ -1419,6 +1502,7 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
             if (pathname)
             {
                 params.filename = pathname;
+                from_cwd(pathname);
                 g_free(pathname);
             }
             break;
@@ -1448,11 +1532,16 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
             if (oldpath)
             {
                 params.filename = oldpath;
+                // A symlink's target is kept as it is given, relative to
+                // the link when it is read
+                if (nr != __NR_symlink)
+                    from_cwd(oldpath);
                 g_free(oldpath);
             }
             if (newpath)
             {
                 params.args["newpath"] = newpath;
+                from_cwd(newpath);
                 g_free(newpath);
             }
             break;
@@ -1470,6 +1559,7 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
             if (pathname)
             {
                 params.filename = pathname;
+                from_cwd(pathname, (int)arg0);
                 g_free(pathname);
             }
             break;
@@ -1478,7 +1568,6 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
         case __NR_renameat:
         case __NR_renameat2:
         case __NR_linkat:
-        case __NR_symlinkat:
         {
             // syscalls with (int olddirfd, const char *oldpath, int newdirfd, const char *newpath, ...)
             params.args["olddirfd"] = std::to_string((int)arg0);
@@ -1486,6 +1575,7 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
             if (oldpath)
             {
                 params.filename = oldpath;
+                from_cwd(oldpath, (int)arg0);
                 g_free(oldpath);
             }
             params.args["newdirfd"] = std::to_string((int)arg2);
@@ -1493,7 +1583,30 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
             if (newpath)
             {
                 params.args["newpath"] = newpath;
+                from_cwd(newpath, (int)arg2);
                 g_free(newpath);
+            }
+            break;
+        }
+
+        case __NR_symlinkat:
+        {
+            // int symlinkat(const char *target, int newdirfd, const char *linkpath):
+            // not renameat's four arguments, as which it was read, an int
+            // taken for the target's address
+            char* target = read_user_string(drakvuf, info, arg0);
+            if (target)
+            {
+                params.filename = target;
+                g_free(target);
+            }
+            params.args["newdirfd"] = std::to_string((int)arg1);
+            char* linkpath = read_user_string(drakvuf, info, arg2);
+            if (linkpath)
+            {
+                params.args["newpath"] = linkpath;
+                from_cwd(linkpath, (int)arg1);
+                g_free(linkpath);
             }
             break;
         }
@@ -1537,11 +1650,29 @@ event_response_t linux_filetracer::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_in
             break;
     }
 
+    if (relative)
+        params.cwd = get_cwd(drakvuf, info);
+
     print_syscall_info(drakvuf, info, syscall_name, &params);
-    return VMI_EVENT_RESPONSE_NONE;
 }
 
 /* ---------------CONSTRUCTOR-------------- */
+
+// The syscalls of 32-bit processes, through the dispatcher the syscalls
+// plugin hooks for them
+void linux_filetracer::hook_compat_syscalls()
+{
+    for (const char* dispatcher : linux_compat::dispatchers)
+    {
+        compat_syscall_hook = createSyscallHook(dispatcher, &linux_filetracer::compat_syscall_cb, dispatcher, UNLIMITED_TTL, true);
+        if (compat_syscall_hook)
+        {
+            PRINT_DEBUG("[FILETRACER] Hooked %s\n", dispatcher);
+            return;
+        }
+    }
+    fprintf(stderr, "[FILETRACER] No 32-bit syscall dispatcher found, the files of 32-bit processes are not traced\n");
+}
 
 linux_filetracer::linux_filetracer(drakvuf_t drakvuf, output_format_t output) : pluginex(drakvuf, output)
 {
@@ -1573,6 +1704,7 @@ linux_filetracer::linux_filetracer(drakvuf_t drakvuf, output_format_t output) : 
     if (syscall_hook)
     {
         PRINT_DEBUG("[FILETRACER] Hooked do_syscall_64\n");
+        hook_compat_syscalls();
         return;  // Success - no need for legacy hooks
     }
     fprintf(stderr, "[FILETRACER] do_syscall_64 hook failed, trying x64_sys_call\n");
@@ -1582,6 +1714,7 @@ linux_filetracer::linux_filetracer(drakvuf_t drakvuf, output_format_t output) : 
     if (syscall_hook)
     {
         PRINT_DEBUG("[FILETRACER] Hooked x64_sys_call\n");
+        hook_compat_syscalls();
         return;  // Success - no need for legacy hooks
     }
     fprintf(stderr, "[FILETRACER] x64_sys_call hook failed\n");

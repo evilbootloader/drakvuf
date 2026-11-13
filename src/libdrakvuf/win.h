@@ -226,6 +226,7 @@ bool win_get_kernel_symbol_rva(drakvuf_t drakvuf, const char* function, addr_t* 
 bool win_get_kernel_symbol_va(drakvuf_t drakvuf, const char* function, addr_t* va);
 
 unicode_string_t* win_get_object_name(drakvuf_t drakvuf, addr_t object);
+addr_t win_get_object_name_info(drakvuf_t drakvuf, addr_t object);
 unicode_string_t* win_get_object_type_name(drakvuf_t drakvuf, addr_t object);
 #ifdef __cplusplus
 extern "C" {

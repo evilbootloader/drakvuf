@@ -232,6 +232,46 @@ std::string UnicodePrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, ui
     return stream.str();
 }
 
+std::string AnsiStringPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    const bool is32bit = drakvuf_process_is32bit(drakvuf, info);
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument
+    );
+    uint8_t header[16] = {};
+    size_t got = 0;
+    uint16_t length = 0;
+    uint64_t buffer = 0;
+    std::string str;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        vmi_read(vmi, &ctx, is32bit ? 8 : 16, header, &got);
+        if (!parse_ansi_string(header, got, is32bit, &length, &buffer) || !buffer)
+            return ArgumentPrinter::print(drakvuf, info, argument);
+
+        // Length counts bytes and no terminator. What precedes an unmapped
+        // page is printed.
+        str.resize(std::min<size_t>(length, MAX_BYTES));
+        got = 0;
+        ctx.addr = buffer;
+        if (!str.empty())
+            vmi_read(vmi, &ctx, str.size(), str.data(), &got);
+        str.resize(got);
+    }
+
+    std::stringstream stream;
+    stream << name << "=";
+    if (!config.print_no_addr)
+        stream << "0x" << std::hex << argument << ":";
+    stream << "\"" << escape_str(str) << "\"";
+    return stream.str();
+}
+
 std::string UlongPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
 {
     return ArgumentPrinter::print(drakvuf, info, value(drakvuf, info, argument));

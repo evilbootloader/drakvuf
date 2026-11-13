@@ -936,6 +936,20 @@ char* drakvuf_get_filepath_from_dentry(drakvuf_t drakvuf, addr_t dentry_addr)
     return ret;
 }
 
+char* drakvuf_get_filepath_from_path(drakvuf_t drakvuf, addr_t path_addr)
+{
+    char* ret = NULL;
+
+    if (drakvuf->osi.get_filepath_from_path)
+    {
+        drakvuf_reader_lock(drakvuf);
+        ret = drakvuf->osi.get_filepath_from_path(drakvuf, path_addr);
+        drakvuf_reader_unlock(drakvuf);
+    }
+
+    return ret;
+}
+
 bool drakvuf_is_wow64(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     bool ret = false;

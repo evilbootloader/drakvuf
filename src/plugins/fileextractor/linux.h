@@ -106,6 +106,7 @@
 #define FILEEXTRACTOR_LINUX_H
 
 #include "plugins/plugins_ex.h"
+#include "helpers/exclude_matcher.h"
 #include "private.h"
 
 #include <map>
@@ -129,6 +130,8 @@ private:
     /* Configuration */
     const char* dump_folder;
     uint64_t extract_size;
+    /* --fileextractor-exclude-list: regexps of file names not to extract */
+    const exclude_matcher exclude;
 
     /* Sequence number for unique file naming */
     int sequence_number{0};
@@ -178,6 +181,13 @@ private:
 
     std::array<size_t, __FE_LINUX_OFFSET_MAX> offsets;
 
+    /* file.f_inode and inode.i_mode, for the type of what a descriptor is.
+     * Looked up one by one: i_mode is at offset 0, which the array lookup
+     * above does not tell from a member the profile lacks. */
+    addr_t file_f_inode{0};
+    addr_t inode_i_mode{0};
+    bool has_inode_mode{false};
+
     /* Track files being written: key = (pid, fd), value = file info */
     struct file_info_t
     {
@@ -193,6 +203,8 @@ private:
         /* Past MAX_FILE_BYTES: this descriptor's writes are dropped until it
          * is closed, and the record that said so was printed once. */
         bool capped{false};
+        /* Named by the exclude list: dropped the same way. */
+        bool excluded{false};
     };
 
     std::map<std::pair<uint64_t, int>, file_info_t> tracked_files;
@@ -223,16 +235,23 @@ private:
 
     /* Hooks */
     std::unique_ptr<libhook::SyscallHook> syscall_hook;
+    /* The same for 32-bit processes, which do not go through do_syscall_64 */
+    std::unique_ptr<libhook::SyscallHook> compat_syscall_hook;
 
     /* Callbacks */
     event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t compat_syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    /* What both do with a close or a write: `nr` an x86-64 number, `args` in its order */
+    void handle_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t nr, const uint64_t args[4]);
 
     /* Syscall argument extraction */
     bool get_pt_regs_and_nr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* pt_regs_addr, uint64_t* nr);
     bool read_pt_regs_arg(drakvuf_t drakvuf, addr_t pt_regs_addr, int arg_index, uint64_t* value);
 
     /* File operations */
-    std::string get_filename_from_fd(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int fd);
+    addr_t get_file_from_fd(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int fd);
+    std::string get_filename(drakvuf_t drakvuf, addr_t file_struct);
+    bool get_file_mode(drakvuf_t drakvuf, addr_t file_struct, uint16_t* mode);
     bool read_user_buffer(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t user_addr, size_t size, std::vector<uint8_t>& buffer);
     std::string sanitize_filename(const std::string& filename);
     std::string make_dump_filename(const std::string& original_name, int seq_num);
@@ -243,6 +262,7 @@ private:
     void print_extraction_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
         const std::string& filename, uint64_t size,
         const std::string& dump_path, const char* reason);
+    void print_extraction_exclusion(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const std::string& filename);
 };
 
 #endif // FILEEXTRACTOR_LINUX_H

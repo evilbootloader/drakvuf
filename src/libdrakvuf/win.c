@@ -424,7 +424,9 @@ static bool find_kernbase(drakvuf_t drakvuf)
     return 1;
 }
 
-unicode_string_t* win_get_object_name(drakvuf_t drakvuf, addr_t object)
+// The _OBJECT_HEADER_NAME_INFO of an object: its name and the directory the
+// name is in. 0 for an object without one.
+addr_t win_get_object_name_info(drakvuf_t drakvuf, addr_t object)
 {
     // Object header is always present before actual object.
     //
@@ -435,23 +437,32 @@ unicode_string_t* win_get_object_name(drakvuf_t drakvuf, addr_t object)
     {
         uint8_t name_info_offset = 0;
         if (VMI_SUCCESS != vmi_read_8_va(drakvuf_vmi(drakvuf), header + drakvuf->offsets[OBJECT_HEADER_NAME_INFO_OFFSET], 0, &name_info_offset) || name_info_offset == 0)
-            return NULL;
+            return 0;
 
-        return drakvuf_read_unicode_va(drakvuf, header - name_info_offset + drakvuf->offsets[OBJECT_HEADER_NAME_INFO_NAME], 0);
+        return header - name_info_offset;
     }
     uint8_t infomask = 0, name_info_off = 0;
 
     if (VMI_SUCCESS != vmi_read_8_va(drakvuf_vmi(drakvuf), header + drakvuf->offsets[OBJECT_HEADER_INFOMASK], 0, &infomask))
-        return NULL;
+        return 0;
     // Get object name. Some objects are anonymous. See ObQueryNameInfo for more info.
     //
     if (infomask & 2)
     {
         if (VMI_SUCCESS != vmi_read_8_va(drakvuf_vmi(drakvuf), drakvuf->ob_infomask2off + (infomask & 3), 0, &name_info_off))
-            return NULL;
-        return drakvuf_read_unicode_va(drakvuf, header - name_info_off + drakvuf->offsets[OBJECT_HEADER_NAME_INFO_NAME], 0);
+            return 0;
+        return header - name_info_off;
     }
-    return NULL;
+    return 0;
+}
+
+unicode_string_t* win_get_object_name(drakvuf_t drakvuf, addr_t object)
+{
+    addr_t name_info = win_get_object_name_info(drakvuf, object);
+    if (!name_info)
+        return NULL;
+
+    return drakvuf_read_unicode_va(drakvuf, name_info + drakvuf->offsets[OBJECT_HEADER_NAME_INFO_NAME], 0);
 }
 
 unicode_string_t* win_get_object_type_name(drakvuf_t drakvuf, addr_t object)
@@ -791,6 +802,11 @@ bool set_os_windows(drakvuf_t drakvuf)
             return 0;
         }
     }
+
+    // Where an object's path ends (win_get_filename_from_handle). Not required:
+    // without it a file's name is printed without its device, as it was.
+    if (VMI_FAILURE == vmi_read_addr_ksym(drakvuf_vmi(drakvuf), "ObpRootDirectoryObject", &drakvuf->ob_root_directory))
+        drakvuf->ob_root_directory = 0;
 
     if (vmi_get_winver(drakvuf_vmi(drakvuf)) == VMI_OS_WINDOWS_10 && VMI_FAILURE == vmi_read_8_ksym(drakvuf_vmi(drakvuf), "ObHeaderCookie", &drakvuf->ob_header_cookie))
     {

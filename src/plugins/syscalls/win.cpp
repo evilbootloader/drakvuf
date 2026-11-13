@@ -378,8 +378,9 @@ static syscalls_origin::reader user_reader(drakvuf_t drakvuf, drakvuf_trap_info_
     };
 }
 
-// The service the thread asked for, its eax at `syscall`: KTHREAD.SystemCallNumber, which
-// KiSystemServiceUser stores for calls from user mode
+// KTHREAD.SystemCallNumber: the eax of the thread's last entry from user mode, which
+// KiSystemServiceUser stores. Not always the service being dispatched: converting a thread to a
+// GUI thread, on its first win32k syscall, makes callbacks whose syscalls overwrite it first.
 static std::optional<uint32_t> thread_service(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s)
 {
     const addr_t thread = s->thread_syscall_number ? drakvuf_get_current_thread(drakvuf, info) : 0;
@@ -390,6 +391,16 @@ static std::optional<uint32_t> thread_service(drakvuf_t drakvuf, drakvuf_trap_in
     if (VMI_SUCCESS != vmi_read_32_va(vmi, thread + s->thread_syscall_number, 0, &number))
         return {};
     return number;
+}
+
+// Every entry of the service routine at `routine`, as a stub's eax names them
+// (syscalls_origin::service_of): more than one for routines the linker folded into one
+static std::vector<uint32_t> routine_services(win_syscalls* s, addr_t routine)
+{
+    std::shared_lock<std::shared_mutex> lock(s->targets_mtx);
+    if (auto it = s->services.find(routine); it != s->services.end())
+        return it->second;
+    return {};
 }
 
 // The frame of what the call before `ret` called, when that makes the syscall indirect
@@ -495,13 +506,16 @@ static bool through_wow64(const win_syscalls::syscall_origin& origin)
  * called the stub (`call_target`) or called another service's (`stub_syscall`). Which ones are,
  * is for the analysis to say (cape_plugin/syscall_origin.py).
  *
+ * `dispatched` is the service the kernel is running, every entry of its routine: what the stub's
+ * is compared with (syscalls_origin::other_service).
+ *
  * A WoW64 process's syscall made through WoW64's own 64-bit code has those frames of the 32-bit
  * call instead (`bitness` 32): the 64-bit ones are ntdll's stub and wow64.dll every time. Made by
  * 64-bit code of the process's own, or with no 32-bit call to show, they are the 64-bit ones
  * (`bitness` 64).
  */
 static win_syscalls::syscall_origin get_origin(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s,
-    privilege_mode_t mode, addr_t caller)
+    privilege_mode_t mode, addr_t caller, const std::vector<uint32_t>& dispatched)
 {
     win_syscalls::syscall_origin origin;
     if (mode == KERNEL_MODE)
@@ -536,9 +550,15 @@ static win_syscalls::syscall_origin get_origin(drakvuf_t drakvuf, drakvuf_trap_i
 
     if (auto service = stub64_service(user_reader(drakvuf, info), caller))
     {
-        auto called = thread_service(drakvuf, info, s);
-        if (called && (*called & SERVICE_MASK) != (*service & SERVICE_MASK))
-            origin.stub_syscall = *service;
+        if (other_service(*service, dispatched))
+        {
+            // A routine with a breakpoint of its own is also reached when the kernel calls it
+            // itself, serving the service the thread asked for through this stub: the dispatcher
+            // hook never sees those calls
+            auto asked = s->dispatcher ? std::nullopt : thread_service(drakvuf, info, s);
+            if (!asked || (*asked & SERVICE_MASK) != (*service & SERVICE_MASK))
+                origin.stub_syscall = *service;
+        }
         if (origin.parent.address)
             origin.call_target = indirect_target(drakvuf, info, s, origin.parent.address,
                     caller - STUB64_CALLER, STUB64_SIZE, false);
@@ -560,8 +580,10 @@ static win_syscalls::syscall_origin get_origin(drakvuf_t drakvuf, drakvuf_trap_i
 }
 
 /// Who made the syscall, in the thread's previous mode. Nothing on a 32-bit kernel.
+/// `num` in the nt (`ntos`) or win32k table is the entry the breakpoint hit was placed for.
 ///
-static win_syscalls::syscall_origin get_syscall_origin(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s)
+static win_syscalls::syscall_origin get_syscall_origin(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s,
+    uint16_t num, bool ntos)
 {
     if (s->is32bit)
     {
@@ -573,7 +595,13 @@ static win_syscalls::syscall_origin get_syscall_origin(drakvuf_t drakvuf, drakvu
     {
         PRINT_DEBUG("[SYSCALLS] Failed to get previous mode\n");
     }
-    return get_origin(drakvuf, info, s, mode, drakvuf_get_syscall_retaddr(drakvuf, info, mode));
+
+    // The routine the breakpoint is on: folded ones have one for each of their entries, and
+    // all are hit
+    auto dispatched = routine_services(s, info->regs->rip);
+    if (dispatched.empty())
+        dispatched.push_back(service_of(num, ntos));
+    return get_origin(drakvuf, info, s, mode, drakvuf_get_syscall_retaddr(drakvuf, info, mode), dispatched);
 }
 
 // Where the syscall returns to: ntdll for calls from user mode, the caller of the Nt function otherwise.
@@ -610,7 +638,7 @@ static event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     auto num_args = sc ? sc->num_args : 0;
 
     auto args = extract_args(drakvuf, info, s->register_size, num_args);
-    auto origin = get_syscall_origin(drakvuf, info, s);
+    auto origin = get_syscall_origin(drakvuf, info, s, w->num, !strcmp(w->type, "nt"));
     s->print_syscall(drakvuf, info, w->num, w->type, sc, std::move(args), origin);
 
     if (s->disable_sysret || s->is_stopping())
@@ -681,11 +709,23 @@ bool win_syscalls::setup_dispatcher(drakvuf_t drakvuf, vmi_instance_t vmi)
 }
 
 // Stubs the linker folded into one routine share its address, their numbers tell them apart.
-// KiSystemServiceUser stores the number for calls from user mode only, a kernel caller's may be
-// stale: the first stub is taken then.
+// From user mode the stub `syscall` ran in says which: its eax is what the kernel looked the
+// routine up by. Otherwise -- code that is no stub of Windows', a kernel caller -- the number
+// KiSystemServiceUser stored, for calls from user mode only and stale on a thread's first win32k
+// syscall (thread_service): the first stub is taken when it is none of them.
 static win_syscalls::dispatch_target pick_folded(drakvuf_t drakvuf, drakvuf_trap_info_t* info, win_syscalls* s,
-    const std::vector<win_syscalls::dispatch_target>& folded)
+    const std::vector<win_syscalls::dispatch_target>& folded, privilege_mode_t mode, addr_t caller)
 {
+    if (mode == USER_MODE)
+    {
+        if (auto service = stub64_service(user_reader(drakvuf, info), caller))
+        {
+            for (const auto& target : folded)
+                if (service_of(target.num, target.ntos) == (*service & SERVICE_MASK))
+                    return target;
+        }
+    }
+
     addr_t thread = drakvuf_get_current_thread(drakvuf, info);
     uint32_t number = 0;
     if (thread)
@@ -741,16 +781,21 @@ event_response_t win_syscalls::dispatcher_cb(drakvuf_t drakvuf, drakvuf_trap_inf
         if (it->second.size() > 1)
             folded = it->second;
     }
-    if (!folded.empty())
-        target = pick_folded(drakvuf, info, this, folded);
-
-    const char* type = target.ntos ? "nt" : "win32k";
-    auto args = extract_args(drakvuf, info, this->register_size, target.sc ? target.sc->num_args : 0, 0x20);
+    // The routine in r10 is the service dispatched
+    const auto dispatched = routine_services(this, info->regs->r10);
 
     privilege_mode_t mode = MAXIMUM_MODE;
     if (!drakvuf_get_current_thread_previous_mode(drakvuf, info, &mode))
         PRINT_DEBUG("[SYSCALLS] Failed to get previous mode\n");
-    auto origin = get_origin(drakvuf, info, this, mode, dispatcher_caller(drakvuf, info, this, mode));
+    const addr_t caller = dispatcher_caller(drakvuf, info, this, mode);
+
+    if (!folded.empty())
+        target = pick_folded(drakvuf, info, this, folded, mode, caller);
+
+    const char* type = target.ntos ? "nt" : "win32k";
+    auto args = extract_args(drakvuf, info, this->register_size, target.sc ? target.sc->num_args : 0, 0x20);
+
+    auto origin = get_origin(drakvuf, info, this, mode, caller, dispatched);
 
     // Named after the syscall so Method shows it, as its own breakpoint was. The dispatcher's is
     // shared by all syscalls and vCPU threads, so a copy is named.
@@ -837,6 +882,12 @@ bool win_syscalls::trap_syscall_table_entries(drakvuf_t drakvuf, vmi_instance_t 
                     break;
                 }
             }
+        }
+
+        // Before the filter: an entry filtered out is still one its routine serves
+        {
+            std::unique_lock<std::shared_mutex> lock(this->targets_mtx);
+            this->services[syscall_va].push_back(service_of(syscall_num, ntos));
         }
 
         const char* symbol_name = nullptr;
@@ -973,8 +1024,9 @@ win_syscalls::win_syscalls(drakvuf_t drakvuf, const syscalls_config* config, out
     if (!this->is32bit && !this->wow64_context_eip)
         PRINT_DEBUG("[SYSCALLS] No WoW64 profile (--json-wow): the 32-bit side of WoW64 syscalls is not reported\n");
 
-    // The service a thread called, to compare with the stub its syscall ran in (get_origin);
-    // without it the comparison is not made. Dispatcher mode needs it as well (setup_dispatcher).
+    // The service a thread last asked for: tells folded routines apart (pick_folded), and a
+    // routine the kernel called itself from one dispatched (get_origin, without the dispatcher).
+    // Dispatcher mode needs it as well (setup_dispatcher).
     if (!this->is32bit &&
         !drakvuf_get_kernel_struct_member_rva(drakvuf, "_KTHREAD", "SystemCallNumber", &this->thread_syscall_number))
     {
@@ -1234,7 +1286,8 @@ void win_syscalls::print_syscall(
 
     // Each frame (get_origin) as an address, its module and, for a second mapping of a system DLL,
     // that mapping's base (`...Copy`). An address is left out when unknown (0); a module when it
-    // could not be looked up, and "" for memory no file backs: the analysis tells the two apart.
+    // could not be looked up, and "" for memory no file backs (exact_str): the analysis tells
+    // the two apart.
     // StubSyscall, the call target and the copies are printed only when there is one.
     auto address = [](addr_t value)
     {
@@ -1247,7 +1300,7 @@ void win_syscalls::print_syscall(
     {
         std::optional<fmt::Estr<std::string>> out;
         if (f.address && f.module)
-            out = fmt::Estr(*f.module);
+            out = exact_str(*f.module);
         return out;
     };
     std::optional<fmt::Xval<uint32_t>> stub_syscall;

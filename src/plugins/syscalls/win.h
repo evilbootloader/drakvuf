@@ -142,7 +142,7 @@ public:
      * Who made a syscall (get_origin in win.cpp). From user mode, the first two frames of the
      * thread's user stack: `caller` the instruction after `syscall`, `parent` what the stub that
      * ran it returns to. When `caller` is in an ntdll or win32u stub: `stub_syscall` the service
-     * that stub is for, when the thread called another; `call_target` what the call before
+     * that stub is for, when the kernel dispatched another; `call_target` what the call before
      * `parent` called, when it was not that stub but the stub past its start, or a syscall stub
      * of its own. `bitness`, for a WoW64 process: 32 when these are the frames of the 32-bit call
      * WoW64 made the syscall for, 64 when they are 64-bit code's; 0 for a 64-bit process.
@@ -182,7 +182,7 @@ public:
     };
     bool dispatcher = false;
     addr_t dispatcher_exit = 0;         // KiSystemServiceExit
-    addr_t thread_syscall_number = 0;   // _KTHREAD.SystemCallNumber, also read for get_origin
+    addr_t thread_syscall_number = 0;   // _KTHREAD.SystemCallNumber, read without the dispatcher too
     addr_t thread_trap_frame = 0;       // _KTHREAD.TrapFrame
     addr_t trap_frame_rsp = 0;          // _KTRAP_FRAME.Rsp
     // Service routines by address. win32k's are added when its table is read, which may be after
@@ -190,6 +190,10 @@ public:
     // entry lists all their numbers.
     std::shared_mutex targets_mtx;
     std::unordered_map<addr_t, std::vector<dispatch_target>> targets;
+    // The table entries of each service routine, as a stub's eax names them
+    // (syscalls_origin::service_of), in both modes and for filtered syscalls too: what
+    // get_origin compares the stub's service with. Under targets_mtx.
+    std::unordered_map<addr_t, std::vector<uint32_t>> services;
     std::unique_ptr<libhook::SyscallHook> dispatcher_hook;
 
     bool setup_dispatcher(drakvuf_t drakvuf, vmi_instance_t vmi);

@@ -187,6 +187,20 @@ std::string escape_bytes(const uint8_t* data, size_t size)
     return out;
 }
 
+bool parse_ansi_string(const uint8_t* buf, size_t len, bool is32bit, uint16_t* length, uint64_t* buffer)
+{
+    const size_t at = is32bit ? 4 : 8;
+    const size_t width = is32bit ? 4 : 8;
+    if (len < at + width)
+        return false;
+
+    *length = buf[0] | (buf[1] << 8);
+    *buffer = 0;
+    for (size_t i = 0; i < width; i++)
+        *buffer |= static_cast<uint64_t>(buf[at + i]) << (8 * i);
+    return true;
+}
+
 std::optional<std::string> format_sockaddr(const uint8_t* buf, size_t len, bool linux)
 {
     if (len < 2)

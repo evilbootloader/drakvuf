@@ -201,6 +201,30 @@ START_TEST(test_sockaddr_un)
 }
 END_TEST
 
+START_TEST(test_ansi_string)
+{
+    // Length 14, MaximumLength 15, padding, Buffer 0x7ffa54562da0
+    const std::vector<uint8_t> x64 = { 14, 0, 15, 0, 0xcc, 0xcc, 0xcc, 0xcc,
+                                       0xa0, 0x2d, 0x56, 0x54, 0xfa, 0x7f, 0, 0
+                                     };
+    uint16_t length = 0;
+    uint64_t buffer = 0;
+    ck_assert(parse_ansi_string(x64.data(), x64.size(), false, &length, &buffer));
+    ck_assert_uint_eq(length, 14);
+    ck_assert(buffer == 0x7ffa54562da0);
+
+    // A 32-bit process's: Buffer follows MaximumLength
+    const std::vector<uint8_t> x86 = { 0x02, 0x01, 0x03, 0x01, 0x78, 0x56, 0x34, 0x12 };
+    ck_assert(parse_ansi_string(x86.data(), x86.size(), true, &length, &buffer));
+    ck_assert_uint_eq(length, 0x102);
+    ck_assert(buffer == 0x12345678);
+
+    // Short of the structure: the 64-bit one read as far as an unmapped page
+    ck_assert(!parse_ansi_string(x64.data(), 12, false, &length, &buffer));
+    ck_assert(!parse_ansi_string(x86.data(), 7, true, &length, &buffer));
+}
+END_TEST
+
 Suite* escape_str_suite(void)
 {
     Suite* s;
@@ -221,6 +245,7 @@ Suite* escape_str_suite(void)
     tcase_add_test(tc_core, test_sockaddr_in);
     tcase_add_test(tc_core, test_sockaddr_in6);
     tcase_add_test(tc_core, test_sockaddr_un);
+    tcase_add_test(tc_core, test_ansi_string);
 
     suite_add_tcase(s, tc_core);
 

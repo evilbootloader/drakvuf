@@ -119,6 +119,8 @@ public:
     /* Hooks */
     // Unified syscall hook (modern kernels 6.x+)
     std::unique_ptr<libhook::SyscallHook> syscall_hook;
+    // The same for 32-bit processes, which do not go through do_syscall_64
+    std::unique_ptr<libhook::SyscallHook> compat_syscall_hook;
 
     // Legacy VFS hooks (older kernels)
     // File operations hooks
@@ -154,6 +156,9 @@ public:
     /* Callbacks */
     // Unified syscall callback (modern kernels)
     event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t compat_syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    // What both do with a file syscall: `nr` an x86-64 number, `args` in its order
+    void handle_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t nr, const char* syscall_name, const uint64_t args[4]);
 
     // Legacy file operations callbacks
     event_response_t open_file_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
@@ -194,15 +199,19 @@ public:
     bool get_pt_regs_and_nr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* pt_regs_addr, uint64_t* nr);
     bool read_pt_regs_arg(drakvuf_t drakvuf, addr_t pt_regs_addr, int arg_index, uint64_t* value);
     std::string get_filename_from_fd(drakvuf_t drakvuf, drakvuf_trap_info_t* info, int fd);
+    std::string get_cwd(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
     char* read_user_string(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t user_addr);
 
     /* File info parsing */
     bool get_file_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, linux_data* params, addr_t struct_addr);
     bool get_path_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, linux_data* params, addr_t struct_addr);
     bool get_dentry_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, linux_data* params, addr_t struct_addr);
+    void get_inode_info(drakvuf_t drakvuf, drakvuf_trap_info_t* info, linux_data* params, addr_t dentry_addr);
     std::string get_filepath(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t dentry_addr);
     std::string get_filepath_locked(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_instance_t vmi, addr_t dentry_addr);
     char* read_filename(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t fileaddr);
+
+    void hook_compat_syscalls();
 
     linux_filetracer(drakvuf_t drakvuf, output_format_t output);
     linux_filetracer(const linux_filetracer&) = delete;

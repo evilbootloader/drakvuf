@@ -126,4 +126,12 @@ std::string escape_bytes(const uint8_t* data, size_t size);
  */
 std::optional<std::string> format_sockaddr(const uint8_t* buf, size_t len, bool linux);
 
+/*
+ * The fields of an ANSI_STRING { USHORT Length; USHORT MaximumLength; PCHAR
+ * Buffer; } from its bytes: Buffer is at 8 in a 64-bit process, after the
+ * padding a pointer's alignment asks for, and at 4 in a 32-bit one. False
+ * for fewer bytes than the structure.
+ */
+bool parse_ansi_string(const uint8_t* buf, size_t len, bool is32bit, uint16_t* length, uint64_t* buffer);
+
 #endif

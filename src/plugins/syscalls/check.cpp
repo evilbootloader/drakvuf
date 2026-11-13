@@ -102,6 +102,10 @@
  *                                                                         *
  ***************************************************************************/
 
+#include <optional>
+#include <sstream>
+#include <string>
+
 #include <check.h>
 
 #include <algorithm>
@@ -111,6 +115,8 @@
 #include "../../libdrakvuf/libdrakvuf.h"
 #include "private.h"
 #include "origin.h"
+#include "linux.h"
+#include "plugins/helpers/linux_compat_syscall.h"
 
 START_TEST(test_syscall_arg_type_parameters)
 {
@@ -327,6 +333,132 @@ START_TEST(test_origin_wow64)
 }
 END_TEST
 
+START_TEST(test_origin_other_service)
+{
+    using syscalls_origin::other_service;
+    using syscalls_origin::service_of;
+
+    ck_assert_uint_eq(service_of(0x18, true), 0x18);
+    ck_assert_uint_eq(service_of(738, false), 0x12e2);
+
+    // win32u!NtGdiInit's stub and the win32k service dispatched: the table's bit counts
+    ck_assert(!other_service(0x12e2, { service_of(738, false) }));
+    ck_assert(other_service(0x12e2, { service_of(738, true) }));
+    // Another service's stub ran the syscall
+    ck_assert(other_service(0x18, { service_of(0x19, true) }));
+    // A routine the linker folded: any of its entries is the stub's
+    ck_assert(!other_service(0x19, { service_of(0x18, true), service_of(0x19, true) }));
+    ck_assert(other_service(0x1a, { service_of(0x18, true), service_of(0x19, true) }));
+    // The bits of eax above the table's are not the service
+    ck_assert(!other_service(0x30018, { service_of(0x18, true) }));
+    // Nothing known of what is dispatched
+    ck_assert(!other_service(0x18, {}));
+}
+END_TEST
+
+// A frame's module in a JSON record: "" for memory no file backs, null when not looked up
+START_TEST(test_origin_module_printed)
+{
+    auto printed = [](const std::optional<fmt::Estr<std::string>>& module)
+    {
+        std::stringstream ss;
+        ck_assert(jsonfmt::print_data(ss, module, ','));
+        return ss.str();
+    };
+    ck_assert(printed(syscalls_ns::exact_str("")) == "\"\"");
+    ck_assert(printed(syscalls_ns::exact_str("\\Windows\\System32\\ntdll.dll")) == "\"\\\\Windows\\\\System32\\\\ntdll.dll\"");
+    ck_assert(printed({}) == "null");
+    // What fmt::Estr prints by itself, and other plugins keep
+    ck_assert(printed(fmt::Estr(std::string())) == "\"(null)\"");
+}
+END_TEST
+
+// The i386 syscalls filetracer, fileextractor and memdump handle as x86-64
+// ones: the numbers and names are this plugin's tables', so a record of
+// theirs joins the syscall's by its name.
+START_TEST(test_linux_compat_translations)
+{
+    using namespace syscalls_ns;
+
+    // i386 syscalls with another name than the x86-64 one doing the same
+    const std::map<std::string, std::string> renamed =
+    {
+        { "oldstat", "stat" }, { "oldlstat", "lstat" }, { "oldfstat", "fstat" },
+        { "stat64", "stat" }, { "lstat64", "lstat" }, { "fstat64", "fstat" },
+        { "_llseek", "lseek" }, { "mmap2", "mmap" }, { "sendfile", "sendfile64" },
+        { "truncate64", "truncate" }, { "ftruncate64", "ftruncate" },
+        { "chown32", "chown" }, { "fchown32", "fchown" }, { "lchown32", "lchown" },
+    };
+
+    ck_assert(NUM_SYSCALLS_LINUX_X32 > 0);
+    for (const auto& t : linux_compat::translations)
+    {
+        ck_assert_msg(t.i386 < NUM_SYSCALLS_LINUX_IA32 && linuxsc::linux_syscalls_table_ia32[t.i386],
+            "i386 syscall %u is not in the table", t.i386);
+        const char* ia32_name = linuxsc::linux_syscalls_table_ia32[t.i386]->display_name;
+        ck_assert_msg(!strcmp(ia32_name, t.name), "i386 syscall %u is %s, not %s", t.i386, ia32_name, t.name);
+
+        // openat2: the x86-64 table ends before it
+        if (t.x64 >= NUM_SYSCALLS_LINUX_X64)
+            continue;
+        auto it = renamed.find(t.name);
+        const std::string expected = it == renamed.end() ? t.name : it->second;
+        const char* x64_name = linuxsc::linux_syscalls_table_x64[t.x64]->display_name;
+        ck_assert_msg(expected == x64_name, "x86-64 syscall %u is %s, not %s", t.x64, x64_name, expected.c_str());
+    }
+
+    ck_assert(linux_compat::find(5)->x64 == 2);     // open
+    ck_assert(!linux_compat::find(90));             // mmap: one pointer to its arguments
+    ck_assert(!linux_compat::find(102));            // socketcall
+    ck_assert(!linux_compat::find(0x1000));
+}
+END_TEST
+
+START_TEST(test_linux_compat_arguments)
+{
+    // lseek(fd, -1, SEEK_END): a 32-bit off_t
+    uint64_t lseek[6] = { 3, 0xffffffff, 2 };
+    linux_compat::to_x64_args(linux_compat::NR_lseek, lseek);
+    ck_assert(static_cast<int64_t>(lseek[1]) == -1 && lseek[2] == 2);
+
+    // _llseek(fd, high, low, result, whence)
+    uint64_t llseek[6] = { 3, 0x1, 0x80000000, 0xff9e4000, 1 };
+    linux_compat::to_x64_args(linux_compat::NR_llseek, llseek);
+    ck_assert(llseek[1] == 0x180000000 && llseek[2] == 1);
+
+    // pwrite64(fd, buf, count, pos_low, pos_high)
+    uint64_t pwrite[6] = { 3, 0x8048000, 0x10, 0xfffff000, 0x2 };
+    linux_compat::to_x64_args(linux_compat::NR_pwrite64, pwrite);
+    ck_assert(pwrite[3] == 0x2fffff000 && pwrite[2] == 0x10);
+
+    // mmap2's offset is in pages; ftruncate64's length in two halves
+    uint64_t mmap2[6] = { 0, 0x2000, 7, 0x22, 0xffffffff, 0x100000 };
+    linux_compat::to_x64_args(linux_compat::NR_mmap2, mmap2);
+    ck_assert(mmap2[5] == 0x100000000 && mmap2[2] == 7 && static_cast<int>(mmap2[4]) == -1);
+    uint64_t ftruncate[6] = { 3, 0x0, 0x1 };
+    linux_compat::to_x64_args(linux_compat::NR_ftruncate64, ftruncate);
+    ck_assert(ftruncate[1] == 0x100000000);
+
+    // clone's tls and child_tid change places; open is as it is
+    uint64_t clone[6] = { 0x100, 0, 0x11, 0x22, 0x33 };
+    linux_compat::to_x64_args(linux_compat::NR_clone, clone);
+    ck_assert(clone[0] == 0x100 && clone[3] == 0x33 && clone[4] == 0x22);
+    uint64_t open[6] = { 0x8048000, 0x10800, 0 };
+    linux_compat::to_x64_args(5, open);
+    ck_assert(open[0] == 0x8048000 && open[1] == 0x10800);
+}
+END_TEST
+
+Suite* linux_compat_suite(void)
+{
+    Suite* s = suite_create("32-bit Linux syscalls as x86-64 ones");
+    TCase* tc = tcase_create("Core");
+    tcase_add_test(tc, test_linux_compat_translations);
+    tcase_add_test(tc, test_linux_compat_arguments);
+    suite_add_tcase(s, tc);
+    return s;
+}
+
 Suite* syscall_origin_suite(void)
 {
     Suite* s = suite_create("Where a Windows syscall was made from");
@@ -335,6 +467,8 @@ Suite* syscall_origin_suite(void)
     tcase_add_test(tc, test_origin_calls_that_reach_the_stub);
     tcase_add_test(tc, test_origin_indirect_syscalls);
     tcase_add_test(tc, test_origin_wow64);
+    tcase_add_test(tc, test_origin_other_service);
+    tcase_add_test(tc, test_origin_module_printed);
     suite_add_tcase(s, tc);
     return s;
 }
@@ -349,6 +483,7 @@ int main(void)
     sr = srunner_create(s);
     srunner_add_suite(sr, syscall_parameters_suite());
     srunner_add_suite(sr, syscall_origin_suite());
+    srunner_add_suite(sr, linux_compat_suite());
 
     srunner_run_all(sr, CK_NORMAL);
     number_failed = srunner_ntests_failed(sr);

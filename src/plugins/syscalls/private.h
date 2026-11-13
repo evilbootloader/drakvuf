@@ -107,6 +107,7 @@
 
 #include "plugins/plugins_ex.h"
 #include "plugins/plugin_utils.h"
+#include "plugins/output_format.h"
 
 namespace syscalls_ns
 {
@@ -878,6 +879,18 @@ static const char* linux_pt_regs_names_optional[__PT_REGS_MAX - __PT_REGS_REQUIR
     [PT_REGS_RSP - __PT_REGS_REQUIRED]      = {"pt_regs", "sp"},
     [PT_REGS_SS - __PT_REGS_REQUIRED]       = {"pt_regs", "ss"},
 };
+
+/*
+ * A string printed as it is, where fmt::Estr prints "(null)" for an empty one. For the module of
+ * a frame, which is "" for memory no file backs: the analysis reads that as unbacked and a JSON
+ * null, what a module left out is printed as, as not looked up (cape_plugin/syscall_origin.py).
+ */
+inline fmt::Estr<std::string> exact_str(const std::string& value)
+{
+    fmt::Estr<std::string> out(value);
+    out.value = value;
+    return out;
+}
 
 }
 

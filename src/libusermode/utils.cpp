@@ -177,6 +177,10 @@ std::unique_ptr<ArgumentPrinter> make_arg_printer(
     {
         return std::make_unique<UnicodePrinter>(name, config);
     }
+    else if (type == "pansi_string")
+    {
+        return std::make_unique<AnsiStringPrinter>(name, config);
+    }
     else if (type == "pulong")
     {
         return std::make_unique<UlongPrinter>(name, config);

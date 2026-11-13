@@ -133,7 +133,10 @@ private:
     std::set<vmi_pid_t> finished;
 
     uint32_t timeout{0};
+    vmi_pid_t dump_process_on_finish{0};
     bool dump_new_processes_on_finish{0};
+    // Used only with dump_new_processes_on_finish
+    std::vector<vmi_pid_t> running_processes_on_start;
     const std::filesystem::path procdump_dir;
     dump_compression_t const dump_compression;
     bool const use_maple_tree{false};

@@ -165,4 +165,8 @@ const kernel_version_t* linux_get_kernel_version(drakvuf_t drakvuf, drakvuf_trap
 
 char* linux_get_filepath_from_dentry(drakvuf_t drakvuf, addr_t dentry_addr);
 
+char* linux_get_filepath_from_path(drakvuf_t drakvuf, addr_t path_addr);
+
+bool linux_prepend_path(drakvuf_t drakvuf, addr_t dentry, addr_t vfsmnt, addr_t root_dentry, addr_t root_mnt, GString* b);
+
 #endif

@@ -106,6 +106,7 @@
 #include <assert.h>
 #include <atomic>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -114,6 +115,9 @@
 #include "linux.h"
 
 using namespace syscalls_ns;
+
+// prctl's option that names the calling thread: PR_SET_NAME in prctl_option
+static constexpr uint32_t LINUX_PR_SET_NAME = 15;
 
 
 bool linux_syscalls::get_pt_regs_addr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* pt_regs_addr, addr_t* nr)
@@ -247,8 +251,10 @@ std::vector<uint64_t> linux_syscalls::build_arguments_buffer(drakvuf_t drakvuf, 
                     arguments.push_back(pt_regs[PT_REGS_RSI]);
                 if ( nargs > 2 )
                     arguments.push_back(pt_regs[PT_REGS_RDX]);
+                // The fourth is in r10, not rcx as for a function: the syscall instruction
+                // puts the address it returns to in rcx
                 if ( nargs > 3 )
-                    arguments.push_back(pt_regs[PT_REGS_RCX]);
+                    arguments.push_back(pt_regs[PT_REGS_R10]);
                 if ( nargs > 4 )
                     arguments.push_back(pt_regs[PT_REGS_R8]);
                 if ( nargs > 5 )
@@ -278,23 +284,22 @@ std::vector<uint64_t> linux_syscalls::build_arguments_buffer(drakvuf_t drakvuf, 
 
 /*
  * What get_origin reads, from the kernel profile: the vDSO of an mm_struct and its size, the
- * dentry of a struct file, and the kernel's vDSO images, which tell a 32-bit process from a 64-bit
+ * path of a struct file, and the kernel's vDSO images, which tell a 32-bit process from a 64-bit
  * one. False when one is missing: syscalls are reported without where they came from then.
  */
 bool linux_syscalls::setup_origin(drakvuf_t drakvuf)
 {
-    addr_t mm_context = 0, context_vdso = 0, context_vdso_image = 0, file_path = 0, path_dentry = 0;
+    addr_t mm_context = 0, context_vdso = 0, context_vdso_image = 0, path_dentry = 0;
     if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "task_struct", "mm", &this->task_mm) ||
         !drakvuf_get_kernel_struct_member_rva(drakvuf, "mm_struct", "context", &mm_context) ||
         !drakvuf_get_kernel_struct_member_rva(drakvuf, "mm_context_t", "vdso", &context_vdso) ||
         !drakvuf_get_kernel_struct_member_rva(drakvuf, "mm_context_t", "vdso_image", &context_vdso_image) ||
         !drakvuf_get_kernel_struct_member_rva(drakvuf, "vdso_image", "size", &this->vdso_image_size) ||
-        !drakvuf_get_kernel_struct_member_rva(drakvuf, "file", "f_path", &file_path) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "file", "f_path", &this->file_path) ||
         !drakvuf_get_kernel_struct_member_rva(drakvuf, "path", "dentry", &path_dentry))
         return false;
     this->mm_vdso = mm_context + context_vdso;
     this->mm_vdso_image = mm_context + context_vdso_image;
-    this->file_dentry = file_path + path_dentry;
 
     // A kernel without the compat ABIs has no vdso_image_32 or vdso_image_x32
     auto vmi = vmi_lock_guard(drakvuf);
@@ -331,13 +336,9 @@ std::optional<std::string> linux_syscalls::resolve_module(drakvuf_t drakvuf, dra
     if (!file)
         return std::string();
 
-    addr_t dentry = 0;
-    {
-        vmi_reader_guard vmi(drakvuf);
-        if (VMI_SUCCESS != vmi_read_addr_va(vmi, file + this->file_dentry, 0, &dentry) || !dentry)
-            return {};
-    }
-    char* path = drakvuf_get_filepath_from_dentry(drakvuf, dentry);
+    // Across mounts, as the process's own path is (ProcessName): the two are
+    // compared to tell a program's own code
+    char* path = drakvuf_get_filepath_from_path(drakvuf, file + this->file_path);
     if (!path)
         return {};
     std::string name = path;
@@ -399,6 +400,27 @@ linux_syscalls::syscall_origin linux_syscalls::get_origin(drakvuf_t drakvuf, dra
     return origin;
 }
 
+// PR_SET_NAME's arg2: the name the thread takes, of which the kernel copies the 15 bytes a comm
+// holds. Nothing when it cannot be read up to its end.
+static std::optional<std::string> read_thread_name(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t addr)
+{
+    char comm[16] = {0}; // TASK_COMM_LEN
+    size_t got = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        ACCESS_CONTEXT(ctx,
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = info->regs->cr3,
+            .addr = addr
+        );
+        // Stops at a page that is not present, with what was read before it
+        vmi_read(vmi, &ctx, sizeof(comm) - 1, comm, &got);
+    }
+    if (!got || (got < sizeof(comm) - 1 && !memchr(comm, 0, got)))
+        return {};
+    return std::string(comm);
+}
+
 void linux_syscalls::print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* entry_info, const syscalls_ns::syscall_t* sc, uint16_t syscall_num, const char* syscall_type, std::vector<uint64_t> arguments, const syscall_origin& origin)
 {
     // Name the trap after the syscall so Method shows it. The dispatcher hooks are shared by all
@@ -413,6 +435,16 @@ void linux_syscalls::print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* entry
     std::vector<std::pair<char const*, fmt::Aarg>> fmt_args;
     for (size_t i = 0; i < arguments.size(); i++)
     {
+        // What prctl's arg2 is depends on its option, which parse_argument does not see: for
+        // PR_SET_NAME the new name, a blank one being how Mirai hides its process
+        if (i == 1 && sc->args[0].type == linux_intopt_pr_ && (uint32_t)arguments[0] == LINUX_PR_SET_NAME)
+        {
+            if (auto name = read_thread_name(drakvuf, info, arguments[i]))
+            {
+                fmt_args.push_back(keyval(sc->args[i].name, exact_str(*name)));
+                continue;
+            }
+        }
         auto str = this->parse_argument(drakvuf, info, sc->args[i], arguments[i]);
         if (!str.empty())
             fmt_args.push_back(keyval(sc->args[i].name, fmt::Estr(str)));
@@ -427,13 +459,14 @@ void linux_syscalls::print_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* entry
     std::string thread_name = tmp ?: "";
     g_free(tmp);
 
-    // Where it was made from (get_origin): left out when unknown
+    // Where it was made from (get_origin): left out when unknown, the module "" for memory no
+    // file backs (exact_str)
     std::optional<fmt::Xval<addr_t>> caller;
     if (origin.caller)
         caller = fmt::Xval(origin.caller);
     std::optional<fmt::Estr<std::string>> from_module;
     if (origin.caller && origin.module)
-        from_module = fmt::Estr(*origin.module);
+        from_module = exact_str(*origin.module);
     std::optional<fmt::Nval<int>> bitness;
     if (origin.bitness)
         bitness = fmt::Nval(origin.bitness);

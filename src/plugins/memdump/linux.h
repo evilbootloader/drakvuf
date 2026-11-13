@@ -246,6 +246,8 @@ public:
 
     // Syscall hooks
     std::unique_ptr<libhook::SyscallHook> syscall_hook;
+    // The same for 32-bit processes, which do not go through do_syscall_64
+    std::unique_ptr<libhook::SyscallHook> compat_syscall_hook;
 
     // Return hooks for async syscall results
     std::map<std::pair<uint64_t, addr_t>, std::unique_ptr<libhook::ReturnHook>> ret_hooks;
@@ -257,6 +259,10 @@ public:
 
     // Callbacks
     event_response_t syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t compat_syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    // What both do with a memory syscall: `nr` an x86-64 number, `args` in its order
+    void handle_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t nr, const char* syscall_name, const uint64_t args[5]);
+    void hook_compat_syscalls();
 
     // Helper functions
     bool get_pt_regs_and_nr(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t* pt_regs_addr, uint64_t* nr);

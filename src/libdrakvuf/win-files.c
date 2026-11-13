@@ -108,6 +108,75 @@
 #include "private.h"
 #include "win-offsets.h"
 
+// CSHORT Type, the first member of the I/O manager's structures
+#define IO_TYPE_DEVICE 3
+#define IO_TYPE_FILE 5
+
+// Object directories from a device up to the root: \Device\HarddiskVolume2
+// has one, \Device\Harddisk0\DR0 two
+#define OBJECT_PATH_MAX_DEPTH 8
+
+/*
+ * The device a FILE_OBJECT was opened on, by its path in the object
+ * namespace: "\Device\HarddiskVolume2", "\Device\NamedPipe". As
+ * ObQueryNameString builds it: the name in each object's
+ * _OBJECT_HEADER_NAME_INFO, then that of the Directory it is in, up to
+ * ObpRootDirectoryObject.
+ *
+ * NULL unless every step is what it should be -- `file` is a FILE_OBJECT, its
+ * DeviceObject a DEVICE_OBJECT, and the directories end at the root: a handle
+ * to anything else is read here as well, and a guess would be printed as a
+ * path.
+ */
+static char* win_get_file_device_path(drakvuf_t drakvuf, addr_t file)
+{
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
+
+    if (!drakvuf->ob_root_directory || !drakvuf->offsets[FILEOBJECT_DEVICEOBJECT])
+        return NULL;
+
+    uint16_t type = 0;
+    if (VMI_SUCCESS != vmi_read_16_va(vmi, file, 0, &type) || type != IO_TYPE_FILE)
+        return NULL;
+
+    addr_t object = 0;
+    if (VMI_SUCCESS != vmi_read_addr_va(vmi, file + drakvuf->offsets[FILEOBJECT_DEVICEOBJECT], 0, &object) || !object)
+        return NULL;
+
+    if (VMI_SUCCESS != vmi_read_16_va(vmi, object, 0, &type) || type != IO_TYPE_DEVICE)
+        return NULL;
+
+    GString* path = g_string_new(NULL);
+    for (int depth = 0; depth < OBJECT_PATH_MAX_DEPTH; depth++)
+    {
+        addr_t name_info = win_get_object_name_info(drakvuf, object);
+        if (!name_info)
+            break;
+
+        addr_t directory = 0;
+        if (VMI_SUCCESS != vmi_read_addr_va(vmi, name_info + drakvuf->offsets[OBJECT_HEADER_NAME_INFO_DIRECTORY], 0, &directory) || !directory)
+            break;
+
+        unicode_string_t* name = drakvuf_read_unicode_va(drakvuf, name_info + drakvuf->offsets[OBJECT_HEADER_NAME_INFO_NAME], 0);
+        if (!name || !name->contents || !name->contents[0])
+        {
+            if (name)
+                vmi_free_unicode_str(name);
+            break;
+        }
+        g_string_prepend(path, (const char*)name->contents);
+        g_string_prepend(path, "\\");
+        vmi_free_unicode_str(name);
+
+        if (directory == drakvuf->ob_root_directory)
+            return g_string_free(path, FALSE);
+        object = directory;
+    }
+
+    g_string_free(path, TRUE);
+    return NULL;
+}
+
 char* win_get_filename_from_handle(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t handle)
 {
     addr_t process = drakvuf_get_current_process(drakvuf, info);
@@ -116,12 +185,30 @@ char* win_get_filename_from_handle(drakvuf_t drakvuf, drakvuf_trap_info_t* info,
     addr_t obj = drakvuf_get_obj_by_handle(drakvuf, process, handle);
     if (!obj) return NULL;
 
-    unicode_string_t* us = drakvuf_read_unicode(drakvuf, info, obj + drakvuf->offsets[OBJECT_HEADER_BODY] + drakvuf->offsets[FILEOBJECT_NAME]);
+    addr_t file = obj + drakvuf->offsets[OBJECT_HEADER_BODY];
+    unicode_string_t* us = drakvuf_read_unicode(drakvuf, info, file + drakvuf->offsets[FILEOBJECT_NAME]);
     if (!us) return NULL;
 
     char* filename = (char*)us->contents;
     us->contents = NULL;
     vmi_free_unicode_str(us);
+
+    // FileName is the path on the volume, "\Users\x\a.tmp": the same file
+    // named by a path argument has its drive. With the device it is the name
+    // the kernel keeps for a process's image, "\Device\HarddiskVolume2\...".
+    // A name relative to another file object (no leading backslash: it was
+    // opened with a RootDirectory) is not a path on the device, and stays.
+    if (filename && (!filename[0] || filename[0] == '\\'))
+    {
+        char* device = win_get_file_device_path(drakvuf, file);
+        if (device)
+        {
+            char* full = g_strconcat(device, filename, NULL);
+            g_free(device);
+            g_free(filename);
+            filename = full;
+        }
+    }
 
     return filename;
 }

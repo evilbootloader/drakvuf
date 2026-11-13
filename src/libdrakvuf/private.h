@@ -230,6 +230,7 @@ struct drakvuf
     uint8_t ob_header_cookie;
     addr_t ob_infomask2off;
     addr_t ob_type_table;
+    addr_t ob_root_directory; // ObpRootDirectoryObject, 0 when the profile has no such symbol
 
     size_t address_width;
 

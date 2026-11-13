@@ -115,6 +115,7 @@
 #include "memdump.h"
 #include "linux.h"
 #include "private.h"
+#include "plugins/helpers/linux_compat_syscall.h"
 
 using namespace memdump_ns;
 
@@ -260,17 +261,76 @@ event_response_t linux_memdump::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_
     if (!is_memory_syscall(nr))
         return VMI_EVENT_RESPONSE_NONE;
 
+    // Read syscall arguments from pt_regs
+    uint64_t args[5] = {};
+    for (int i = 0; i < 5; i++)
+        read_pt_regs_arg(drakvuf, pt_regs_addr, i, &args[i]);
+
+    handle_syscall(drakvuf, info, nr, get_memory_syscall_name(nr), args);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+// i386's first mmap, which the syscalls plugin prints as `mmap` too: its one
+// argument points to the six. Static programs built against old C libraries
+// still call it.
+static constexpr uint64_t I386_NR_OLD_MMAP = 90;
+
+/*
+ * A 32-bit process's syscall, handled as the x86-64 syscall doing the same
+ * and printed under its own name: `mmap2` is handled as `mmap` is. Runs on
+ * several vCPU threads at once, as syscall_cb.
+ */
+event_response_t linux_memdump::compat_syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    addr_t pt_regs_addr = 0;
+    uint64_t nr = 0;
+
+    if (!linux_compat::get_pt_regs_and_nr(drakvuf, info, this->regs[PT_REGS_ORIG_RAX], &pt_regs_addr, &nr))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    const auto* translation = linux_compat::find(nr);
+    if (nr != I386_NR_OLD_MMAP && (!translation || !is_memory_syscall(translation->x64)))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    const size_t arg_regs[6] =
+    {
+        this->regs[PT_REGS_RBX], this->regs[PT_REGS_RCX], this->regs[PT_REGS_RDX],
+        this->regs[PT_REGS_RSI], this->regs[PT_REGS_RDI], this->regs[PT_REGS_RBP]
+    };
+    uint64_t args[6] = {};
+    if (!linux_compat::read_args(drakvuf, pt_regs_addr, arg_regs, args))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    if (nr == I386_NR_OLD_MMAP)
+    {
+        // struct mmap_arg_struct32 { addr, len, prot, flags, fd, offset }, 32 bits each
+        uint32_t mmap_args[6] = {};
+        {
+            vmi_reader_guard vmi(drakvuf);
+            ACCESS_CONTEXT(ctx,
+                .translate_mechanism = VMI_TM_PROCESS_DTB,
+                .dtb = info->regs->cr3,
+                .addr = args[0]
+            );
+            if (VMI_SUCCESS != vmi_read(vmi, &ctx, sizeof(mmap_args), mmap_args, nullptr))
+                return VMI_EVENT_RESPONSE_NONE;
+        }
+        for (int i = 0; i < 6; i++)
+            args[i] = mmap_args[i];
+        handle_syscall(drakvuf, info, __NR_mmap, "mmap", args);
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    linux_compat::to_x64_args(nr, args);
+    handle_syscall(drakvuf, info, translation->x64, translation->name, args);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+void linux_memdump::handle_syscall(drakvuf_t drakvuf, drakvuf_trap_info_t* info, uint64_t nr, const char* syscall_name, const uint64_t args[5])
+{
     std::lock_guard<std::mutex> lock(this->syscall_mtx);
 
-    const char* syscall_name = get_memory_syscall_name(nr);
-
-    // Read syscall arguments from pt_regs
-    uint64_t arg0 = 0, arg1 = 0, arg2 = 0, arg3 = 0, arg4 = 0;
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 0, &arg0);
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 1, &arg1);
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 2, &arg2);
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 3, &arg3);
-    read_pt_regs_arg(drakvuf, pt_regs_addr, 4, &arg4);
+    const uint64_t arg0 = args[0], arg1 = args[1], arg2 = args[2];
 
     switch (nr)
     {
@@ -461,8 +521,22 @@ event_response_t linux_memdump::syscall_cb(drakvuf_t drakvuf, drakvuf_trap_info_
         default:
             break;
     }
+}
 
-    return VMI_EVENT_RESPONSE_NONE;
+// The syscalls of 32-bit processes, through the dispatcher the syscalls
+// plugin hooks for them
+void linux_memdump::hook_compat_syscalls()
+{
+    for (const char* dispatcher : linux_compat::dispatchers)
+    {
+        compat_syscall_hook = createSyscallHook(dispatcher, &linux_memdump::compat_syscall_cb, dispatcher, UNLIMITED_TTL, true);
+        if (compat_syscall_hook)
+        {
+            PRINT_DEBUG("[MEMDUMP] Hooked %s\n", dispatcher);
+            return;
+        }
+    }
+    fprintf(stderr, "[MEMDUMP] No 32-bit syscall dispatcher found, the memory syscalls of 32-bit processes are not seen\n");
 }
 
 linux_memdump::linux_memdump(drakvuf_t drakvuf, const memdump_config* c, output_format_t output, memdump* parent_)
@@ -505,6 +579,7 @@ linux_memdump::linux_memdump(drakvuf_t drakvuf, const memdump_config* c, output_
     if (syscall_hook)
     {
         PRINT_DEBUG("[MEMDUMP] Hooked do_syscall_64\n");
+        hook_compat_syscalls();
         return;
     }
     PRINT_DEBUG("[MEMDUMP] do_syscall_64 hook failed, trying x64_sys_call\n");
@@ -514,6 +589,7 @@ linux_memdump::linux_memdump(drakvuf_t drakvuf, const memdump_config* c, output_
     if (syscall_hook)
     {
         PRINT_DEBUG("[MEMDUMP] Hooked x64_sys_call\n");
+        hook_compat_syscalls();
         return;
     }
 

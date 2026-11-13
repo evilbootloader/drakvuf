@@ -440,7 +440,7 @@ endif
 sources += plugins.cpp plugins.h plugins_ex.cpp plugins_ex.h plugin_utils.cpp plugin_utils.h
 sources += output_format.h output_format/common.h output_format/csvfmt.h output_format/deffmt.h output_format/jsonfmt.h output_format/kvfmt.h
 sources += output_format/xfmt.h output_format/ostream.h output_format/ostream.cpp
-sources += helpers/type_traits.h helpers/hooks.h helpers/unicode_string.h helpers/vmi_lock_guard.h helpers/trap_owner_scope.h helpers/return_tracker.h helpers/profile_guard.h helpers/exclude_matcher.h helpers/exclude_matcher.cpp helpers/object_attributes.h
+sources += helpers/type_traits.h helpers/hooks.h helpers/unicode_string.h helpers/vmi_lock_guard.h helpers/trap_owner_scope.h helpers/return_tracker.h helpers/profile_guard.h helpers/exclude_matcher.h helpers/exclude_matcher.cpp helpers/object_attributes.h helpers/linux_compat_syscall.h
 
 AM_CPPFLAGS = $(CPPFLAGS) -I$(top_srcdir) -I$(top_srcdir)/src -I$(srcdir) -I$(srcdir)/helpers
 AM_CPPFLAGS += $(VMI_CFLAGS)

@@ -195,6 +195,7 @@ struct linux_data : PluginResult
         , file_handle()
         , permissions()
         , filename()
+        , cwd()
         , flags()
         , modes()
         , uid()
@@ -207,6 +208,8 @@ struct linux_data : PluginResult
     int permissions;
 
     std::string filename;
+    // The working directory, when `filename` is a path relative to it
+    std::string cwd;
     std::string flags;
     std::string modes;
     std::optional<uint32_t> uid;
@@ -693,6 +696,9 @@ enum
     _FILES_STRUCT_FDT,
     _FDTABLE_FD,
     _FDTABLE_MAX_FDS,
+    // The working directory, which a relative path is resolved from
+    _TASK_STRUCT_FS,
+    _FS_STRUCT_PWD,
 
     __LINUX_OFFSET_MAX,
 };
@@ -721,6 +727,8 @@ static const char* linux_offset_names[__LINUX_OFFSET_MAX][2] =
     [_FILES_STRUCT_FDT] = {"files_struct", "fdt"},
     [_FDTABLE_FD] = {"fdtable", "fd"},
     [_FDTABLE_MAX_FDS] = {"fdtable", "max_fds"},
+    [_TASK_STRUCT_FS] = {"task_struct", "fs"},
+    [_FS_STRUCT_PWD] = {"fs_struct", "pwd"},
 };
 
 // Linux Inode Flags

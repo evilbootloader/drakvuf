@@ -232,6 +232,20 @@ public:
     std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
 };
 
+// A PANSI_STRING, as UnicodePrinter prints a PUNICODE_STRING:
+// name=0xADDR:"text". LdrGetProcedureAddress's ProcedureName is one, and
+// NULL when the function is looked up by its ordinal.
+class AnsiStringPrinter : public ArgumentPrinter
+{
+public:
+    // Export names are far shorter; Length is the guest's number
+    static constexpr size_t MAX_BYTES = 1024;
+
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+};
+
 class UlongPrinter : public ArgumentPrinter
 {
 public:
