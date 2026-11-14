@@ -121,7 +121,10 @@ using rva64_t = uint64_t;
 #define MDMP_VENDOR_ID_SIZE 3
 #define MDMP_STRING_MAX_LENGTH 32
 #define MDMP_NUMBER_OF_STREAMS 3
-#define MDMP_MAX_MEMORY_RANGES 256
+// One range a VAD. A 64-bit process has several hundred, and its own image
+// comes after its heaps and stacks: at 256 the dump of an ordinary program
+// described its memory up to somewhere before the program (2026-11-14).
+#define MDMP_MAX_MEMORY_RANGES 2048
 #define MDMP_MAX_THREADS 1
 
 namespace procdump2_ns

@@ -440,6 +440,58 @@ uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argume
     return value;
 }
 
+bool hook_code_matches(const std::vector<int16_t>& expect, const uint8_t* bytes, size_t size)
+{
+    if (expect.empty() || !size)
+        return false;
+    for (size_t i = 0; i < std::min(expect.size(), size); ++i)
+        if (expect[i] >= 0 && expect[i] != bytes[i])
+            return false;
+    return true;
+}
+
+bool hook_code_present(drakvuf_t drakvuf, const std::vector<int16_t>& expect, addr_t dtb, addr_t va)
+{
+    uint8_t bytes[HOOK_EXPECT_MAX];
+    if (expect.empty() || expect.size() > sizeof(bytes))
+        return false;
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = dtb,
+        .addr = va
+    );
+    vmi_lock_guard vmi(drakvuf);
+    return VMI_SUCCESS == vmi_read(vmi, &ctx, expect.size(), bytes, nullptr)
+        && hook_code_matches(expect, bytes, expect.size());
+}
+
+// "4883ec28??8b": two characters a byte, "??" for any
+static std::vector<int16_t> parse_expect(const std::string& hex)
+{
+    if (hex.empty() || hex.size() % 2 || hex.size() > 2 * HOOK_EXPECT_MAX)
+        throw std::runtime_error{"Invalid code pattern"};
+
+    std::vector<int16_t> expect;
+    bool any_byte = false;
+    for (size_t i = 0; i < hex.size(); i += 2)
+    {
+        if (hex[i] == '?' && hex[i + 1] == '?')
+        {
+            expect.push_back(-1);
+            continue;
+        }
+        if (!std::isxdigit(static_cast<unsigned char>(hex[i])) || !std::isxdigit(static_cast<unsigned char>(hex[i + 1])))
+            throw std::runtime_error{"Invalid code pattern"};
+        expect.push_back(static_cast<int16_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+        any_byte = true;
+    }
+    // All wildcards would be a hook placed on whatever is there
+    if (!any_byte)
+        throw std::runtime_error{"Invalid code pattern"};
+    return expect;
+}
+
 plugin_target_config_entry_t parse_entry(
     std::stringstream& ss,
     PrinterConfig& config)
@@ -465,6 +517,10 @@ plugin_target_config_entry_t parse_entry(
         else if (token == "clrcall")
         {
             entry.abi = argument_abi::CLR;
+        }
+        else if (token.rfind("when:", 0) == 0)
+        {
+            entry.expect = parse_expect(token.substr(5));
         }
         else if (token == "goabi" || token == "goabi0")
         {

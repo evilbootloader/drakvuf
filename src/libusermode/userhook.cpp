@@ -533,7 +533,11 @@ static bool join_shared_image(drakvuf_t drakvuf, userhook* plugin, dll_t* dll_me
     for (size_t i = 0; i < dll_meta->targets.size(); i++)
     {
         auto& target = dll_meta->targets[i];
-        target.state = HOOK_FAILED;
+        // Unpacked code is on pages of this process's own: not the image's
+        // to share, and waited for here as it was there
+        target.state = target.expect.empty() ? HOOK_FAILED : HOOK_WAITING;
+        dll_meta->has_waiting = dll_meta->has_waiting || !target.expect.empty();
+        target.pid = pid;
         target.offset = model->targets[i].offset;
         target.target_addr = model->targets[i].target_addr;
     }
@@ -607,6 +611,22 @@ void resolve_dll_targets(vmi_instance_t vmi, dll_t* dll_meta, addr_t process_dtb
     }
 }
 
+// Whether the code a "when:" target waits for is at its address
+static bool code_is_there(vmi_instance_t vmi, addr_t process_dtb, const hook_target_entry_t& target)
+{
+    uint8_t bytes[HOOK_EXPECT_MAX];
+    if (target.expect.size() > sizeof(bytes))
+        return false;
+
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = process_dtb,
+        .addr = target.target_addr
+    );
+    return VMI_SUCCESS == vmi_read(vmi, &ctx, target.expect.size(), bytes, nullptr)
+        && hook_code_matches(target.expect, bytes, target.expect.size());
+}
+
 void trap_loaded_dll_targets(drakvuf_t drakvuf, dll_t* dll_meta, addr_t process_dtb, const proc_data_t& proc_data)
 {
     auto vmi = vmi_lock_guard(drakvuf);
@@ -616,6 +636,16 @@ void trap_loaded_dll_targets(drakvuf_t drakvuf, dll_t* dll_meta, addr_t process_
         if (target.state == HOOK_FIRST_TRY || target.state == HOOK_PAGEFAULT_RETRY)
         {
             addr_t exec_func = target.target_addr;
+
+            // Code that is unpacked later: no page is asked for and nothing
+            // is placed until the code is there (place_waiting_targets)
+            if (!target.expect.empty() && !code_is_there(vmi, process_dtb, target))
+            {
+                target.pid = proc_data.pid;
+                target.state = HOOK_WAITING;
+                dll_meta->has_waiting = true;
+                continue;
+            }
 
             if (is_pagetable_loaded(vmi, exec_func, process_dtb))
             {
@@ -842,6 +872,47 @@ static void try_hook_main_image(drakvuf_t drakvuf, drakvuf_trap_info_t* info, us
             perform_hooking(drakvuf, info, plugin, dll_meta);
 }
 
+/*
+ * The "when:" targets of the calling process whose code has arrived since
+ * they were last looked at. Called where the process is seen changing its
+ * memory -- a view mapped, a protection changed, both of which a packer's
+ * stub does between unpacking and running what it unpacked -- and costs one
+ * lookup in a set for a process with nothing waiting. A target whose code
+ * never comes, or comes on a page that is not executable yet, waits on.
+ */
+static void place_waiting_targets(drakvuf_t drakvuf, drakvuf_trap_info_t* info, userhook* plugin)
+{
+    auto proc_data = get_proc_data(drakvuf, info);
+    auto dlls = plugin->loaded_dlls.find(proc_data.pid);
+    if (dlls == plugin->loaded_dlls.end() || plugin->is_stopping())
+        return;
+
+    for (auto& dll : dlls->second)
+    {
+        if (!dll.v.is_hooked || !dll.has_waiting)
+            continue;
+
+        auto vmi = vmi_lock_guard(drakvuf);
+        dll.has_waiting = false;
+        for (auto& target : dll.targets)
+        {
+            if (target.state != HOOK_WAITING)
+                continue;
+
+            target.pid = proc_data.pid;
+            if (code_is_there(vmi, info->regs->cr3, target)
+                && make_trap(vmi, drakvuf, info->regs->cr3, &target, target.target_addr))
+            {
+                target.state = HOOK_OK;
+                PRINT_DEBUG("[USERHOOK] Hook %s at 0x%llx: its code is there now\n",
+                    target.target_name.c_str(), (unsigned long long)target.target_addr);
+            }
+            else
+                dll.has_waiting = true;
+        }
+    }
+}
+
 /**
  * This is used in order to observe when SysWOW64 process is loading a new DLL.
  * If the DLL is interesting, we perform further investigation and try to equip user mode hooks.
@@ -858,7 +929,11 @@ static event_response_t protect_virtual_memory_hook_ret_cb(drakvuf_t drakvuf, dr
     auto ret = hook_dll(drakvuf, info, params->base_address, plugin);
 
     if (!plugin->is_injection_in_progress(drakvuf, info))
+    {
+        // The protection is changed: what was unpacked may be executable now
+        place_waiting_targets(drakvuf, info, plugin);
         plugin->destroy_trap(info->trap);
+    }
 
     return ret;
 }
@@ -880,6 +955,8 @@ static event_response_t protect_virtual_memory_hook_cb(drakvuf_t drakvuf, drakvu
 
     if (plugin->is_injection_in_progress(drakvuf, info))
         return VMI_EVENT_RESPONSE_NONE;
+
+    place_waiting_targets(drakvuf, info, plugin);
 
     // IN HANDLE ProcessHandle
     uint64_t process_handle = drakvuf_get_function_argument(drakvuf, info, 1);
@@ -967,6 +1044,8 @@ static event_response_t map_view_of_section_hook_cb(drakvuf_t drakvuf, drakvuf_t
 
     if (plugin->is_injection_in_progress(drakvuf, info))
         return VMI_EVENT_RESPONSE_NONE;
+
+    place_waiting_targets(drakvuf, info, plugin);
 
     if (plugin->is_stopping())
         return VMI_EVENT_RESPONSE_NONE;
@@ -1170,6 +1249,7 @@ void userhook::request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, c
         p_dll->targets.emplace_back(target->function_name, target->clsid, target->offset, target->no_retval, callback, target->argument_printers, extra);
     p_dll->targets.back().mt_safe = mt_safe;
     p_dll->targets.back().abi = target->abi;
+    p_dll->targets.back().expect = target->expect;
 }
 
 void userhook::register_plugin(drakvuf_t drakvuf, usermode_cb_registration reg)

@@ -462,7 +462,9 @@ void libmon::on_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid
 {
     this->reload_hooks(drakvuf, info);
 
-    const auto& exe = this->executables[pid] = executable{ proc_base, dtb, path };
+    addr_t phdr = drakvuf_get_auxv_value(drakvuf, proc_base, AUXV_AT_PHDR);
+    const auto& exe = this->executables[pid] = executable{ proc_base, dtb, path, phdr & ~(addr_t)(VMI_PS_4KB - 1) };
+    this->print_executable(pid, exe);
 
     // By offset only: an executable need not have a symbol table to resolve a
     // name in, and the ones this is for have none.
@@ -476,6 +478,24 @@ void libmon::on_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid
         this->hook_executable(drakvuf, info, pid, exe, entries);
 }
 
+void libmon::print_executable(vmi_pid_t pid, const executable& exe, vmi_pid_t parent) const
+{
+    if (!exe.base)
+        return;
+
+    std::optional<fmt::Nval<vmi_pid_t>> forked_from;
+    if (parent)
+        forked_from = fmt::Nval(parent);
+    fmt::print(m_output_format, "libmon", this->drakvuf, nullptr,
+        keyval("Event", fmt::Rstr("executable")),
+        keyval("PID", fmt::Nval(pid)),
+        // Estr: the path is the process's to choose, as a library's is
+        keyval("Path", fmt::Estr(exe.path)),
+        keyval("Base", fmt::Xval(exe.base)),
+        keyval("Parent", forked_from)
+    );
+}
+
 void libmon::hook_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
     const executable& exe, const std::vector<const plugin_target_config_entry_t*>& entries)
 {
@@ -486,8 +506,8 @@ void libmon::hook_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_p
     // Offsets count from the page of the program headers: the one address of
     // the executable known before it has run, fixed or randomised alike, and
     // what the list's writer counted from (sandboxd/samplehooks.py).
-    addr_t phdr = drakvuf_get_auxv_value(drakvuf, proc_base, AUXV_AT_PHDR);
-    if (!phdr)
+    addr_t exe_base = exe.base;
+    if (!exe_base)
     {
         fmt::print(m_output_format, "libmon", drakvuf, nullptr,
             keyval("Event", fmt::Rstr("not_tracked")),
@@ -496,7 +516,6 @@ void libmon::hook_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_p
         );
         return;
     }
-    addr_t exe_base = phdr & ~(addr_t)(VMI_PS_4KB - 1);
 
     auto& proc = this->libs[pid];
     proc.proc_base = proc_base;
@@ -513,7 +532,10 @@ void libmon::hook_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_p
     for (auto entry : entries)
     {
         addr_t va = exe_base + entry->offset;
-        if (!this->within_library(drakvuf, pid, proc_base, exe_base, va))
+        // Code a packer puts there later ("when:") is in no mapping of the
+        // file, and may be in none at all yet. What it is placed on is
+        // decided by what the memory holds, in place_cold().
+        if (entry->expect.empty() && !this->within_library(drakvuf, pid, proc_base, exe_base, va))
         {
             PRINT_DEBUG("[LIBMON] pid %d: %s at 0x%lx is not in %s, not hooked\n", pid,
                 entry->function_name.c_str(), va, path.c_str());
@@ -543,6 +565,35 @@ void libmon::place_cold(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
                 page_info_t pinfo;
                 resident = VMI_SUCCESS == vmi_pagetable_lookup_extended(vmi, target.dtb, target.va, &pinfo);
             }
+
+            // Code that is unpacked later: wherever the address is backed
+            // from, nothing is placed until it holds that code. Before, it
+            // holds the packer's own, or what the packer reads.
+            const auto& expect = target.config->expect;
+            if (!expect.empty())
+            {
+                if (resident)
+                    return hook_code_present(drakvuf, expect, target.dtb, target.va)
+                        && this->place_hook(drakvuf, info, pid, target.dtb, *target.config, target.so_path,
+                            target.so_base, target.va);
+
+                // A program run from memory (memfd) is a file of pages
+                // already written: there before it is first touched
+                addr_t frame = 0;
+                uint8_t bytes[HOOK_EXPECT_MAX];
+                const size_t size = std::min<size_t>(expect.size(), VMI_PS_4KB - (target.va & (VMI_PS_4KB - 1)));
+                if (!drakvuf_linux_file_page_frame(drakvuf, target.proc_base, target.va, &frame))
+                    return false;
+                {
+                    vmi_lock_guard vmi(drakvuf);
+                    if (VMI_SUCCESS != vmi_read_pa(vmi, frame, size, bytes, nullptr))
+                        return false;
+                }
+                return hook_code_matches(expect, bytes, size)
+                    && this->place_hook(drakvuf, info, pid, target.dtb, *target.config, target.so_path,
+                        target.so_base, target.va, frame);
+            }
+
             if (resident)
                 return this->place_hook(drakvuf, info, pid, target.dtb, *target.config, target.so_path,
                         target.so_base, target.va);
@@ -585,6 +636,12 @@ event_response_t libmon::fault_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     addr_t third = drakvuf_get_function_argument(drakvuf, info, 3);
     bool near = std::any_of(it->second.begin(), it->second.end(), [&](const deferred_hook& target)
     {
+        // Code that is unpacked is written to a page long after the fault
+        // that brought the page, and made executable with no fault at all:
+        // any fault of the process is a time to look again
+        if (!target.config->expect.empty())
+            return true;
+
         addr_t low = target.va > FAULT_AROUND ? target.va - FAULT_AROUND : 0;
         addr_t high = target.va + FAULT_AROUND;
         return (second >= low && second < high) || (third >= low && third < high);
@@ -622,7 +679,10 @@ void libmon::on_fork(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t par
 
     // The same program: a list that grows later may name it in the child too
     if (auto exe = this->executables.find(parent_pid); exe != this->executables.end())
-        this->executables[pid] = executable{ child_base, dtb, exe->second.path };
+    {
+        const auto& child = this->executables[pid] = executable{ child_base, dtb, exe->second.path, exe->second.base };
+        this->print_executable(pid, child, parent_pid);
+    }
 
     auto parent = this->libs.find(parent_pid);
     if (parent == this->libs.end() || this->libs.count(pid))

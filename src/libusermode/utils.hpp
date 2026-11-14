@@ -176,6 +176,13 @@ struct plugin_target_config_entry_t
     uint64_t offset;
     bool no_retval{false};
     argument_abi abi{argument_abi::PLATFORM};
+    // "when:<hex>": the bytes the function starts with, -1 for one that may
+    // be anything ("??"). The hook is placed once they are at its address
+    // and not before. For code that is not in the file: what a packer
+    // unpacks in place, found in a first run's memory (sandboxd/stagehints.py).
+    // Until it is there the address holds something else, which may be
+    // running, and a breakpoint inside another instruction corrupts it.
+    std::vector<int16_t> expect;
     HookActions actions;
     std::vector<std::unique_ptr<ArgumentPrinter>> argument_printers;
 
@@ -193,6 +200,18 @@ struct plugin_target_config_entry_t
 };
 
 plugin_target_config_entry_t parse_entry(std::stringstream& ss, PrinterConfig& config);
+
+// The longest "when:" pattern
+static constexpr size_t HOOK_EXPECT_MAX = 32;
+
+// Whether the `size` bytes read from where a "when:" hook goes are the code it
+// waits for. Fewer bytes than the pattern (the rest is on a page not read)
+// are compared as far as they go; none is no match.
+bool hook_code_matches(const std::vector<int16_t>& expect, const uint8_t* bytes, size_t size);
+
+// The same, reading `va` of the address space `dtb`: false when any of it is
+// not resident.
+bool hook_code_present(drakvuf_t drakvuf, const std::vector<int16_t>& expect, addr_t dtb, addr_t va);
 
 /*
  * The lines a hook list has gained since it was loaded. A list written for

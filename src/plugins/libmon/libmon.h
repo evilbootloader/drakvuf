@@ -237,8 +237,14 @@ private:
         addr_t proc_base;
         addr_t dtb;
         std::string path;
+        addr_t base;        // the page of its program headers, 0 when the kernel gave none
     };
     std::map<vmi_pid_t, executable> executables;
+
+    // Says where a process's executable is: what a hook's offset counts from.
+    // A second run's hooks are worked out from this run's memory with it
+    // (sandboxd/stagehints.py).
+    void print_executable(vmi_pid_t pid, const executable& exe, vmi_pid_t parent = 0) const;
 
     // The entries every set has for a file
     void visit_wanted(const std::string& path,

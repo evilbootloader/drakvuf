@@ -189,6 +189,7 @@ struct dll_t
 
     bool in_progress{false};
     bool shares_image{false};   // counted in userhook::shared_images
+    bool has_waiting{false};    // a target is HOOK_WAITING: place_waiting_targets looks here
     x86_registers_t regs;
 
     uint64_t stack_marker()

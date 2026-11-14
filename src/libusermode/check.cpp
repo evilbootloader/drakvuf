@@ -207,6 +207,40 @@ START_TEST(test_parse_go_hook)
 }
 END_TEST
 
+START_TEST(test_parse_when_hook)
+{
+    // Code that is not in the file: hooked once these bytes are at the address
+    auto entry = test_parse_dll_entry("/tmp/s,connect,401a30,when:4883ec28??8b05,log,Fd:int");
+    ck_assert(entry.type == HOOK_BY_OFFSET && entry.offset == 0x401a30);
+    ck_assert(entry.expect.size() == 7 && entry.expect[0] == 0x48 && entry.expect[4] == -1);
+    ck_assert(entry.argument_printers.size() == 1);
+
+    const uint8_t there[] = { 0x48, 0x83, 0xec, 0x28, 0x90, 0x8b, 0x05 };
+    const uint8_t other[] = { 0x48, 0x83, 0xec, 0x30, 0x90, 0x8b, 0x05 };
+    ck_assert(hook_code_matches(entry.expect, there, sizeof(there)));
+    ck_assert(!hook_code_matches(entry.expect, other, sizeof(other)));
+    // What is on the page read, when the pattern runs over its end
+    ck_assert(hook_code_matches(entry.expect, there, 3));
+    ck_assert(!hook_code_matches(entry.expect, there, 0));
+    ck_assert(!hook_code_matches({}, there, sizeof(there)));
+
+    for (const char* bad : { "/tmp/s,f,10,when:,log", "/tmp/s,f,10,when:488,log", "/tmp/s,f,10,when:zz,log",
+                             "/tmp/s,f,10,when:????,log" })
+    {
+        bool refused = false;
+        try
+        {
+            test_parse_dll_entry(bad);
+        }
+        catch (const std::runtime_error&)
+        {
+            refused = true;
+        }
+        ck_assert(refused);
+    }
+}
+END_TEST
+
 START_TEST(test_parse_dll_hook_with_empty_args)
 {
     auto entry_str = "combase.dll,CoCreateInstance,log";
@@ -360,6 +394,7 @@ static Suite* dll_hooks_parsing_suite(void)
     tcase_add_test(tc_core, test_parse_dll_hook_with_offset);
     tcase_add_test(tc_core, test_parse_dll_hook_with_empty_args);
     tcase_add_test(tc_core, test_parse_go_hook);
+    tcase_add_test(tc_core, test_parse_when_hook);
     tcase_add_test(tc_core, test_narrow_integer_argument);
     tcase_add_test(tc_core, test_output_arguments);
     tcase_add_test(tc_core, test_buffer_arguments);

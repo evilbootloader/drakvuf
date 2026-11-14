@@ -123,7 +123,10 @@ enum target_hook_state
     HOOK_FIRST_TRY,
     HOOK_PAGEFAULT_RETRY,
     HOOK_FAILED,
-    HOOK_OK
+    HOOK_OK,
+    // A "when:" target whose code is not at its address yet. Not placed and
+    // not failed: looked at again when its process changes its memory.
+    HOOK_WAITING
 };
 
 struct hook_target_entry_t
@@ -142,6 +145,7 @@ struct hook_target_entry_t
     bool shared{false};     // trap is a breakpoint of userhook::shared_images, not this process's
     bool mt_safe{false};    // callback may run on several vCPU threads at once, on a shared breakpoint
     argument_abi abi{argument_abi::PLATFORM};   // where its arguments are (read_hook_argument)
+    std::vector<int16_t> expect;                // the entry's "when:" pattern, empty for none
     void* plugin;
 
     hook_target_entry_t(std::string target_name,
