@@ -118,6 +118,8 @@
 #include <math.h>
 #include <random>
 #include <cassert>
+#include <chrono>
+#include <string>
 
 #include <libdrakvuf/libdrakvuf.h> /* eprint_current_time */
 
@@ -204,10 +206,31 @@ static float calculate_pixel_unit(int u)
     return (float)(1<<15)/u;
 }
 
-/* Retrieves display dimensions for coordination of mouse movements */
-static int get_display_dimensions(qmp_connection* qc, dimensions* dims)
+/*
+ * Dumps a frame for the screen monitor and announces it. Written beside the
+ * file and renamed over it, so a reader has either the frame before or this
+ * one, never half of one.
+ */
+static void publish_frame(qmp_connection* qc, const char* path, std::atomic<uint32_t>* frames)
 {
-    const char* tmp_path = "/tmp/tmp.ppm";
+    std::string part = std::string(path) + ".part";
+    if (dump_screen(qc, part.c_str()) != 0)
+        return;
+    if (rename(part.c_str(), path) != 0)
+    {
+        fprintf(stderr, "[HIDSIM] [INJECTOR] Error renaming screen dump %s\n", part.c_str());
+        return;
+    }
+    frames->fetch_add(1);
+}
+
+/* Retrieves display dimensions for coordination of mouse movements */
+static int get_display_dimensions(qmp_connection* qc, dimensions* dims, const char* tmp_path)
+{
+    /*
+     * tmp_path is this domain's own: it was /tmp/tmp.ppm for every DRAKVUF on
+     * the host, and two analyses starting together read each other's screen.
+     */
 
     /* Dumps screen via QMP as .ppm-file and stores result at tmp_path */
     if (dump_screen(qc, tmp_path) != 0)
@@ -604,14 +627,17 @@ void translate(qmp_connection* qc, dimensions* dim, int time_frame,
 
 /* Injects random mouse movements */
 static int run_random_injection(qmp_connection* qc, bool is_rand_clicks,
-    std::atomic<uint32_t>* coords, std::atomic<bool>* has_to_stop)
+    std::atomic<uint32_t>* coords, std::atomic<bool>* has_to_stop,
+    const char* screen_path, std::atomic<uint32_t>* frames)
 {
     PRINT_DEBUG("[HIDSIM] [INJECTOR] Injecting random mouse movements\n");
     dimensions dim;
 
     /* Needed for retrieval of screen resolution */
-    if (get_display_dimensions(qc, &dim) != 0)
+    if (get_display_dimensions(qc, &dim, screen_path) != 0)
         return -1;
+
+    auto last_frame = std::chrono::steady_clock::now() - std::chrono::seconds(SCREEN_FRAME_INTERVAL);
 
     center_cursor(qc);
 
@@ -639,6 +665,13 @@ static int run_random_injection(qmp_connection* qc, bool is_rand_clicks,
     /* Loops, until stopped */
     while (!has_to_stop->load())
     {
+        /* A frame for the screen monitor, between two movements */
+        if (frames && std::chrono::steady_clock::now() - last_frame >=
+            std::chrono::seconds(SCREEN_FRAME_INTERVAL))
+        {
+            publish_frame(qc, screen_path, frames);
+            last_frame = std::chrono::steady_clock::now();
+        }
 
         if (coords->load())
         {
@@ -851,7 +884,8 @@ static int hid_cleanup(qmp_connection* qc, int fd, FILE* f)
 
 /* Worker thread function */
 int hid_inject(const char* sock_path, const char* template_path, bool is_rand_clicks,
-    std::atomic<uint32_t>* coords, std::atomic<bool>* has_to_stop)
+    std::atomic<uint32_t>* coords, std::atomic<bool>* has_to_stop,
+    const char* screen_path, std::atomic<uint32_t>* frames)
 {
     /* Initializes qmp connection */
     qmp_connection qc;
@@ -905,7 +939,7 @@ int hid_inject(const char* sock_path, const char* template_path, bool is_rand_cl
     }
     else
     {
-        sc = run_random_injection(&qc, is_rand_clicks, coords, has_to_stop);
+        sc = run_random_injection(&qc, is_rand_clicks, coords, has_to_stop, screen_path, frames);
     }
     if (sc != 0)
         fprintf(stderr, "[HIDSIM] [INJECTOR] Error performing HID injection\n");

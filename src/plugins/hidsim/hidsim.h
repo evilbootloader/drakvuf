@@ -116,6 +116,8 @@
 #include "../plugins.h"
 
 #define SOCK_STUB "/run/xen/qmp-libxl-"
+/* Where QEMU dumps the domain's screen, beside its QMP socket: <stub><domid>.ppm */
+#define SCREEN_STUB "/run/xen/hidsim-"
 
 struct hidsim_config
 {
@@ -139,9 +141,12 @@ private:
     std::string sock_path;
     std::string template_path;
     std::string win32k_json_path;
+    std::string screen_path;
 
     bool is_monitor;
     bool is_gui_support;
+    /* The monitor reads the screen (gui/screen_buttons), not the window manager */
+    bool is_screen_monitor;
     bool is_rand_clicks;
 
     /* Worker threads */
@@ -151,6 +156,8 @@ private:
     /* Thread communication */
     std::atomic<bool> has_to_stop;
     std::atomic<uint32_t> coords;
+    /* Screen frames dumped so far, for the screen monitor */
+    std::atomic<uint32_t> frames;
 
     bool prepare_gui_reconstruction(drakvuf_t drakvuf,
         const char* win32k_profile);

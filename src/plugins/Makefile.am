@@ -367,6 +367,8 @@ sources += hidsim/gui/vmi_win_gui_atoms.h
 sources += hidsim/gui/vmi_win_gui_filter_definitions.h
 sources += hidsim/gui_monitor.cpp
 sources += hidsim/gui_monitor.h
+sources += hidsim/gui/screen_buttons.cpp
+sources += hidsim/gui/screen_buttons.h
 endif
 
 if PLUGIN_ROOTKITMON

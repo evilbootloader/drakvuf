@@ -152,9 +152,18 @@ if get_option('plugin-hidsim')
     plugin_sources += 'hidsim/gui/vmi_win_gui_offsets.cpp'
     plugin_sources += 'hidsim/gui/vmi_win_gui_atoms.cpp'
     plugin_sources += 'hidsim/gui_monitor.cpp'
+    plugin_sources += 'hidsim/gui/screen_buttons.cpp'
 
     pthread = dependency('threads')
     deps += pthread
+
+    # --hid-monitor-gui reads buttons off the screen with it on every guest
+    # whose window manager cannot be walked. Without it the option says so.
+    tesseract = dependency('tesseract', required : false)
+    if tesseract.found()
+        deps += tesseract
+        config_h.set('HAVE_TESSERACT', 1)
+    endif
 
     config_h.set('ENABLE_PLUGIN_HIDSIM', 1)
 endif

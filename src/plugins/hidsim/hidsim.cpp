@@ -107,6 +107,7 @@
 #include <libdrakvuf/libdrakvuf.h>  /* eprint_current_time */
 #include "hid_injection.h"          /* hid_inject */
 #include "gui_monitor.h"            /* gui_reconstruct */
+#include "gui/screen_buttons.h"     /* screen_monitor */
 
 #include "hidsim.h"
 
@@ -169,11 +170,12 @@ std::string construct_sock_path(drakvuf_t drakvuf)
 }
 
 hidsim::hidsim(drakvuf_t drakvuf, const hidsim_config* config) :
-    has_to_stop{false}, coords{0}
+    is_gui_support{false}, is_screen_monitor{false}, has_to_stop{false}, coords{0}, frames{0}
 {
     /* Constructs path to Unix domain socket of Xen guest under investigation */
     this->sock_path = construct_sock_path(drakvuf);
     PRINT_DEBUG("[HIDSIM] Using Unix domain socket: %s\n", this->sock_path.c_str());
+    this->screen_path = SCREEN_STUB + std::to_string(drakvuf_get_dom_id(drakvuf)) + ".ppm";
 
     if (config->template_fp)
     {
@@ -190,18 +192,38 @@ hidsim::hidsim(drakvuf_t drakvuf, const hidsim_config* config) :
         PRINT_DEBUG("[HIDSIM] GUI monitoring requested\n");
         this->is_monitor = prepare_gui_reconstruction(drakvuf, config->win32k_profile);
 
+        /*
+         * The window manager can be walked on Windows 7 with a win32k profile
+         * that has its types, and nowhere else: later Windows publish none of
+         * them, and a Linux guest has no win32k. Everywhere else the buttons
+         * are read off the screen, which any guest has.
+         */
+        if (!this->is_monitor)
+        {
+            this->is_gui_support = false;
+            if (screen_monitor_available())
+                this->is_screen_monitor = true;
+            else
+                fprintf(stderr, "[HIDSIM] --hid-monitor-gui: this guest's windows cannot "
+                    "be walked and DRAKVUF was built without tesseract, so its screen "
+                    "cannot be read: the mouse moves and no button is pressed\n");
+        }
     }
     else
         this->is_monitor = false;
 
     /* Starts injection thread */
     this->thread_inject = std::thread(hid_inject, sock_path.c_str(),
-            template_path.c_str(), is_rand_clicks, &coords, &has_to_stop);
+            template_path.c_str(), is_rand_clicks, &coords, &has_to_stop,
+            screen_path.c_str(), this->is_screen_monitor ? &frames : nullptr);
 
     /* GUI Reconstruction thread */
     if (this->is_monitor && this->is_gui_support)
         this->thread_reconstruct = std::thread(gui_monitor, drakvuf, &coords,
                 &has_to_stop);
+    else if (this->is_screen_monitor)
+        this->thread_reconstruct = std::thread(screen_monitor, screen_path.c_str(),
+                &frames, &coords, &has_to_stop);
 
     PRINT_DEBUG("[HIDSIM] HID injection started\n");
 }
@@ -222,8 +244,15 @@ bool hidsim::stop_impl()
         if (this->thread_inject.joinable())
             this->thread_inject.join();
 
-        if (this->is_monitor && this->thread_reconstruct.joinable())
+        if (this->thread_reconstruct.joinable())
             this->thread_reconstruct.join();
+
+        /* The last frame dumped, and one a stop caught half written */
+        if (this->is_screen_monitor)
+        {
+            remove(this->screen_path.c_str());
+            remove((this->screen_path + ".part").c_str());
+        }
     }
     PRINT_DEBUG("[HIDSIM] Successfully joined thread \n");
 

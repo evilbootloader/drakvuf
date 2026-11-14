@@ -111,9 +111,19 @@
 #include <atomic>
 #include <mutex>
 
-/* Injects random HID events or events specified in a template file */
+/* Seconds between two frames of the screen dumped for the monitor */
+#define SCREEN_FRAME_INTERVAL 2
+
+/*
+ * Injects random HID events or events specified in a template file.
+ * screen_path is where the guest's screen is dumped: once for its size and,
+ * with frames (random mode only), every SCREEN_FRAME_INTERVAL seconds for
+ * gui/screen_buttons, counted in frames. The QMP connection is this
+ * thread's alone, so the dumps are too.
+ */
 int hid_inject(const char* sock_path, const char* template_path,
     bool is_rand_clicks, std::atomic<uint32_t>* coords,
-    std::atomic<bool>* has_to_stop);
+    std::atomic<bool>* has_to_stop, const char* screen_path,
+    std::atomic<uint32_t>* frames);
 
 #endif
