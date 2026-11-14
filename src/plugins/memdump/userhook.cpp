@@ -206,6 +206,32 @@ void memdump::userhook_init(const memdump_config* c, output_format_t output)
     drakvuf_register_usermode_callback(drakvuf, &reg);
 }
 
+/*
+ * The RVA of the one symbol of a volatility3 profile whose decorated name
+ * starts with `prefix` (a class's method, whatever its signature). False when
+ * there is none, or more than one: an overload nobody chose between.
+ */
+static bool decorated_symbol_rva(json_object* profile_json, const char* prefix, addr_t* rva)
+{
+    json_object* symbols = nullptr;
+    if (!json_object_object_get_ex(profile_json, "symbols", &symbols))
+        return false;
+
+    const size_t length = strlen(prefix);
+    unsigned int found = 0;
+    json_object_object_foreach(symbols, name, symbol)
+    {
+        json_object* address = nullptr;
+        if (strncmp(name, prefix, length) == 0 &&
+            json_object_object_get_ex(symbol, "address", &address))
+        {
+            *rva = (addr_t)json_object_get_int64(address);
+            found++;
+        }
+    }
+    return found == 1;
+}
+
 void memdump::setup_dotnet_hooks(const char* dll_name, const char* profile, bool is32_bit)
 {
     PRINT_DEBUG("%s profile found, will setup usermode hooks for .NET\n", dll_name);
@@ -219,10 +245,14 @@ void memdump::setup_dotnet_hooks(const char* dll_name, const char* profile, bool
             return;
         }
 
-        // LoadImage_1 => AssemblyNative::LoadImage
-        if (!json_get_symbol_rva(drakvuf, profile_json, "LoadImage_1", &func_rva))
+        // LoadImage_1 => AssemblyNative::LoadImage, as rekall named it. A
+        // profile made by volatility3's pdbconv has the symbol under its
+        // decorated name and no LoadImage_1: the hook was never placed.
+        if (!json_get_symbol_rva(drakvuf, profile_json, "LoadImage_1", &func_rva) &&
+            !decorated_symbol_rva(profile_json, "?LoadImage@AssemblyNative@@", &func_rva))
         {
-            PRINT_DEBUG("[MEMDUMP] Failed to find LoadImage_1 (AssemblyNative::LoadImage) RVA in json for %s\n", dll_name);
+            fprintf(stderr, "[MEMDUMP] No AssemblyNative::LoadImage in the profile of %s: "
+                "assemblies loaded from memory are not dumped\n", dll_name);
             json_object_put(profile_json);
             return;
         }
