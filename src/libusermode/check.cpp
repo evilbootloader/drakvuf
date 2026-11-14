@@ -177,6 +177,27 @@ START_TEST(test_parse_dll_hook_with_offset)
 }
 END_TEST
 
+START_TEST(test_parse_go_hook)
+{
+    // Go's conventions, with the offset before or after: reported at entry
+    auto entry = test_parse_dll_entry("/tmp/s,net.Dial,4a1b20,goabi,log,Network:buffer[NetworkLen],NetworkLen:ulong");
+    ck_assert(entry.function_name == "net.Dial");
+    ck_assert(entry.type == HOOK_BY_OFFSET && entry.offset == 0x4a1b20);
+    ck_assert(entry.abi == argument_abi::GO_REGISTERS);
+    ck_assert(entry.no_retval);
+    ck_assert(entry.argument_printers.size() == 2);
+
+    entry = test_parse_dll_entry("/tmp/s,net/http.(*Client).Do,goabi0,4a1b20,log,Client:lpvoid");
+    ck_assert(entry.function_name == "net/http.(*Client).Do");
+    ck_assert(entry.type == HOOK_BY_OFFSET && entry.offset == 0x4a1b20);
+    ck_assert(entry.abi == argument_abi::GO_STACK);
+    ck_assert(entry.no_retval);
+
+    entry = test_parse_dll_entry("libc.so.6,connect,log,Fd:int");
+    ck_assert(entry.abi == argument_abi::PLATFORM);
+}
+END_TEST
+
 START_TEST(test_parse_dll_hook_with_empty_args)
 {
     auto entry_str = "combase.dll,CoCreateInstance,log";
@@ -329,6 +350,7 @@ static Suite* dll_hooks_parsing_suite(void)
     tcase_add_test(tc_core, test_parse_dll_hook);
     tcase_add_test(tc_core, test_parse_dll_hook_with_offset);
     tcase_add_test(tc_core, test_parse_dll_hook_with_empty_args);
+    tcase_add_test(tc_core, test_parse_go_hook);
     tcase_add_test(tc_core, test_narrow_integer_argument);
     tcase_add_test(tc_core, test_output_arguments);
     tcase_add_test(tc_core, test_buffer_arguments);

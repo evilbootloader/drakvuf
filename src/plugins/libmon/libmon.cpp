@@ -1022,7 +1022,7 @@ void libmon::on_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const hooked_
     std::vector<uint64_t> arguments;
     arguments.reserve(config.argument_printers.size());
     for (size_t i = 1; i <= config.argument_printers.size(); i++)
-        arguments.push_back(drakvuf_get_function_argument(drakvuf, info, i));
+        arguments.push_back(read_hook_argument(drakvuf, info, config.abi, i));
 
     // One breakpoint per return address, shared by the calls returning there.
     // Kept between calls only in code mapped from a file: writing to the page

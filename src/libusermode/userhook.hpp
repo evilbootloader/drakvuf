@@ -141,6 +141,7 @@ struct hook_target_entry_t
     drakvuf_trap_t* trap = nullptr;
     bool shared{false};     // trap is a breakpoint of userhook::shared_images, not this process's
     bool mt_safe{false};    // callback may run on several vCPU threads at once, on a shared breakpoint
+    argument_abi abi{argument_abi::PLATFORM};   // where its arguments are (read_hook_argument)
     void* plugin;
 
     hook_target_entry_t(std::string target_name,

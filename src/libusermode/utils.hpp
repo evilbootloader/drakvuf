@@ -105,6 +105,7 @@
 #pragma once
 
 #include <cstdint>
+#include <libdrakvuf/libdrakvuf.h>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -116,6 +117,21 @@ enum target_hook_type
 {
     HOOK_BY_NAME,
     HOOK_BY_OFFSET
+};
+
+// Where a hooked function's arguments are. A hook list says so for the
+// functions that do not follow the platform's C convention.
+enum class argument_abi
+{
+    PLATFORM,
+    // Go's register convention ("goabi"): amd64 since Go 1.17. Integer words
+    // in RAX, RBX, RCX, RDI, RSI, R8, R9, R10, R11, then the stack. A string
+    // is two words (pointer, length), a slice three, an interface two.
+    GO_REGISTERS,
+    // Go's stack convention ("goabi0"): every argument on the stack above the
+    // return address, a word each. All of Go before 1.17, all of 32-bit Go,
+    // and the functions written in assembly to this day.
+    GO_STACK,
 };
 
 struct HookActions
@@ -152,6 +168,7 @@ struct plugin_target_config_entry_t
     std::string clsid;
     uint64_t offset;
     bool no_retval{false};
+    argument_abi abi{argument_abi::PLATFORM};
     HookActions actions;
     std::vector<std::unique_ptr<ArgumentPrinter>> argument_printers;
 
@@ -169,3 +186,7 @@ struct plugin_target_config_entry_t
 };
 
 plugin_target_config_entry_t parse_entry(std::stringstream& ss, PrinterConfig& config);
+
+// Argument `number` (from 1) of the function a breakpoint at its entry was
+// hit in, read the way `abi` has it
+uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argument_abi abi, int number);

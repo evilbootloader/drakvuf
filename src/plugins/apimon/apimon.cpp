@@ -464,7 +464,7 @@ static event_response_t usermode_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info* i
     // All of them first: a buffer's length may be a later argument
     call.raw.reserve(printers.size());
     for (size_t i = 0; i < printers.size(); ++i)
-        call.raw.push_back(drakvuf_get_function_argument(drakvuf, info, i + 1));
+        call.raw.push_back(read_hook_argument(drakvuf, info, target->abi, i + 1));
 
     for (size_t i = 0; i < printers.size(); ++i)
     {

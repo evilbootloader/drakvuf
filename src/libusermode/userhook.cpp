@@ -1164,6 +1164,7 @@ void userhook::request_usermode_hook(drakvuf_t drakvuf, const dll_view_t* dll, c
     else // HOOK_BY_OFFSET
         p_dll->targets.emplace_back(target->function_name, target->clsid, target->offset, target->no_retval, callback, target->argument_printers, extra);
     p_dll->targets.back().mt_safe = mt_safe;
+    p_dll->targets.back().abi = target->abi;
 }
 
 void userhook::register_plugin(drakvuf_t drakvuf, usermode_cb_registration reg)

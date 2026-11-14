@@ -104,6 +104,7 @@
 
 #include "utils.hpp"
 #include "printers/printers.hpp"
+#include "plugins/helpers/vmi_lock_guard.h"
 
 #include <algorithm>
 #include <iterator>
@@ -314,6 +315,47 @@ std::vector<std::unique_ptr<ArgumentPrinter>> parse_arguments(
 
 } // namespace
 
+uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argument_abi abi, int number)
+{
+    if (abi == argument_abi::PLATFORM)
+        return drakvuf_get_function_argument(drakvuf, info, number);
+
+    const bool is32 = drakvuf_process_is32bit(drakvuf, info);
+    const auto* regs = info->regs;
+    int slot = number;      // on the stack, from 1: [sp] is the return address
+
+    if (abi == argument_abi::GO_REGISTERS && !is32)
+    {
+        const uint64_t in_registers[] =
+        {
+            regs->rax, regs->rbx, regs->rcx, regs->rdi, regs->rsi,
+            regs->r8, regs->r9, regs->r10, regs->r11
+        };
+        const int count = sizeof(in_registers) / sizeof(in_registers[0]);
+        if (number >= 1 && number <= count)
+            return in_registers[number - 1];
+        // What no register was left for. Exact when every argument is one
+        // word or was split over the registers whole, which a list's author
+        // has to check for a function this long.
+        slot = number - count;
+    }
+
+    if (slot < 1)
+        return 0;
+
+    const uint64_t word = is32 ? 4 : 8;
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = regs->cr3,
+        .addr = regs->rsp + word * slot
+    );
+    uint64_t value = 0;
+    vmi_reader_guard vmi(drakvuf);
+    if (VMI_SUCCESS != vmi_read(vmi, &ctx, word, &value, nullptr))
+        return 0;
+    return value;
+}
+
 plugin_target_config_entry_t parse_entry(
     std::stringstream& ss,
     PrinterConfig& config)
@@ -334,6 +376,15 @@ plugin_target_config_entry_t parse_entry(
         }
         else if (token == "no-retval")
         {
+            entry.no_retval = true;
+        }
+        else if (token == "goabi" || token == "goabi0")
+        {
+            entry.abi = token == "goabi" ? argument_abi::GO_REGISTERS : argument_abi::GO_STACK;
+            // A goroutine's stack is moved when it grows and the goroutine
+            // itself between threads, so a return is not found again by the
+            // thread and stack pointer of its call; and a result is not in
+            // RAX on the stack convention. Reported at entry.
             entry.no_retval = true;
         }
         else
