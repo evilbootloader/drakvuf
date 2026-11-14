@@ -187,6 +187,30 @@ struct plugin_target_config_entry_t
 
 plugin_target_config_entry_t parse_entry(std::stringstream& ss, PrinterConfig& config);
 
+/*
+ * The lines a hook list has gained since it was loaded. A list written for
+ * one job grows while the trace runs: what the sample drops and then runs is
+ * read on the host as it is written, and its functions are added at the end
+ * (sandboxd/stagehooks.py). Lines are only ever added after what was there,
+ * so what was read stays read, whether the file was appended to or replaced.
+ */
+class hook_list_tail
+{
+public:
+    // The list as it is now counts as read. No path: nothing ever comes.
+    void start(const char* list_path);
+
+    // The complete lines added since the last call, comments and empty ones
+    // left out. Looks at the file at most every few hundred milliseconds,
+    // being called from callbacks that stall the guest.
+    std::vector<std::string> new_lines();
+
+private:
+    std::string path;
+    uint64_t consumed = 0;
+    int64_t last_look_ms = 0;
+};
+
 // Argument `number` (from 1) of the function a breakpoint at its entry was
 // hit in, read the way `abi` has it
 uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argument_abi abi, int number);

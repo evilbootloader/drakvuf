@@ -137,6 +137,11 @@
 
 static bool g_injection_mode_enabled = false;
 
+void drakvuf_userhook_lists_changed(drakvuf_t drakvuf)
+{
+    userhook::get_instance(drakvuf).lists_generation++;
+}
+
 void userhooks_set_injection_mode(bool enable)
 {
     g_injection_mode_enabled = enable;
@@ -816,18 +821,18 @@ static void try_hook_main_image(drakvuf_t drakvuf, drakvuf_trap_info_t* info, us
         return;
 
     auto& state = plugin->proc_main_image[proc_data.pid];
-    if (state.first != proc_data.base_addr)
-        state = { proc_data.base_addr, 0 };
-    if (state.second >= max_lookups)
+    if (state.eprocess != proc_data.base_addr || state.lists != plugin->lists_generation)
+        state = { proc_data.base_addr, 0, plugin->lists_generation };
+    if (state.lookups >= max_lookups)
         return;
 
     ntdll_mmvad_visitor_ctx_t vctx{ proc_data.name, {} };
     if (!drakvuf_traverse_mmvad(drakvuf, proc_data.base_addr, find_main_image_mmvad_visitor, &vctx))
     {
-        state.second++;
+        state.lookups++;
         return;
     }
-    state.second = max_lookups;
+    state.lookups = max_lookups;
 
     if (is_already_hooked(drakvuf, info, plugin, &vctx.mmvad))
         return;

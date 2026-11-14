@@ -107,7 +107,10 @@
 #include "plugins/helpers/vmi_lock_guard.h"
 
 #include <algorithm>
+#include <chrono>
+#include <fstream>
 #include <iterator>
+#include <sys/stat.h>
 #include <optional>
 #include <cctype>
 
@@ -314,6 +317,62 @@ std::vector<std::unique_ptr<ArgumentPrinter>> parse_arguments(
 }
 
 } // namespace
+
+void hook_list_tail::start(const char* list_path)
+{
+    if (!list_path)
+        return;
+    this->path = list_path;
+
+    struct stat st;
+    if (stat(list_path, &st) == 0)
+        this->consumed = st.st_size;
+}
+
+std::vector<std::string> hook_list_tail::new_lines()
+{
+    static constexpr int64_t LOOK_EVERY_MS = 250;
+    // Bounds one read: a list is a few hundred lines a stage
+    static constexpr uint64_t MAX_READ = 4 << 20;
+
+    std::vector<std::string> lines;
+    if (this->path.empty())
+        return lines;
+
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now - this->last_look_ms < LOOK_EVERY_MS)
+        return lines;
+    this->last_look_ms = now;
+
+    struct stat st;
+    if (stat(this->path.c_str(), &st) != 0 || static_cast<uint64_t>(st.st_size) <= this->consumed)
+        return lines;
+
+    std::ifstream file(this->path, std::ios::binary);
+    if (!file || !file.seekg(static_cast<std::streamoff>(this->consumed)))
+        return lines;
+
+    std::string added(std::min<uint64_t>(st.st_size - this->consumed, MAX_READ), '\0');
+    file.read(added.data(), added.size());
+    added.resize(file.gcount());
+
+    // Up to the last line end: a line still being written is read next time
+    const size_t end = added.rfind('\n');
+    if (end == std::string::npos)
+        return lines;
+    this->consumed += end + 1;
+
+    std::stringstream stream(added.substr(0, end));
+    for (std::string line; std::getline(stream, line); )
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (!line.empty() && line[0] != '#')
+            lines.push_back(std::move(line));
+    }
+    return lines;
+}
 
 uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argument_abi abi, int number)
 {

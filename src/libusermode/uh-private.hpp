@@ -302,8 +302,18 @@ public:
 
     // The processes whose own image (the EXE) has been offered to the hook
     // lists, or looked for often enough: EPROCESS and the lookups spent, so a
-    // reused pid is another process.
-    std::map<vmi_pid_t, std::pair<addr_t, unsigned int>> proc_main_image;
+    // reused pid is another process; and which state of the lists it was
+    // offered to, so it is offered again to lists that have grown.
+    struct main_image_state
+    {
+        addr_t eprocess = 0;
+        unsigned int lookups = 0;
+        uint64_t lists = 0;
+    };
+    std::map<vmi_pid_t, main_image_state> proc_main_image;
+
+    // Counts the times a plugin's hook list gained entries (drakvuf_userhook_lists_changed)
+    uint64_t lists_generation = 0;
 
     const bool injection_mode;
     int injection_in_progress = 0;

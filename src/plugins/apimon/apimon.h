@@ -105,6 +105,7 @@
 #ifndef APIMON_H
 #define APIMON_H
 
+#include <deque>
 #include <vector>
 #include <map>
 #include <memory>
@@ -170,6 +171,16 @@ class apimon: public pluginex
 {
 public:
     wanted_hooks_t wanted_hooks;
+
+    // What the list has gained while running, a set per time it grew: filled
+    // before it is put here and never touched again, as hooks refer to their
+    // entries' printers and the hook callback runs on several threads.
+    std::deque<std::unique_ptr<wanted_hooks_t>> added_hooks;
+    hook_list_tail list_tail;
+    bool print_no_addr = false;
+
+    // Take up what the list has gained. Called with the userhook lock held.
+    void reload_hooks(drakvuf_t drakvuf);
     // Modules per process, resolved on demand: the hook callbacks run on several vCPU threads at once
     std::mutex procs_mtx;
     std::unordered_map<vmi_pid_t, std::vector<apimon_module>> procs;

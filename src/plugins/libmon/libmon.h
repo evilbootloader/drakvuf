@@ -1,6 +1,7 @@
 #ifndef _INCLUDE_LIBMON
 #define _INCLUDE_LIBMON
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -221,6 +222,35 @@ private:
     static event_response_t function_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
     wanted_so_hooks_t wanted_hooks;
+
+    // What the list has gained while running, a set per time it grew. Each is
+    // filled before it is put here and never touched again: hooks point at
+    // their entries, and the return callback reads them on other threads.
+    std::deque<std::unique_ptr<wanted_so_hooks_t>> added_hooks;
+    hook_list_tail list_tail;
+    bool print_no_addr = false;
+
+    // Every process's executable, hooks or none: a list that grows may name
+    // one that is already running.
+    struct executable
+    {
+        addr_t proc_base;
+        addr_t dtb;
+        std::string path;
+    };
+    std::map<vmi_pid_t, executable> executables;
+
+    // The entries every set has for a file
+    void visit_wanted(const std::string& path,
+        const std::function<void(const plugin_target_config_entry_t&)>& visitor) const;
+
+    // Take up what the list has gained, and place it in the executables
+    // already running that it names
+    void reload_hooks(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+
+    // Place entries (by offset) in a process's executable
+    void hook_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+        const executable& exe, const std::vector<const plugin_target_config_entry_t*>& entries);
     std::unique_ptr<dl_rendezvous> rendezvous;
 
     std::unordered_map<addr_t, pa_hook> pa_hooks;   // key: physical address

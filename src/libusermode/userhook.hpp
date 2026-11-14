@@ -269,6 +269,14 @@ void drakvuf_remove_running_trap(drakvuf_t drakvuf, drakvuf_trap_t* trap);
 void userhooks_set_injection_mode(bool enable);
 
 /**
+ * A plugin's hook list has gained entries while running. An image that is
+ * mapped already and had nothing to hook is not looked at again by itself;
+ * this has every process's own image (its EXE) offered to the registered
+ * callbacks once more, at the process's next mapping or protection call.
+ */
+void drakvuf_userhook_lists_changed(drakvuf_t drakvuf);
+
+/**
  * Requests to stop the userhooks subsystem.
  * @param[in] drakvuf drakvuf context
  * @return true if userhooks subsystem has been stopped, false otherwise.

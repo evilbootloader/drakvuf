@@ -68,7 +68,9 @@ libmon::libmon(drakvuf_t drakvuf, const libmon_config* c, output_format_t output
 true)
     , no_retval(c->no_retval)
 {
+    this->print_no_addr = c->print_no_addr;
     load_so_hook_config(c->so_hooks_list, c->print_no_addr, this->wanted_hooks);
+    this->list_tail.start(c->so_hooks_list);
 
     if (this->wanted_hooks.empty())
     {
@@ -341,7 +343,7 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
     proc.build_ids[so.base] = build_id;
 
     std::vector<const plugin_target_config_entry_t*> entries;
-    this->wanted_hooks.visit_hooks_for(so.path, [&](const plugin_target_config_entry_t& entry)
+    this->visit_wanted(so.path, [&](const plugin_target_config_entry_t& entry)
     {
         entries.push_back(&entry);
     });
@@ -400,19 +402,86 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
         this->cr3_hook = createCr3Hook(&libmon::cr3_cb);
 }
 
+void libmon::visit_wanted(const std::string& path,
+    const std::function<void(const plugin_target_config_entry_t&)>& visitor) const
+{
+    this->wanted_hooks.visit_hooks_for(path, visitor);
+    for (const auto& added : this->added_hooks)
+        added->visit_hooks_for(path, visitor);
+}
+
+void libmon::reload_hooks(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    auto lines = this->list_tail.new_lines();
+    if (lines.empty())
+        return;
+
+    auto added = std::make_unique<wanted_so_hooks_t>();
+    PrinterConfig printer_config{ this->print_no_addr, PrinterConfig::NumericFormat::HEX };
+    for (const auto& line : lines)
+    {
+        std::stringstream ss(line);
+        try
+        {
+            added->add_hook(parse_entry(ss, printer_config));
+        }
+        catch (const std::exception& e)
+        {
+            PRINT_DEBUG("[LIBMON] skipping malformed added entry '%s' (%s)\n", line.c_str(), e.what());
+        }
+    }
+    if (added->empty())
+        return;
+
+    const wanted_so_hooks_t& fresh = *added;
+    this->added_hooks.push_back(std::move(added));
+
+    fmt::print(m_output_format, "libmon", drakvuf, nullptr,
+        keyval("Event", fmt::Rstr("hooks_added")),
+        keyval("Lines", fmt::Nval(lines.size()))
+    );
+
+    // A program the list names now may have been started before it did: what
+    // is run the moment it is written is ahead of whoever reads it on the
+    // host. Its functions are hooked from here on.
+    for (const auto& [pid, exe] : this->executables)
+    {
+        std::vector<const plugin_target_config_entry_t*> entries;
+        fresh.visit_hooks_for(exe.path, [&](const plugin_target_config_entry_t& entry)
+        {
+            if (entry.type == HOOK_BY_OFFSET)
+                entries.push_back(&entry);
+        });
+        if (!entries.empty())
+            this->hook_executable(drakvuf, info, pid, exe, entries);
+    }
+}
+
 void libmon::on_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
     addr_t proc_base, addr_t dtb, const std::string& path)
 {
+    this->reload_hooks(drakvuf, info);
+
+    const auto& exe = this->executables[pid] = executable{ proc_base, dtb, path };
+
     // By offset only: an executable need not have a symbol table to resolve a
     // name in, and the ones this is for have none.
     std::vector<const plugin_target_config_entry_t*> entries;
-    this->wanted_hooks.visit_hooks_for(path, [&](const plugin_target_config_entry_t& entry)
+    this->visit_wanted(path, [&](const plugin_target_config_entry_t& entry)
     {
         if (entry.type == HOOK_BY_OFFSET)
             entries.push_back(&entry);
     });
-    if (entries.empty())
-        return;
+    if (!entries.empty())
+        this->hook_executable(drakvuf, info, pid, exe, entries);
+}
+
+void libmon::hook_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+    const executable& exe, const std::vector<const plugin_target_config_entry_t*>& entries)
+{
+    const addr_t proc_base = exe.proc_base;
+    const addr_t dtb = exe.dtb;
+    const std::string& path = exe.path;
 
     // Offsets count from the page of the program headers: the one address of
     // the executable known before it has run, fixed or randomised alike, and
@@ -435,9 +504,10 @@ void libmon::on_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid
     proc.exe_base = exe_base;
     // Its extent is in headers nothing has read yet at exec; resolve_module()
     // and within_library() fall back to the cap. No build ID either: no other
-    // process is asked for its pages.
-    proc.loaded[exe_base] = loaded_so{ path, 0 };
-    proc.build_ids[exe_base] = "";
+    // process is asked for its pages. Not replaced when the dynamic linker
+    // has since been seen to list it.
+    proc.loaded.try_emplace(exe_base, loaded_so{ path, 0 });
+    proc.build_ids.try_emplace(exe_base, "");
 
     auto& cold = this->cold[pid];
     for (auto entry : entries)
@@ -452,9 +522,9 @@ void libmon::on_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid
         cold.push_back(deferred_hook{ entry, path, exe_base, proc_base, dtb, va, 0, "" });
     }
 
-    // A process taken up at startup has run, and may have most of its pages
+    // A process taken up at startup, or one the list named late, has run and
+    // may have most of its pages
     this->place_cold(drakvuf, info, pid);
-
 }
 
 void libmon::place_cold(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid)
@@ -537,8 +607,11 @@ event_response_t libmon::fault_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* in
 void libmon::on_fork(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t parent_pid,
     vmi_pid_t pid, addr_t child_base, addr_t dtb)
 {
-    UNUSED(drakvuf);
-    UNUSED(info);
+    this->reload_hooks(drakvuf, info);
+
+    // The same program: a list that grows later may name it in the child too
+    if (auto exe = this->executables.find(parent_pid); exe != this->executables.end())
+        this->executables[pid] = executable{ child_base, dtb, exe->second.path };
 
     auto parent = this->libs.find(parent_pid);
     if (parent == this->libs.end() || this->libs.count(pid))
@@ -950,6 +1023,12 @@ void libmon::on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const s
 // leaving them armed over whatever gets mapped there next.
 void libmon::on_process_reset(vmi_pid_t pid)
 {
+    this->executables.erase(pid);
+
+    // An exit is one of the few things that happen all the time in a guest,
+    // which makes it a clock to look at the list on
+    this->reload_hooks(this->drakvuf, nullptr);
+
     // Told of every exec and exit in the guest; most are of processes nothing
     // was ever placed in, and the walk over the breakpoints below is not free
     if (!this->libs.count(pid) && !this->deferred.count(pid) && !this->cold.count(pid))

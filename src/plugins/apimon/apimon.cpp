@@ -641,10 +641,60 @@ static void on_dll_discovered(drakvuf_t drakvuf, const std::string& dll_name, co
         keyval("PID", fmt::Nval(pid))
     );
 
+    plugin->reload_hooks(drakvuf);
+
     plugin->wanted_hooks.visit_hooks_for(dll_name, [&](const auto& e)
     {
         drakvuf_request_usermode_hook(drakvuf, dll, &e, usermode_hook_cb, plugin, true);
     });
+    for (const auto& added : plugin->added_hooks)
+        added->visit_hooks_for(dll_name, [&](const auto& e)
+    {
+        drakvuf_request_usermode_hook(drakvuf, dll, &e, usermode_hook_cb, plugin, true);
+    });
+}
+
+/*
+ * A list written for one job grows while the trace runs, with the functions
+ * of what the sample dropped (sandboxd/stagehooks.py). Looked at when an
+ * image is discovered, which a starting process does dozens of times. A line
+ * that does not parse is skipped here, where at start-up it stops the plugin:
+ * the trace is running.
+ */
+void apimon::reload_hooks(drakvuf_t drakvuf)
+{
+    auto lines = this->list_tail.new_lines();
+    if (lines.empty())
+        return;
+
+    auto added = std::make_unique<wanted_hooks_t>();
+    PrinterConfig config{};
+    config.print_no_addr = this->print_no_addr;
+    for (const auto& line : lines)
+    {
+        try
+        {
+            std::stringstream ss(line);
+            auto e = parse_entry(ss, config);
+            if (e.actions.log)
+                added->add_hook(std::move(e));
+        }
+        catch (const std::exception& exc)
+        {
+            PRINT_DEBUG("[APIMON] skipping malformed added entry '%s' (%s)\n", line.c_str(), exc.what());
+        }
+    }
+    if (added->empty())
+        return;
+
+    this->added_hooks.push_back(std::move(added));
+    fmt::print(m_output_format, "apimon", drakvuf, nullptr,
+        keyval("Event", fmt::Rstr("hooks_added")),
+        keyval("Lines", fmt::Nval(lines.size()))
+    );
+
+    // The program the lines name may be running already
+    drakvuf_userhook_lists_changed(drakvuf);
 }
 
 static void on_dll_hooked(drakvuf_t drakvuf, const dll_view_t* dll, const std::vector<hook_target_view_t>& targets, void* extra)
@@ -935,6 +985,8 @@ true)
             return !entry.actions.log;
         };
         drakvuf_load_dll_hook_config(drakvuf, c->dll_hooks_list, c->print_no_addr, noLog, this->wanted_hooks);
+        this->print_no_addr = c->print_no_addr;
+        this->list_tail.start(c->dll_hooks_list);
     }
     catch (const std::runtime_error& exc)
     {
