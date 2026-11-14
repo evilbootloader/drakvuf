@@ -230,6 +230,10 @@ typedef struct os_interface
     bool (*find_vma_file)
     (drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr, addr_t* vm_file);
 
+    /* Linux only: the frame the page cache holds for a file-backed address the process has not faulted in */
+    bool (*file_page_frame)
+    (drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr, addr_t* pa);
+
     /* Linux only: several symbols in one pass, and the module's GNU build ID */
     bool (*exportsyms_to_va_at_base)
     (drakvuf_t drakvuf, addr_t process_addr, addr_t module_base, const char* const* syms, size_t count, addr_t* vas);

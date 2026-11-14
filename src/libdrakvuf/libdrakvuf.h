@@ -744,6 +744,15 @@ bool drakvuf_linux_find_vma(drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr
 bool drakvuf_linux_find_vma_file(drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr,
     addr_t* vm_file) NOEXCEPT;
 
+/* The physical address the page cache holds for a file-backed address that
+ * the process has not faulted in yet: where a breakpoint can go before the
+ * program has run. Believed only when the page found says it is that file's
+ * page at that offset, up to date and unlocked. False when the page is not
+ * cached, the address is not in a file mapping, or the kernel keeps no VMA
+ * list (Linux 6.1 on). */
+bool drakvuf_linux_file_page_frame(drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr,
+    addr_t* pa) NOEXCEPT;
+
 // Microsoft PreviousMode KTHREAD explanation:
 // https://msdn.microsoft.com/en-us/library/windows/hardware/ff559860(v=vs.85).aspx
 bool drakvuf_get_current_thread_previous_mode(drakvuf_t drakvuf,

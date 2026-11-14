@@ -809,6 +809,20 @@ bool drakvuf_linux_find_vma_file(drakvuf_t drakvuf, addr_t process_addr, addr_t 
     return ret;
 }
 
+bool drakvuf_linux_file_page_frame(drakvuf_t drakvuf, addr_t process_addr, addr_t vaddr, addr_t* pa)
+{
+    bool ret = false;
+
+    if ( drakvuf->osi.file_page_frame )
+    {
+        drakvuf_reader_lock(drakvuf);
+        ret = drakvuf->osi.file_page_frame(drakvuf, process_addr, vaddr, pa);
+        drakvuf_reader_unlock(drakvuf);
+    }
+
+    return ret;
+}
+
 bool drakvuf_exportsyms_to_va_at_base(drakvuf_t drakvuf, addr_t process_addr, addr_t module_base,
     const char* const* syms, size_t count, addr_t* vas)
 {

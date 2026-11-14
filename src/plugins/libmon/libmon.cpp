@@ -537,14 +537,25 @@ void libmon::place_cold(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t 
         {
             // Residency first: drakvuf_add_trap() logs two errors for an
             // address it cannot translate
+            bool resident = false;
             {
                 vmi_lock_guard vmi(drakvuf);
                 page_info_t pinfo;
-                if (VMI_SUCCESS != vmi_pagetable_lookup_extended(vmi, target.dtb, target.va, &pinfo))
-                    return false;
+                resident = VMI_SUCCESS == vmi_pagetable_lookup_extended(vmi, target.dtb, target.va, &pinfo);
             }
+            if (resident)
+                return this->place_hook(drakvuf, info, pid, target.dtb, *target.config, target.so_path,
+                        target.so_base, target.va);
+
+            // Not touched yet, which is every page at exec. The kernel has a
+            // file that was just written in its page cache, and the frame
+            // there is the one a fault will map: the hook goes in before the
+            // program has run, and no fault has to be waited for.
+            addr_t pa = 0;
+            if (!drakvuf_linux_file_page_frame(drakvuf, target.proc_base, target.va, &pa))
+                return false;
             return this->place_hook(drakvuf, info, pid, target.dtb, *target.config, target.so_path,
-                    target.so_base, target.va);
+                    target.so_base, target.va, pa);
         }), targets.end());
 
         if (targets.empty())
@@ -898,6 +909,17 @@ void libmon::flush_deferred(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pi
                     target = targets.erase(target);
                     continue;
                 }
+            }
+
+            // No process has the page, but the page cache may: a library
+            // only this process maps, at a function nothing has called
+            addr_t cached = 0;
+            if (target->va && drakvuf_linux_file_page_frame(drakvuf, target->proc_base, target->va, &cached)
+                && this->place_hook(drakvuf, info, pid, target->dtb, *target->config,
+                    target->so_path, target->so_base, target->va, cached))
+            {
+                target = targets.erase(target);
+                continue;
             }
         }
 

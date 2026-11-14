@@ -122,6 +122,7 @@ addr_t linux_get_auxv_value(drakvuf_t drakvuf, addr_t eprocess_base, uint64_t ty
 
 bool linux_find_vma(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* start, addr_t* end);
 bool linux_find_vma_file(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* vm_file);
+bool linux_file_page_frame(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* pa);
 
 addr_t get_lib_address(drakvuf_t drakvuf, addr_t eprocess_base, const char* lib);
 

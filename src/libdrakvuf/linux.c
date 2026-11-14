@@ -542,6 +542,7 @@ bool set_os_linux(drakvuf_t drakvuf)
     drakvuf->osi.get_auxv_value = linux_get_auxv_value;
     drakvuf->osi.find_vma = linux_find_vma;
     drakvuf->osi.find_vma_file = linux_find_vma_file;
+    drakvuf->osi.file_page_frame = linux_file_page_frame;
     drakvuf->osi.module_span = linux_module_span;
     drakvuf->osi.exportsyms_to_va_at_base = linux_module_syms2va;
     drakvuf->osi.module_build_id = linux_module_build_id;

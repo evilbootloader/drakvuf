@@ -788,7 +788,17 @@ next:
  * The walk is shared with linux_find_vma_file(): with `file` set, the VMA's
  * vm_file (0 for an anonymous mapping) is read into it as well.
  */
+static bool find_vma_at(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* start, addr_t* end,
+    addr_t* file, addr_t* vma_out);
+
 static bool find_vma(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* start, addr_t* end, addr_t* file)
+{
+    return find_vma_at(drakvuf, eprocess_base, vaddr, start, end, file, NULL);
+}
+
+// As find_vma() is described above, also giving the vm_area_struct itself
+static bool find_vma_at(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* start, addr_t* end,
+    addr_t* file, addr_t* vma_out)
 {
     vmi_instance_t vmi = drakvuf_vmi(drakvuf);
 
@@ -840,6 +850,8 @@ static bool find_vma(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr
             }
             *start = vm_start;
             *end = vm_end;
+            if (vma_out)
+                *vma_out = vma;
             return true;
         }
 
@@ -870,6 +882,154 @@ bool linux_find_vma_file(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, 
 {
     addr_t start, end;
     return find_vma(drakvuf, eprocess_base, vaddr, &start, &end, vm_file);
+}
+
+/*
+ * The physical address behind a file-backed virtual address that the process
+ * has not touched yet, through the page cache.
+ *
+ * A page of a mapped file that nobody has faulted in has no page table entry,
+ * but the kernel usually has the page all the same: a file that was just
+ * written, or read by anyone, sits in its inode's page cache, and the frame a
+ * read fault will map is that one. So: the VMA gives the file and the page's
+ * index in it (vm_pgoff + pages into the VMA), the file's address_space keeps
+ * its pages in an xarray (i_pages), and a struct page's place in the vmemmap
+ * array is its frame number.
+ *
+ * Everything read here is kernel memory the process cannot write. The entry
+ * found is believed only when the page says the same of itself -- its
+ * mapping and index are the ones looked up, which a tail of a huge page and a
+ * page being replaced do not -- and when it is up to date and not locked: a
+ * page still being read from disk has yet to get its contents.
+ *
+ * False when the kernel keeps no VMA list (6.1 on), the address is not in a
+ * file mapping, the page is not in the cache, or any read fails.
+ */
+#define XA_SLOT_BITS 6
+#define XA_WALK_MAX  12
+
+bool linux_file_page_frame(drakvuf_t drakvuf, addr_t eprocess_base, addr_t vaddr, addr_t* pa)
+{
+    vmi_instance_t vmi = drakvuf_vmi(drakvuf);
+
+    addr_t start = 0, end = 0, file = 0, vma = 0;
+    if (!find_vma_at(drakvuf, eprocess_base, vaddr, &start, &end, &file, &vma) || !file)
+        return false;
+
+    addr_t pgoff_rva, mapping_rva, pages_rva, head_rva, shift_rva, slots_rva;
+    addr_t page_mapping_rva, page_index_rva, page_flags_rva;
+    size_t page_size = 0;
+    if (!drakvuf_get_kernel_struct_member_rva(drakvuf, "vm_area_struct", "vm_pgoff", &pgoff_rva) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "file", "f_mapping", &mapping_rva) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "address_space", "i_pages", &pages_rva) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "xarray", "xa_head", &head_rva) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "xa_node", "shift", &shift_rva) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "xa_node", "slots", &slots_rva) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "page", "mapping", &page_mapping_rva) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "page", "index", &page_index_rva) ||
+        !drakvuf_get_kernel_struct_member_rva(drakvuf, "page", "flags", &page_flags_rva) ||
+        !drakvuf_get_kernel_struct_size(drakvuf, "page", &page_size) || !page_size)
+        return false;
+
+    // Which bit says a page's contents are there differs between kernels
+    json_object* kernel_json = vmi_get_kernel_json(vmi);
+    json_object* enums = NULL;
+    json_object* flags_enum = NULL;
+    json_object* constants = NULL;
+    json_object* uptodate_bit = NULL;
+    json_object* locked_bit = NULL;
+    if (!kernel_json ||
+        !json_object_object_get_ex(kernel_json, "enums", &enums) ||
+        !json_object_object_get_ex(enums, "pageflags", &flags_enum) ||
+        !json_object_object_get_ex(flags_enum, "constants", &constants) ||
+        !json_object_object_get_ex(constants, "PG_uptodate", &uptodate_bit) ||
+        !json_object_object_get_ex(constants, "PG_locked", &locked_bit))
+        return false;
+    const uint64_t uptodate = 1ULL << json_object_get_int(uptodate_bit);
+    const uint64_t locked = 1ULL << json_object_get_int(locked_bit);
+
+    // Where struct pages are: randomised with the rest of the kernel's layout
+    addr_t vmemmap = 0xffffea0000000000ULL;
+    addr_t vmemmap_va = 0;
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = drakvuf->kpgd
+    );
+    if (drakvuf_get_kernel_symbol_va(drakvuf, "vmemmap_base", &vmemmap_va) && vmemmap_va)
+    {
+        ctx.addr = vmemmap_va;
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &vmemmap) || !vmemmap)
+            return false;
+    }
+
+    addr_t pgoff = 0, mapping = 0, entry = 0;
+    ctx.addr = vma + pgoff_rva;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &pgoff))
+        return false;
+    ctx.addr = file + mapping_rva;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &mapping) || !mapping)
+        return false;
+    ctx.addr = mapping + pages_rva + head_rva;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &entry))
+        return false;
+
+    const uint64_t index = pgoff + ((vaddr - start) >> 12);
+
+    // An internal entry (low bits 10, above the first page) is a node; the
+    // head being a page itself means the file has the one page, index 0
+    bool at_leaf = false;
+    for (int depth = 0; depth < XA_WALK_MAX; depth++)
+    {
+        if ((entry & 3) != 2 || entry <= 4096)
+        {
+            if (depth == 0 && index != 0)
+                return false;
+            at_leaf = true;
+            break;
+        }
+
+        addr_t node = entry - 2;
+        uint8_t shift = 0;
+        ctx.addr = node + shift_rva;
+        if (VMI_FAILURE == vmi_read_8(vmi, &ctx, &shift) || shift > 58)
+            return false;
+        // Past what the tree spans from here
+        if (depth == 0 && (index >> shift) >= (1ULL << XA_SLOT_BITS))
+            return false;
+
+        ctx.addr = node + slots_rva + 8 * ((index >> shift) & ((1ULL << XA_SLOT_BITS) - 1));
+        if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &entry))
+            return false;
+        if (shift == 0)
+        {
+            at_leaf = true;
+            break;
+        }
+    }
+
+    // Nothing there, or a value entry (a shadow of an evicted page, a swap
+    // entry), or a sibling or retry marker
+    if (!at_leaf || !entry || (entry & 3) || entry < vmemmap)
+        return false;
+
+    addr_t page = entry;
+    addr_t its_mapping = 0, its_index = 0, its_flags = 0;
+    ctx.addr = page + page_mapping_rva;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &its_mapping))
+        return false;
+    ctx.addr = page + page_index_rva;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &its_index))
+        return false;
+    ctx.addr = page + page_flags_rva;
+    if (VMI_FAILURE == vmi_read_addr(vmi, &ctx, &its_flags))
+        return false;
+    if (its_mapping != mapping || its_index != index || !(its_flags & uptodate) || (its_flags & locked))
+        return false;
+    if ((page - vmemmap) % page_size)
+        return false;
+
+    *pa = (((page - vmemmap) / page_size) << 12) | (vaddr & 0xfff);
+    return true;
 }
 
 /*
