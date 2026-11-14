@@ -300,6 +300,11 @@ public:
 
     std::map<vmi_pid_t, module_context_t> proc_ntdll;
 
+    // The processes whose own image (the EXE) has been offered to the hook
+    // lists, or looked for often enough: EPROCESS and the lookups spent, so a
+    // reused pid is another process.
+    std::map<vmi_pid_t, std::pair<addr_t, unsigned int>> proc_main_image;
+
     const bool injection_mode;
     int injection_in_progress = 0;
     std::set<std::pair<vmi_pid_t, uint32_t /*tid*/>> pf_in_progress;

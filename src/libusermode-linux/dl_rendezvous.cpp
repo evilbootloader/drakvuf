@@ -43,6 +43,12 @@ dl_rendezvous::dl_rendezvous(drakvuf_t drakvuf)
         throw -1;
     }
 
+    // Not fatal: without it a forked child goes unseen until it execs, as
+    // every one did before this hook existed.
+    fork_hook = createSyscallHook("wake_up_new_task", &dl_rendezvous::wake_up_new_task_cb);
+    if (!fork_hook)
+        PRINT_DEBUG("[DL_RENDEZVOUS] wake_up_new_task not hookable: forked children are not monitored until they exec\n");
+
     this->bootstrap_layouts(drakvuf);
 }
 
@@ -104,6 +110,10 @@ void dl_rendezvous::adopt_visitor(drakvuf_t drakvuf, addr_t process, void* visit
 {
     auto ctx = static_cast<walk_ctx*>(visitor_ctx);
     auto self = ctx->self;
+
+    // Its executable first, interpreter or none: a statically linked sample
+    // injected before the plugins started is one of these and nothing else
+    self->offer_executable(drakvuf, process);
 
     vmi_pid_t pid = 0;
     addr_t dtb = 0, ld_base = 0;
@@ -223,6 +233,98 @@ void dl_rendezvous::set_status_callback(status_cb on_status)
     this->reported_cb = std::move(on_status);
 }
 
+void dl_rendezvous::set_executable_callback(executable_cb on_executable)
+{
+    this->exe_cb = std::move(on_executable);
+}
+
+void dl_rendezvous::set_fork_callback(fork_cb on_fork)
+{
+    this->forked_cb = std::move(on_fork);
+}
+
+event_response_t dl_rendezvous::wake_up_new_task_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    // wake_up_new_task(struct task_struct *p), run by the parent once the
+    // child is whole and before it has run. A new thread has its parent's
+    // tgid and is the same process.
+    vmi_pid_t parent = info->proc_data.pid;
+    addr_t child_base = drakvuf_get_function_argument(drakvuf, info, 1);
+    vmi_pid_t child = 0;
+    if (!drakvuf_get_process_pid(drakvuf, child_base, &child) || child <= 0 || child == parent)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    auto tracked = this->procs.find(parent);
+    if (tracked == this->procs.end() && !this->forked_cb)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    // As read_process()
+    addr_t dtb = 0;
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+        if (VMI_SUCCESS != vmi_pid_to_dtb(vmi, child, &dtb))
+            dtb = 0;
+    }
+    if (!dtb && (!drakvuf_get_process_dtb(drakvuf, child_base, &dtb) || !dtb))
+    {
+        if (tracked != this->procs.end())
+            this->report(child, "forked child's page tables not found; not monitored until it execs");
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    // The child has its parent's ld.so at the same address and the same
+    // link_map, so it is as far along as the parent: armed on the same
+    // breakpoint, which is one more process's now, or waiting like it.
+    if (tracked != this->procs.end() && !tracked->second.abandoned && !this->procs.count(child))
+    {
+        process_state state = tracked->second;
+        state.dtb = dtb;
+        state.proc_base = child_base;
+        if (state.rendezvous_trap)
+        {
+            auto shared = this->pa_traps.find(state.trap_pa);
+            if (shared != this->pa_traps.end())
+                shared->second.refs++;
+            else
+                state.rendezvous_trap = nullptr;
+        }
+        bool waiting = !state.rendezvous_trap;
+        this->procs[child] = std::move(state);
+        if (waiting)
+            this->start_arming_tick();
+    }
+
+    if (this->forked_cb)
+        this->forked_cb(drakvuf, info, parent, child, child_base, dtb);
+
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+void dl_rendezvous::offer_executable(drakvuf_t drakvuf, addr_t process)
+{
+    if (!this->exe_cb)
+        return;
+
+    vmi_pid_t pid = 0;
+    if (!drakvuf_get_process_pid(drakvuf, process, &pid) || pid <= 0)
+        return;
+
+    // As read_process(): libvmi's translation of the pgd, which a kernel
+    // thread, having no mm, has none of.
+    addr_t dtb = 0;
+    {
+        auto vmi = vmi_lock_guard(drakvuf);
+        if (VMI_SUCCESS != vmi_pid_to_dtb(vmi, pid, &dtb) || !dtb)
+            return;
+    }
+
+    char* name = drakvuf_get_process_name(drakvuf, process, true);
+    if (!name)
+        return;
+    this->exe_cb(drakvuf, nullptr, pid, process, dtb, name);
+    g_free(name);
+}
+
 // PRINT_DEBUG compiles to nothing in a release build, so a failure to arm
 // would otherwise be indistinguishable from a guest that simply never called
 // anything. Hand the reason to the consumer as well, so it can be surfaced.
@@ -262,6 +364,28 @@ event_response_t dl_rendezvous::finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap
     vmi_pid_t pid = info->proc_data.pid;
     addr_t eprocess_base = info->proc_data.base_addr;
 
+    // exec() keeps the pid, so a process exec'ing more than once (shell
+    // wrappers, interpreters re-exec'ing) lands here again for a pid already
+    // known: to us if it had an interpreter, and to the consumer either way,
+    // which is told of every executable. Drop the previous address space's
+    // trap and snapshot instead of leaking it and leaving a stale breakpoint
+    // behind, and tell consumers to do the same with anything they resolved
+    // back then -- before they hear of the new executable, and whether or
+    // not the new one has an interpreter (a dynamic program that exec'd a
+    // static one used to keep its trap and its libraries).
+    auto previous = this->procs.find(pid);
+    if (previous != this->procs.end())
+    {
+        if (previous->second.rendezvous_trap)
+            this->release_trap(previous->second);
+        this->procs.erase(previous);
+    }
+    if (this->reset_cb)
+        this->reset_cb(pid);
+    if (this->exe_cb)
+        this->exe_cb(drakvuf, info, pid, eprocess_base, info->regs->cr3,
+            info->proc_data.name ? info->proc_data.name : "");
+
     // AT_BASE is the interpreter's load address and AT_ENTRY the main
     // executable's entry point. Reading them from the aux vector avoids
     // searching the VMA list, whose mm_struct.mmap / vm_area_struct.vm_next
@@ -277,20 +401,7 @@ event_response_t dl_rendezvous::finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap
         return VMI_EVENT_RESPONSE_NONE;
     }
 
-    // exec() keeps the pid, so a process exec'ing more than once (shell
-    // wrappers, interpreters re-exec'ing) lands here again for a pid we
-    // already track. Drop the previous address space's trap and snapshot
-    // instead of leaking it and leaving a stale breakpoint behind, and tell
-    // consumers to do the same with anything they resolved back then.
     auto& state = this->procs[pid];
-    if (state.rendezvous_trap)
-    {
-        this->release_trap(state);
-
-        if (this->reset_cb)
-            this->reset_cb(pid);
-    }
-
     state = {};
     state.ld_base = ld_base;
     state.dtb = info->regs->cr3;            // begin_new_exec() already installed the new mm
@@ -861,9 +972,6 @@ void dl_rendezvous::diff_link_map(drakvuf_t drakvuf, drakvuf_trap_info_t* info, 
 event_response_t dl_rendezvous::do_exit_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
     vmi_pid_t pid = info->proc_data.pid;
-    auto it = this->procs.find(pid);
-    if (it == this->procs.end())
-        return VMI_EVENT_RESPONSE_NONE;
 
     // do_exit runs once per thread and `pid` is the tgid: the address space
     // goes with the last thread, so the others leave the process tracked. A
@@ -872,8 +980,15 @@ event_response_t dl_rendezvous::do_exit_cb(drakvuf_t drakvuf, drakvuf_trap_info_
     if (drakvuf_get_process_live_threads(drakvuf, info->proc_data.base_addr, &live) && live > 1)
         return VMI_EVENT_RESPONSE_NONE;
 
+    // Every process, not only the ones tracked here: a consumer also knows
+    // processes with no interpreter (their executable) and the children a
+    // process it hooked forked, and neither is in `procs`.
     if (this->reset_cb)
         this->reset_cb(pid);
+
+    auto it = this->procs.find(pid);
+    if (it == this->procs.end())
+        return VMI_EVENT_RESPONSE_NONE;
 
     this->release_trap(it->second);
 

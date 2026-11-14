@@ -31,6 +31,11 @@ struct libmon_config
 // shared objects loaded by guest processes. Library discovery is delegated to
 // dl_rendezvous; libmon resolves the wanted symbols in each newly mapped .so
 // and breakpoints them.
+//
+// And to functions of the executable itself, which has no export to name them
+// by: entries of the list that give an offset and whose module is the
+// executable's path. The one way a statically linked program is seen above
+// its system calls.
 class libmon : public pluginex
 {
 public:
@@ -81,6 +86,9 @@ private:
         // The executable, which the dynamic linker lists without a name
         addr_t exe_start = 0;
         addr_t exe_end = 0;
+        // Where the offsets of the executable's own hooks count from, 0 when
+        // the list has none for it. In `loaded` under this address.
+        addr_t exe_base = 0;
     };
 
     // A hook that could not be completed yet, either because the symbol was
@@ -116,6 +124,27 @@ private:
     void on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const so_view_t& so);
 
     void on_process_reset(vmi_pid_t pid);
+
+    // A process and what it runs, at exec or when taken up at startup: place
+    // the hooks the list has for that file.
+    void on_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+        addr_t proc_base, addr_t dtb, const std::string& path);
+
+    // Place what can be placed of a process's executable hooks, the ones
+    // whose page the process has. No budget and no giving up, unlike the
+    // deferred library hooks: a program's own function may first run minutes
+    // in, and this runs on the few faults in the executable, not on a tick.
+    void place_cold(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid);
+
+    // handle_mm_fault of a process with cold executable hooks, and its return,
+    // when the page is there and the instruction has not run yet
+    event_response_t fault_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t fault_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+
+    // A fork: the child has the parent's libraries and executable at the same
+    // addresses without an exec to announce it, and gets the parent's hooks.
+    void on_fork(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t parent, vmi_pid_t child,
+        addr_t child_proc_base, addr_t child_dtb);
 
     // A call to a hooked function: reports it at entry, or tracks it to its return
     void on_call(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const hooked_function& target);
@@ -201,6 +230,16 @@ private:
     std::set<std::pair<vmi_pid_t, addr_t>> hooked_keys;
 
     std::map<vmi_pid_t, std::vector<deferred_hook>> deferred;
+
+    // Hooks in executables whose page the process has not touched yet. Apart
+    // from `deferred`: nothing else maps a sample's file, so there is no other
+    // process to reach the frame through, and the page arrives when the
+    // program first runs something on it -- which the fault hook waits for.
+    std::map<vmi_pid_t, std::vector<deferred_hook>> cold;
+    // Held only while something is cold: it fires on every page fault of the guest
+    std::unique_ptr<libhook::SyscallHook> fault_hook;
+    // The faults being waited out, by (pid, tid)
+    std::map<std::pair<vmi_pid_t, uint32_t>, std::unique_ptr<libhook::ReturnHook>> fault_returns;
     // When the retry tick last looked up symbols for a process, which is the expensive part
     std::map<vmi_pid_t, gint64> last_resolve;
     // The process the retry tick goes on with, so a long list is worked through in turns

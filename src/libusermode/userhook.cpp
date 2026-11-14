@@ -773,6 +773,70 @@ static void try_hook_ntdll(drakvuf_t drakvuf, drakvuf_trap_info_t* info, userhoo
     }
 }
 
+static bool find_main_image_mmvad_visitor(drakvuf_t drakvuf, mmvad_info_t* mmvad, void* callback_data)
+{
+    auto* vctx = reinterpret_cast<ntdll_mmvad_visitor_ctx_t*>(callback_data);
+
+    if (!mmvad->file_name_ptr || drakvuf_mmvad_type(drakvuf, mmvad) != VAD_TYPE_DLL)
+        return false;
+
+    // The VAD names the file from its volume's root (\Users\u\s.exe), the
+    // process with the device before that
+    auto name = drakvuf_read_unicode(drakvuf, mmvad->file_name_ptr);
+    if (name.empty() || name.size() > vctx->name.size())
+        return false;
+    auto same = [](char x, char y)
+    {
+        return std::toupper(x) == std::toupper(y);
+    };
+    if (!std::equal(name.rbegin(), name.rend(), vctx->name.rbegin(), same))
+        return false;
+
+    vctx->mmvad = *mmvad;
+    return true;
+}
+
+/*
+ * The process's own image. Nothing maps it with a system call this plugin
+ * sees -- the kernel does when it creates the process -- so it is looked for,
+ * once per process, after ntdll: one image is hooked at a time. Hook-list
+ * entries can only name a function of an EXE by offset, which is what a list
+ * written for one sample does (the functions located in it before the run).
+ */
+static void try_hook_main_image(drakvuf_t drakvuf, drakvuf_trap_info_t* info, userhook* plugin)
+{
+    constexpr unsigned int max_lookups = 20;
+
+    auto proc_data = get_proc_data(drakvuf, info);
+    if (!proc_data.name || plugin->is_stopping())
+        return;
+
+    auto ntdll = plugin->proc_ntdll.find(proc_data.pid);
+    if (ntdll == plugin->proc_ntdll.end() || (ntdll->second.mmvad && !ntdll->second.is_hooked))
+        return;
+
+    auto& state = plugin->proc_main_image[proc_data.pid];
+    if (state.first != proc_data.base_addr)
+        state = { proc_data.base_addr, 0 };
+    if (state.second >= max_lookups)
+        return;
+
+    ntdll_mmvad_visitor_ctx_t vctx{ proc_data.name, {} };
+    if (!drakvuf_traverse_mmvad(drakvuf, proc_data.base_addr, find_main_image_mmvad_visitor, &vctx))
+    {
+        state.second++;
+        return;
+    }
+    state.second = max_lookups;
+
+    if (is_already_hooked(drakvuf, info, plugin, &vctx.mmvad))
+        return;
+
+    if (auto dll_meta = create_dll_meta(drakvuf, info, plugin, &vctx.mmvad); dll_meta)
+        if (!join_shared_image(drakvuf, plugin, dll_meta, proc_data.pid))
+            perform_hooking(drakvuf, info, plugin, dll_meta);
+}
+
 /**
  * This is used in order to observe when SysWOW64 process is loading a new DLL.
  * If the DLL is interesting, we perform further investigation and try to equip user mode hooks.
@@ -803,6 +867,11 @@ static event_response_t protect_virtual_memory_hook_cb(drakvuf_t drakvuf, drakvu
         return perform_hooking(drakvuf, info, plugin, dll_meta);
 
     try_hook_ntdll(drakvuf, info, plugin);
+
+    if (plugin->is_injection_in_progress(drakvuf, info))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    try_hook_main_image(drakvuf, info, plugin);
 
     if (plugin->is_injection_in_progress(drakvuf, info))
         return VMI_EVENT_RESPONSE_NONE;
@@ -885,6 +954,11 @@ static event_response_t map_view_of_section_hook_cb(drakvuf_t drakvuf, drakvuf_t
         return perform_hooking(drakvuf, info, plugin, dll_meta);
 
     try_hook_ntdll(drakvuf, info, plugin);
+
+    if (plugin->is_injection_in_progress(drakvuf, info))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    try_hook_main_image(drakvuf, info, plugin);
 
     if (plugin->is_injection_in_progress(drakvuf, info))
         return VMI_EVENT_RESPONSE_NONE;

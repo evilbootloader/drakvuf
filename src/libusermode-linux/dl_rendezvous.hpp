@@ -35,6 +35,19 @@ struct so_view_t
 using so_event_cb = std::function<void(drakvuf_t, drakvuf_trap_info_t*, const so_view_t&)>;
 using proc_reset_cb = std::function<void(vmi_pid_t)>;
 
+// A process and the file it is running, at its exec or, for one already
+// running at startup, when it is taken up. Every process, with an interpreter
+// or without: this is the one thing known of a statically linked one, which
+// has no ld.so and so no link_map to report anything from. No trap info for a
+// process taken up at startup.
+using executable_cb = std::function<void(drakvuf_t, drakvuf_trap_info_t*, vmi_pid_t,
+        addr_t proc_base, addr_t dtb, const std::string& path)>;
+
+// A fork: a process with its parent's address space, at the same addresses,
+// and no exec to announce it. Not a new thread, which has its parent's pid.
+using fork_cb = std::function<void(drakvuf_t, drakvuf_trap_info_t*, vmi_pid_t parent,
+        vmi_pid_t child, addr_t child_proc_base, addr_t child_dtb)>;
+
 // Reports why tracking gave up on a process. Consumers should surface this:
 // without it a failure to arm is indistinguishable from a quiet guest.
 using status_cb = std::function<void(vmi_pid_t, const char* reason)>;
@@ -148,6 +161,16 @@ public:
 
     void set_status_callback(status_cb on_status);
 
+    // Notified of every process's executable, after the reset of whatever the
+    // pid ran before. Set before adopt_running_processes(), which reports the
+    // processes already running.
+    void set_executable_callback(executable_cb on_executable);
+
+    // Notified of every fork in the guest, after the child has been given its
+    // parent's tracking here. Consumers do the same with what they resolved
+    // in the parent: it all holds in the child.
+    void set_fork_callback(fork_cb on_fork);
+
     /*
      * Take up the processes that were already running when we started, which
      * the exec path cannot see: their finalize_exec happened before the hook
@@ -172,6 +195,7 @@ public:
     // bound member functions.
     event_response_t finalize_exec_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
     event_response_t do_exit_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
+    event_response_t wake_up_new_task_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info);
 
 private:
     struct process_state
@@ -298,13 +322,19 @@ private:
 
     void report(vmi_pid_t pid, const char* reason);
 
+    // Tell the consumer of a running process's executable (adoption)
+    void offer_executable(drakvuf_t drakvuf, addr_t process);
+
     so_event_cb discovered_cb;
     so_event_cb removed_cb;
     proc_reset_cb reset_cb;
     status_cb reported_cb;
+    executable_cb exe_cb;
+    fork_cb forked_cb;
 
     std::unique_ptr<libhook::SyscallHook> exec_hook;
     std::unique_ptr<libhook::SyscallHook> exit_hook;
+    std::unique_ptr<libhook::SyscallHook> fork_hook;
 
     // Both are installed only while some process still needs arming: each
     // fires system-wide and is far too costly to leave running.

@@ -30,6 +30,10 @@ static constexpr addr_t SYMBOL_ABSENT = ~(addr_t)0;
 // Aux vector entry with the address of the executable's program headers
 static constexpr uint64_t AUXV_AT_PHDR = 3;
 
+// A read fault on a file brings in the pages around it too (fault_around_bytes,
+// 64 KiB by default), so a fault this near a cold hook may have brought its page
+static constexpr addr_t FAULT_AROUND = 0x10000;
+
 /*
  * The guest changes page tables under us: a fork makes the stack copy-on-write,
  * and the kernel moves pages. A translation cached by an earlier event can then
@@ -87,6 +91,20 @@ true)
     this->rendezvous->set_process_reset_callback([this](vmi_pid_t pid)
     {
         this->on_process_reset(pid);
+    });
+
+    this->rendezvous->set_executable_callback(
+        [this](drakvuf_t d, drakvuf_trap_info_t* i, vmi_pid_t pid, addr_t proc_base, addr_t dtb,
+            const std::string& path)
+    {
+        this->on_executable(d, i, pid, proc_base, dtb, path);
+    });
+
+    this->rendezvous->set_fork_callback(
+        [this](drakvuf_t d, drakvuf_trap_info_t* i, vmi_pid_t parent, vmi_pid_t child, addr_t proc_base,
+            addr_t dtb)
+    {
+        this->on_fork(d, i, parent, child, proc_base, dtb);
     });
 
     // Surface give-up reasons as ordinary events. They would otherwise only
@@ -302,8 +320,12 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
     proc.proc_base = so.proc_base;
     proc.dtb = so.dtb;
 
-    // The program headers sit right behind the ELF header, in the first page of the executable
-    if (new_process)
+    // The program headers sit right behind the ELF header, in the first page
+    // of the executable. Not only for a new process: one with hooks of its
+    // own in the executable is known from its exec, when no page of it could
+    // be read yet.
+    UNUSED(new_process);
+    if (!proc.exe_end)
     {
         addr_t phdr = drakvuf_get_auxv_value(drakvuf, so.proc_base, AUXV_AT_PHDR);
         addr_t exe_base = phdr & ~(addr_t)(VMI_PS_4KB - 1);
@@ -375,6 +397,195 @@ void libmon::on_so_discovered(drakvuf_t drakvuf, drakvuf_trap_info_t* info, cons
     // once per newly discovered library and would spend several of them in a
     // single event.
     if (!this->deferred.empty() && !this->cr3_hook)
+        this->cr3_hook = createCr3Hook(&libmon::cr3_cb);
+}
+
+void libmon::on_executable(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid,
+    addr_t proc_base, addr_t dtb, const std::string& path)
+{
+    // By offset only: an executable need not have a symbol table to resolve a
+    // name in, and the ones this is for have none.
+    std::vector<const plugin_target_config_entry_t*> entries;
+    this->wanted_hooks.visit_hooks_for(path, [&](const plugin_target_config_entry_t& entry)
+    {
+        if (entry.type == HOOK_BY_OFFSET)
+            entries.push_back(&entry);
+    });
+    if (entries.empty())
+        return;
+
+    // Offsets count from the page of the program headers: the one address of
+    // the executable known before it has run, fixed or randomised alike, and
+    // what the list's writer counted from (sandboxd/samplehooks.py).
+    addr_t phdr = drakvuf_get_auxv_value(drakvuf, proc_base, AUXV_AT_PHDR);
+    if (!phdr)
+    {
+        fmt::print(m_output_format, "libmon", drakvuf, nullptr,
+            keyval("Event", fmt::Rstr("not_tracked")),
+            keyval("PID", fmt::Nval(pid)),
+            keyval("Reason", fmt::Qstr(std::string("no AT_PHDR: the executable's own hooks are not placed")))
+        );
+        return;
+    }
+    addr_t exe_base = phdr & ~(addr_t)(VMI_PS_4KB - 1);
+
+    auto& proc = this->libs[pid];
+    proc.proc_base = proc_base;
+    proc.dtb = dtb;
+    proc.exe_base = exe_base;
+    // Its extent is in headers nothing has read yet at exec; resolve_module()
+    // and within_library() fall back to the cap. No build ID either: no other
+    // process is asked for its pages.
+    proc.loaded[exe_base] = loaded_so{ path, 0 };
+    proc.build_ids[exe_base] = "";
+
+    auto& cold = this->cold[pid];
+    for (auto entry : entries)
+    {
+        addr_t va = exe_base + entry->offset;
+        if (!this->within_library(drakvuf, pid, proc_base, exe_base, va))
+        {
+            PRINT_DEBUG("[LIBMON] pid %d: %s at 0x%lx is not in %s, not hooked\n", pid,
+                entry->function_name.c_str(), va, path.c_str());
+            continue;
+        }
+        cold.push_back(deferred_hook{ entry, path, exe_base, proc_base, dtb, va, 0, "" });
+    }
+
+    // A process taken up at startup has run, and may have most of its pages
+    this->place_cold(drakvuf, info, pid);
+
+}
+
+void libmon::place_cold(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t pid)
+{
+    auto it = this->cold.find(pid);
+    if (it != this->cold.end())
+    {
+        auto& targets = it->second;
+        targets.erase(std::remove_if(targets.begin(), targets.end(), [&](const deferred_hook& target)
+        {
+            // Residency first: drakvuf_add_trap() logs two errors for an
+            // address it cannot translate
+            {
+                vmi_lock_guard vmi(drakvuf);
+                page_info_t pinfo;
+                if (VMI_SUCCESS != vmi_pagetable_lookup_extended(vmi, target.dtb, target.va, &pinfo))
+                    return false;
+            }
+            return this->place_hook(drakvuf, info, pid, target.dtb, *target.config, target.so_path,
+                    target.so_base, target.va);
+        }), targets.end());
+
+        if (targets.empty())
+            this->cold.erase(it);
+    }
+
+    if (this->cold.empty())
+        this->fault_hook.reset();
+    else if (!this->fault_hook)
+    {
+        this->fault_hook = createSyscallHook("handle_mm_fault", &libmon::fault_cb);
+        if (!this->fault_hook)
+            PRINT_DEBUG("[LIBMON] handle_mm_fault not hookable: cold executable hooks stay unplaced\n");
+    }
+}
+
+event_response_t libmon::fault_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    auto it = this->cold.find(info->proc_data.pid);
+    if (it == this->cold.end())
+        return VMI_EVENT_RESPONSE_NONE;
+
+    // handle_mm_fault(vma, address, flags, regs); (mm, vma, address, flags)
+    // before Linux 4.8. Whichever is the address, the other is a kernel
+    // pointer or a few flag bits and near no hook.
+    addr_t second = drakvuf_get_function_argument(drakvuf, info, 2);
+    addr_t third = drakvuf_get_function_argument(drakvuf, info, 3);
+    bool near = std::any_of(it->second.begin(), it->second.end(), [&](const deferred_hook& target)
+    {
+        addr_t low = target.va > FAULT_AROUND ? target.va - FAULT_AROUND : 0;
+        addr_t high = target.va + FAULT_AROUND;
+        return (second >= low && second < high) || (third >= low && third < high);
+    });
+    if (!near)
+        return VMI_EVENT_RESPONSE_NONE;
+
+    // The page is there when the fault returns, and the instruction that
+    // faulted has not run: the first call of a function is caught too.
+    auto key = std::make_pair(info->proc_data.pid, info->proc_data.tid);
+    auto hook = this->createReturnHook(info, &libmon::fault_ret_cb);
+    if (hook)
+        this->fault_returns[key] = std::move(hook);
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+event_response_t libmon::fault_ret_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
+{
+    auto params = libhook::GetTrapParams(info);
+    if (!params->verifyResultCallParams(drakvuf, info))
+        return VMI_EVENT_RESPONSE_NONE;
+
+    vmi_pid_t pid = info->proc_data.pid;
+    flush_translations(drakvuf, info->regs->cr3);
+    this->place_cold(drakvuf, info, pid);
+
+    this->fault_returns.erase(std::make_pair(pid, info->proc_data.tid));
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+void libmon::on_fork(drakvuf_t drakvuf, drakvuf_trap_info_t* info, vmi_pid_t parent_pid,
+    vmi_pid_t pid, addr_t child_base, addr_t dtb)
+{
+    UNUSED(drakvuf);
+    UNUSED(info);
+
+    auto parent = this->libs.find(parent_pid);
+    if (parent == this->libs.end() || this->libs.count(pid))
+        return;
+
+    // Everything known of the parent holds in the child: the same files at
+    // the same addresses. Hooks in libraries and in the executable alike --
+    // a child that never execs is otherwise unseen for all its life, and
+    // that is how a daemon and most bots run.
+    process_libs child = parent->second;
+    child.proc_base = child_base;
+    child.dtb = dtb;
+    this->libs[pid] = std::move(child);
+
+    // A fork shares the parent's frames, so its breakpoints are the child's:
+    // the same ones, answering for one pid more
+    for (auto& [pa, shared] : this->pa_hooks)
+    {
+        auto hooks = shared.by_pid.find(parent_pid);
+        if (hooks == shared.by_pid.end())
+            continue;
+
+        std::vector<hooked_function> inherited = hooks->second;
+        for (const auto& hook : inherited)
+            this->hooked_keys.insert(std::make_pair(pid, hook.va));
+        shared.by_pid[pid] = std::move(inherited);
+    }
+
+    // And what was still waiting for a page or a symbol table waits in the
+    // child too, read through the child's own page tables
+    auto carry = [&](std::map<vmi_pid_t, std::vector<deferred_hook>>& waiting)
+    {
+        auto it = waiting.find(parent_pid);
+        if (it == waiting.end())
+            return false;
+
+        std::vector<deferred_hook> targets = it->second;
+        for (auto& target : targets)
+        {
+            target.proc_base = child_base;
+            target.dtb = dtb;
+        }
+        waiting[pid] = std::move(targets);
+        return true;
+    };
+    carry(this->cold);
+    if (carry(this->deferred) && !this->cr3_hook)
         this->cr3_hook = createCr3Hook(&libmon::cr3_cb);
 }
 
@@ -739,9 +950,20 @@ void libmon::on_so_removed(drakvuf_t drakvuf, drakvuf_trap_info_t* info, const s
 // leaving them armed over whatever gets mapped there next.
 void libmon::on_process_reset(vmi_pid_t pid)
 {
+    // Told of every exec and exit in the guest; most are of processes nothing
+    // was ever placed in, and the walk over the breakpoints below is not free
+    if (!this->libs.count(pid) && !this->deferred.count(pid) && !this->cold.count(pid))
+        return;
+
     this->deferred.erase(pid);
     this->last_resolve.erase(pid);
     this->libs.erase(pid);
+
+    this->cold.erase(pid);
+    if (this->cold.empty())
+        this->fault_hook.reset();
+    for (auto it = this->fault_returns.begin(); it != this->fault_returns.end(); )
+        it = it->first.first == pid ? this->fault_returns.erase(it) : std::next(it);
 
     // Drop any call still in flight: its return address belongs to an address
     // space that no longer exists.
