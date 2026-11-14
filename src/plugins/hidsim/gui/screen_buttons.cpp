@@ -17,9 +17,12 @@
 
 #include "screen_buttons.h"
 
-#ifdef HAVE_TESSERACT
+#pragma push_macro("HAVE_CONFIG_H")
+#undef HAVE_CONFIG_H
+
 #include <tesseract/baseapi.h>
-#endif
+
+#pragma pop_macro("HAVE_CONFIG_H")
 
 /*
  * vmi_win_gui_filter_definitions.h's BTN_TEXTS, in the order they are wanted
