@@ -177,6 +177,18 @@ std::unique_ptr<ArgumentPrinter> make_arg_printer(
     {
         return std::make_unique<WideStringPrinter>(name, config);
     }
+    else if (type == "clrstring")
+    {
+        return std::make_unique<ClrStringPrinter>(name, config);
+    }
+    else if (type == "pcorinfo_method_info")
+    {
+        return std::make_unique<CorinfoMethodInfoPrinter>(name, config);
+    }
+    else if (type == "clrbytes")
+    {
+        return std::make_unique<ClrBytesPrinter>(name, config);
+    }
     else if (type == "punicode_string")
     {
         return std::make_unique<UnicodePrinter>(name, config);
@@ -374,7 +386,8 @@ std::vector<std::string> hook_list_tail::new_lines()
     return lines;
 }
 
-uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argument_abi abi, int number)
+uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argument_abi abi, int number,
+    int total)
 {
     if (abi == argument_abi::PLATFORM)
         return drakvuf_get_function_argument(drakvuf, info, number);
@@ -382,6 +395,18 @@ uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argume
     const bool is32 = drakvuf_process_is32bit(drakvuf, info);
     const auto* regs = info->regs;
     int slot = number;      // on the stack, from 1: [sp] is the return address
+
+    if (abi == argument_abi::CLR)
+    {
+        if (!is32)
+            return drakvuf_get_function_argument(drakvuf, info, number);
+        if (number == 1)
+            return regs->rcx & 0xffffffff;
+        if (number == 2)
+            return regs->rdx & 0xffffffff;
+        // Pushed left to right: the last one is at [esp+4]
+        slot = total - number + 1;
+    }
 
     if (abi == argument_abi::GO_REGISTERS && !is32)
     {
@@ -436,6 +461,10 @@ plugin_target_config_entry_t parse_entry(
         else if (token == "no-retval")
         {
             entry.no_retval = true;
+        }
+        else if (token == "clrcall")
+        {
+            entry.abi = argument_abi::CLR;
         }
         else if (token == "goabi" || token == "goabi0")
         {

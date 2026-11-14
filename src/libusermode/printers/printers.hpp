@@ -339,6 +339,44 @@ public:
         const uint8_t* data, size_t size);
 };
 
+// A .NET string object (System.String): a method table pointer, the length
+// in characters, then the UTF-16 text, which the runtime keeps terminated.
+class ClrStringPrinter : public StringPrinterInterface
+{
+private:
+    std::string getBuffer(drakvuf_t drakvuf, const access_context_t* ctx) const;
+
+public:
+    using StringPrinterInterface::StringPrinterInterface;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+};
+
+// A .NET byte[] object: a method table pointer, the length in a pointer-wide
+// slot, then the bytes, printed as BufferPrinter prints them.
+class ClrBytesPrinter : public ArgumentPrinter
+{
+public:
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+};
+
+// The JIT compiler's CORINFO_METHOD_INFO (CILJit::compileMethod's third
+// argument): { ftn, scope, ILCode, ILCodeSize, ... }, pointers then a 32-bit
+// size, the same in .NET Framework 4 and .NET (Core). Printed with the first
+// bytes of the IL: a method's name is not in reach here, and its body is what
+// the report finds it by in the assembly's metadata (postprocessing/clrjit.py).
+class CorinfoMethodInfoPrinter : public ArgumentPrinter
+{
+public:
+    static constexpr size_t IL_BYTES = 32;
+
+    using ArgumentPrinter::ArgumentPrinter;
+
+    std::string print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const;
+};
+
 // A WSABUF array (WSASend's, WSARecv's lpBuffers): the first buffer's bytes,
 // as BufferPrinter prints them. Read at the return, where WSARecv's is filled.
 class WsaBufPrinter : public ArgumentPrinter

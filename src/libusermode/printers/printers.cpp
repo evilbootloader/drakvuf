@@ -416,6 +416,110 @@ std::string BufferPrinter::print_sized(drakvuf_t drakvuf, drakvuf_trap_info* inf
     return print_bytes(name, config, argument, data.data(), got);
 }
 
+std::string ClrStringPrinter::getBuffer(drakvuf_t drakvuf, const access_context_t* ctx) const
+{
+    vmi_reader_guard vmi(drakvuf);
+    auto str_obj = drakvuf_read_wchar_string(drakvuf, ctx);
+    std::string ret = str_obj == NULL ? "" : (char*)str_obj->contents;
+    if (str_obj)
+        vmi_free_unicode_str(str_obj);
+    return ret;
+}
+
+std::string ClrStringPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    // Past the method table pointer and the 32-bit length
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument + (drakvuf_process_is32bit(drakvuf, info) ? 8 : 12)
+    );
+    std::stringstream stream;
+    stream << name << "=";
+    if (!config.print_no_addr)
+        stream << "0x" << std::hex << argument << ":";
+    stream << "\"" << escape_str(getBuffer(drakvuf, &ctx)) << "\"";
+    return stream.str();
+}
+
+std::string ClrBytesPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    const uint64_t word = drakvuf_process_is32bit(drakvuf, info) ? 4 : 8;
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument + word
+    );
+    uint32_t length = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        if (vmi_read_32(vmi, &ctx, &length) != VMI_SUCCESS)
+            return ArgumentPrinter::print(drakvuf, info, argument);
+    }
+
+    std::vector<uint8_t> data(std::min<uint64_t>(length, BufferPrinter::MAX_BYTES));
+    size_t got = 0;
+    if (!data.empty())
+    {
+        ctx.addr = argument + 2 * word;
+        vmi_reader_guard vmi(drakvuf);
+        vmi_read(vmi, &ctx, data.size(), data.data(), &got);
+    }
+    return BufferPrinter::print_bytes(name, config, argument, data.data(), got);
+}
+
+std::string CorinfoMethodInfoPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
+{
+    if (!argument)
+        return ArgumentPrinter::print(drakvuf, info, argument);
+
+    const uint64_t word = drakvuf_process_is32bit(drakvuf, info) ? 4 : 8;
+    ACCESS_CONTEXT(ctx,
+        .translate_mechanism = VMI_TM_PROCESS_DTB,
+        .dtb = info->regs->cr3,
+        .addr = argument
+    );
+    uint64_t pointers[3] = { 0, 0, 0 };     // ftn, scope, ILCode
+    uint32_t il_size = 0;
+    uint8_t code[IL_BYTES];
+    size_t got = 0;
+    {
+        vmi_reader_guard vmi(drakvuf);
+        for (auto& pointer : pointers)
+        {
+            if (vmi_read(vmi, &ctx, word, &pointer, nullptr) != VMI_SUCCESS)
+                return ArgumentPrinter::print(drakvuf, info, argument);
+            ctx.addr += word;
+        }
+        if (vmi_read_32(vmi, &ctx, &il_size) != VMI_SUCCESS)
+            return ArgumentPrinter::print(drakvuf, info, argument);
+        if (pointers[2] && il_size)
+        {
+            ctx.addr = pointers[2];
+            vmi_read(vmi, &ctx, std::min<size_t>(il_size, IL_BYTES), code, &got);
+        }
+    }
+
+    std::stringstream stream;
+    stream << name << "=0x" << std::hex << argument
+        << ":{ftn=0x" << pointers[0] << ",scope=0x" << pointers[1] << ",il=0x" << pointers[2]
+        << ",size=" << std::dec << il_size << ",code=";
+    for (size_t i = 0; i < got; i++)
+    {
+        char byte[3];
+        snprintf(byte, sizeof(byte), "%02x", code[i]);
+        stream << byte;
+    }
+    stream << "}";
+    return stream.str();
+}
+
 std::string WsaBufPrinter::print(drakvuf_t drakvuf, drakvuf_trap_info* info, uint64_t argument) const
 {
     if (!argument)

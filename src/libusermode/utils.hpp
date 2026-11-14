@@ -132,6 +132,13 @@ enum class argument_abi
     // return address, a word each. All of Go before 1.17, all of 32-bit Go,
     // and the functions written in assembly to this day.
     GO_STACK,
+    // The CLR's managed convention ("clrcall"). On x64 it is the platform's.
+    // On x86 the first two arguments are in ECX and EDX and the others are
+    // pushed left to right, so the LAST is nearest the return address: where
+    // one is depends on how many there are. Exact when every argument is a
+    // word; a list's writer leaves out the arguments of a method with a
+    // 64-bit, floating point or by-value struct argument.
+    CLR,
 };
 
 struct HookActions
@@ -212,5 +219,7 @@ private:
 };
 
 // Argument `number` (from 1) of the function a breakpoint at its entry was
-// hit in, read the way `abi` has it
-uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argument_abi abi, int number);
+// hit in, read the way `abi` has it. `total`: how many the function takes,
+// which the CLR's x86 convention needs.
+uint64_t read_hook_argument(drakvuf_t drakvuf, drakvuf_trap_info_t* info, argument_abi abi, int number,
+    int total = 0);

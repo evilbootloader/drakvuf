@@ -195,6 +195,15 @@ START_TEST(test_parse_go_hook)
 
     entry = test_parse_dll_entry("libc.so.6,connect,log,Fd:int");
     ck_assert(entry.abi == argument_abi::PLATFORM);
+
+    // A .NET method, precompiled in a framework assembly: with its return
+    entry = test_parse_dll_entry("8.0.11\\System.Net.WebClient.dll,System.Net.WebClient::DownloadString,a220,clrcall,"
+            "log,This:lpvoid,Arg1:clrstring,Arg2:clrbytes");
+    ck_assert(entry.abi == argument_abi::CLR && !entry.no_retval);
+    ck_assert(entry.type == HOOK_BY_OFFSET && entry.offset == 0xa220);
+    ck_assert(dynamic_cast<const ClrStringPrinter*>(entry.argument_printers[1].get()) != nullptr);
+    ck_assert(dynamic_cast<const ClrBytesPrinter*>(entry.argument_printers[2].get()) != nullptr);
+    ck_assert(entry.argument_printers[1]->print(nullptr, nullptr, 0) == "Arg1=0x0");
 }
 END_TEST
 
