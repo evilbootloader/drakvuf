@@ -120,6 +120,28 @@ public:
 
     procdump2(drakvuf_t drakvuf, const procdump2_config* config, output_format_t output);
     ~procdump2() = default;
+
+protected:
+    /*
+     * DRAKVUF stops this, the plug-in it knows; the work is the OS part's.
+     * Without passing the stop on, as from #1769 (2024-02) until 2026-11-15,
+     * the part's stop_impl never ran: no process was dumped at the end of an
+     * analysis -- not the injected one, not --procdump-new-processes-on-finish
+     * -- and a sample still running then left no dump (sandbox jobs 295f5786
+     * and 831d5f4c). Called again by DRAKVUF's stop loop until it is done, as
+     * the part's own stop_impl expects.
+     *
+     * Windows only, for now: the Linux part's stop dumps the processes still
+     * running too, and passing it on would change every Ubuntu analysis,
+     * which is the operator's to decide (sandbox_project CLAUDE.md).
+     */
+    bool stop_impl() override
+    {
+        bool done = true;
+        if (wp)
+            done = wp->stop() && done;
+        return done && pluginex::stop_impl();
+    }
 };
 
 #endif
