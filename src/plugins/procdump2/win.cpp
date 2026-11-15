@@ -102,6 +102,7 @@
  *                                                                         *
  ***************************************************************************/
 
+#include <algorithm>
 #include <array>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -422,16 +423,33 @@ event_response_t win_procdump2::dispatcher(drakvuf_trap_info_t* info)
         return VMI_EVENT_RESPONSE_NONE;
     }
 
-    for (auto it = this->pending.cbegin(), next_it = it; it != this->pending.cend(); it = next_it)
+    /* Oldest task first, not lowest PID first.
+     *
+     * At stop every process started during the analysis is queued
+     * (start_dump_processes_on_stop) in the order of the kernel's process
+     * list, which is the order they were created in, and DRAKVUF waits for
+     * the plug-in a bounded time. The analysed sample is started first, and
+     * its processes came out last or not at all when PIDs decided: one dump
+     * takes 6 to 35 s on a Windows 11 guest (sandbox job 295f5786,
+     * 2026-11-15, whose sample, PID 52, was queued and never dumped).
+     */
+    std::vector<std::shared_ptr<win_procdump2_ctx>> queue;
+    for (auto& [pid, ctx] : this->pending)
+        queue.push_back(ctx);
+    std::sort(queue.begin(), queue.end(), [](const auto& a, const auto& b)
     {
-        ++next_it;
-        auto ctx = it->second;
-        if (dispatch_pending(info, ctx))
-        {
-            return VMI_EVENT_RESPONSE_NONE;
-        }
-    }
+        return a->idx < b->idx;
+    });
 
+    for (auto& ctx : queue)
+    {
+        // An earlier one may have finished or moved another on
+        auto still = this->pending.find(ctx->target_process_pid);
+        if (still == this->pending.end() || still->second != ctx)
+            continue;
+        if (dispatch_pending(info, ctx))
+            return VMI_EVENT_RESPONSE_NONE;
+    }
 
     return VMI_EVENT_RESPONSE_NONE;
 }
@@ -2120,7 +2138,9 @@ void win_procdump2::print_pending_on_stop()
 
 void win_procdump2::start_dump_processes_on_stop()
 {
-    // On first stop call we collect PIDs for dump
+    // On first stop call we collect PIDs for dump. In the process list's
+    // order, which is the order of creation: the oldest is dumped first
+    // (dispatcher).
 
     std::vector<vmi_pid_t> pids;
     if (dump_process_on_finish)
