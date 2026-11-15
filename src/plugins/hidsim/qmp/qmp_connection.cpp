@@ -104,13 +104,19 @@
 * It is distributed as part of DRAKVUF under the same license             *
 ***************************************************************************/
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <string.h>
 #include <glib/gprintf.h>
+#include <string>
+
 #include "qmp_connection.h"
+
+static int qmp_read_reply(qmp_connection* qc, unsigned long id, char** out);
 
 /* Checks, if the given string matches a success response */
 int qmp_check_result_str(const char* s, size_t n)
@@ -157,6 +163,9 @@ int qmp_init_conn(qmp_connection* qc,  const char* path)
 
     /* Sets socket path */
     g_snprintf(qc->sa.sun_path, sizeof(qc->sa.sun_path), "%s", path);
+    qc->pending_len = 0;
+    qc->last_id = 0;
+    qc->is_connected = false;
 
     /* Initializes connection */
     ret = connect(qc->fd, (struct sockaddr*) &qc->sa, sizeof(qc->sa));
@@ -215,52 +224,129 @@ int qmp_init_conn(qmp_connection* qc,  const char* path)
 int qmp_communicate_json(qmp_connection* qc, struct json_object* in,
     struct json_object** out)
 {
-    const char* in_str = json_object_to_json_string_ext(in,
-            JSON_C_TO_STRING_SPACED);
+    if (out)
+        *out = NULL;
+
+    unsigned long id = ++qc->last_id;
+    json_object_object_add(in, "id", json_object_new_int64((int64_t)id));
+
+    /* One line per command */
+    std::string line = std::string(json_object_to_json_string_ext(in, JSON_C_TO_STRING_PLAIN)) + "\n";
+    if (write(qc->fd, line.data(), line.size()) != (ssize_t)line.size())
+    {
+        fprintf(stderr, "Write to %s failed - %s\n", qc->sa.sun_path,
+            strerror(errno));
+        return -1;
+    }
 
     char* out_str = NULL;
-
-    qmp_communicate(qc, in_str, &out_str);
+    if (qmp_read_reply(qc, id, &out_str) != 0)
+        return -1;
 
     if (out)
         *out = json_tokener_parse(out_str);
-
-    if (out_str)
-    {
-        free(out_str);
-        out_str = NULL;
-    }
+    free(out_str);
 
     return 0;
 }
 
-/* Sends the given data to the QMPConnection and reads the response */
+/*
+ * The next whole line the server sent, without its line end, in a buffer
+ * the caller frees. -1 when none came in QMP_REPLY_TIMEOUT_MS or the socket
+ * failed. A line longer than the buffer is no reply of ours and is dropped.
+ */
+static int qmp_next_line(qmp_connection* qc, char** line)
+{
+    for (;;)
+    {
+        char* end = (char*)memchr(qc->pending, '\n', qc->pending_len);
+        if (end)
+        {
+            size_t n = end - qc->pending;
+            *line = strndup(qc->pending, n);
+            memmove(qc->pending, end + 1, qc->pending_len - n - 1);
+            qc->pending_len -= n + 1;
+            return 0;
+        }
+        if (qc->pending_len == sizeof(qc->pending))
+            qc->pending_len = 0;
+
+        struct pollfd p = { qc->fd, POLLIN, 0 };
+        int ready = poll(&p, 1, QMP_REPLY_TIMEOUT_MS);
+        if (ready <= 0)
+        {
+            fprintf(stderr, "No reply from %s%s%s\n", qc->sa.sun_path,
+                ready < 0 ? " - " : "", ready < 0 ? strerror(errno) : "");
+            return -1;
+        }
+        ssize_t got = read(qc->fd, qc->pending + qc->pending_len, sizeof(qc->pending) - qc->pending_len);
+        if (got <= 0)
+        {
+            fprintf(stderr, "Read from %s failed - %s\n", qc->sa.sun_path,
+                got < 0 ? strerror(errno) : "closed");
+            return -1;
+        }
+        qc->pending_len += got;
+    }
+}
+
+/*
+ * The reply to the command with `id`: the next line with that id and a
+ * `return` or an `error`. Events, and replies to commands given up on, are
+ * read past. Reading whatever one read() returned, as this did until
+ * 2026-11-15, handed a command an event or another's reply -- the
+ * screendump's "done" arrived before the file did, and hidsim renamed a
+ * frame QEMU had not written (sandbox jobs a900801c, 27bd6c98, e5049989).
+ */
+static int qmp_read_reply(qmp_connection* qc, unsigned long id, char** out)
+{
+    for (;;)
+    {
+        char* line = NULL;
+        if (qmp_next_line(qc, &line) != 0)
+            return -1;
+
+        struct json_object* jo = json_tokener_parse(line);
+        struct json_object* jid = NULL;
+        bool reply = jo
+            && (json_object_object_get_ex(jo, QMP_RETURN, NULL) || json_object_object_get_ex(jo, "error", NULL))
+            && json_object_object_get_ex(jo, "id", &jid)
+            && (unsigned long)json_object_get_int64(jid) == id;
+        if (jo)
+            json_object_put(jo);
+
+        if (reply)
+        {
+            if (out)
+                *out = line;
+            else
+                free(line);
+            return 0;
+        }
+        free(line);
+    }
+}
+
+/* Sends the given command to the QMPConnection and waits for its reply */
 int qmp_communicate(qmp_connection* qc, const char* in, char** out)
 {
-
-    int ret = write(qc->fd, in, strlen(in));
-    if (ret == -1)
-    {
-        fprintf(stderr, "Write to %s failed - %s\n", qc->sa.sun_path,
-            strerror(errno));
-        return ret;
-    }
-
-    /* Reads the response */
-    ret = read(qc->fd, qc->buf, sizeof(qc->buf));
-
-    if (ret == -1)
-    {
-        fprintf(stderr, "Read from %s failed - %s\n", qc->sa.sun_path,
-            strerror(errno));
-        return ret;
-    }
     if (out)
-        *out = strndup(qc->buf, BUF_SIZE);
-
-    memset(qc->buf, 0, sizeof(qc->buf));
-
-    return 0;
+        *out = NULL;
+    struct json_object* jo = json_tokener_parse(in);
+    if (!jo)
+    {
+        fprintf(stderr, "Not a QMP command: %s\n", in);
+        return -1;
+    }
+    struct json_object* reply = NULL;
+    int ret = qmp_communicate_json(qc, jo, out ? &reply : NULL);
+    if (reply)
+    {
+        *out = strdup(json_object_to_json_string(reply));
+        json_object_put(reply);
+    }
+    json_object_put(jo);
+    return ret;
 }
 
 /* Clean-up */

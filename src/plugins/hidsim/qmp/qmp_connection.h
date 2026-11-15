@@ -118,6 +118,10 @@
 #define QMP_RETURN "return"
 
 #define BUF_SIZE 0x2000
+/* How long a reply is waited for. A screendump writes the whole frame first */
+#ifndef QMP_REPLY_TIMEOUT_MS
+#define QMP_REPLY_TIMEOUT_MS 10000
+#endif
 
 /* Connection to a QMP server */
 typedef struct qmp_connection
@@ -126,6 +130,15 @@ typedef struct qmp_connection
     struct sockaddr_un sa;
     char buf[BUF_SIZE];
     bool is_connected;
+    /*
+     * What the server has sent and no reply has used yet: QMP is lines of
+     * JSON, a read returns any part of them, and the server also sends lines
+     * nobody asked for (events).
+     */
+    char pending[BUF_SIZE];
+    size_t pending_len;
+    /* The `id` of the last command sent: its reply is the one with it */
+    unsigned long last_id;
 } qmp_connection;
 
 /*

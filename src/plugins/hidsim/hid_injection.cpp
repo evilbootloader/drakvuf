@@ -111,6 +111,8 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #include <linux/input.h>
 #include <sys/time.h>
 #include <json-c/json.h>
@@ -185,7 +187,7 @@ static int dump_screen(qmp_connection* qc, const char* path)
 
     if (qmp_check_result_json(out))
     {
-        fprintf(stderr, "[HIDSIM] [INJECTOR] Error dumping screen");
+        fprintf(stderr, "[HIDSIM] [INJECTOR] Error dumping screen\n");
         json_object_put(out);
         json_object_put(cmd);
         return -1;
@@ -218,7 +220,8 @@ static void publish_frame(qmp_connection* qc, const char* path, std::atomic<uint
         return;
     if (rename(part.c_str(), path) != 0)
     {
-        fprintf(stderr, "[HIDSIM] [INJECTOR] Error renaming screen dump %s\n", part.c_str());
+        fprintf(stderr, "[HIDSIM] [INJECTOR] Error renaming screen dump %s - %s\n", part.c_str(),
+            strerror(errno));
         return;
     }
     frames->fetch_add(1);
