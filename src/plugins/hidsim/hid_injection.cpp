@@ -121,6 +121,7 @@
 #include <random>
 #include <cassert>
 #include <chrono>
+#include <functional>
 #include <string>
 
 #include <libdrakvuf/libdrakvuf.h> /* eprint_current_time */
@@ -146,12 +147,18 @@
 /* Throttle injection down to 50 microsecond intervals */
 #define TIME_BIN 50
 #define MAX_SLEEP 10 * 1000000
-/* Mean move count for injecting random clicks */
-#define CLK_MEAN 5
-/* Sigma of the distribution of moves for injecting random clicks */
-#define CLK_SIGMA 5
-/* Screen area to spare for clicking in percent  */
-#define DISPLAY_BORDER 0.2
+/*
+ * Mean move count for injecting random clicks, and its sigma. A click every
+ * three moves or so, about one a second: a check that waits three seconds
+ * for a click, or two within the double-click time, sees one (pafish's).
+ */
+#define CLK_MEAN 3
+#define CLK_SIGMA 1
+/* How long a button is held, and the pause inside a double click, in ms */
+#define CLK_HOLD_MS 80
+#define CLK_DOUBLE_GAP_MS 140
+/* The longest way to a button the monitor found, in microseconds */
+#define TO_BUTTON_MAX_US 600000
 /*
  * Replaces the flawed rand()-function of C's standard library with the
  * Mersenne Twister implementation
@@ -510,6 +517,12 @@ double gaussian_rand (double mean, double sigma)
     return (mean + sigma * u * s);
 }
 
+static int clamp_ms(float value, int low, int high)
+{
+    int v = (int)value;
+    return v < low ? low : v > high ? high : v;
+}
+
 /* Clicks on current cursor location */
 void click(qmp_connection* qc, BTN_ENUM b)
 {
@@ -527,8 +540,11 @@ void click(qmp_connection* qc, BTN_ENUM b)
     PRINT_DEBUG("[HIDSIM] [INJECTOR] %s\n", json_object_to_json_string_ext(cmd,
             JSON_C_TO_STRING_SPACED));
 
-    /* Keep the button down a litte */
-    usleep(500);
+    /*
+     * Held as a hand holds it. Half a millisecond, as it was, made a press
+     * and its release one report of the tablet's.
+     */
+    usleep(1000 * clamp_ms(gaussian_rand(CLK_HOLD_MS, CLK_HOLD_MS / 4), CLK_HOLD_MS / 2, CLK_HOLD_MS * 2));
 
     /* Resets event buffer */
     json_object_put(cmd);
@@ -549,9 +565,23 @@ void click(qmp_connection* qc, BTN_ENUM b)
 
 }
 
-/* Smoothly moves the cursor to new coordinates in a given time frame */
+/* Two clicks within the double-click time */
+static void double_click(qmp_connection* qc, BTN_ENUM b)
+{
+    click(qc, b);
+    usleep(1000 * clamp_ms(gaussian_rand(CLK_DOUBLE_GAP_MS, CLK_DOUBLE_GAP_MS / 4),
+            CLK_DOUBLE_GAP_MS / 2, CLK_DOUBLE_GAP_MS * 2));
+    click(qc, b);
+}
+
+/*
+ * Smoothly moves the cursor to new coordinates in a given time frame.
+ * `step`, when given, runs between two micro movements and stops the
+ * movement where it is when it answers false.
+ */
 void translate(qmp_connection* qc, dimensions* dim, int time_frame,
-    int ox, int oy, int dx, int dy, int* newx, int* newy)
+    int ox, int oy, int dx, int dy, int* newx, int* newy,
+    const std::function<bool()>& step = nullptr)
 {
     const float DISP_RES = dim->dx < dim->dy ? dim->dy : dim->dx;
     assert(DISP_RES > 0);
@@ -623,6 +653,9 @@ void translate(qmp_connection* qc, dimensions* dim, int time_frame,
         /* Randomize the sleep */
         s = (int) gaussian_rand((float)sleep, sleep/16);
         usleep(s);
+
+        if (step && !step())
+            break;
     }
     *newx = cx;
     *newy = cy;
@@ -640,7 +673,18 @@ static int run_random_injection(qmp_connection* qc, bool is_rand_clicks,
     if (get_display_dimensions(qc, &dim, screen_path) != 0)
         return -1;
 
-    auto last_frame = std::chrono::steady_clock::now() - std::chrono::seconds(SCREEN_FRAME_INTERVAL);
+    const auto frame_interval = std::chrono::milliseconds(SCREEN_FRAME_INTERVAL_MS);
+    auto last_frame = std::chrono::steady_clock::now() - frame_interval;
+    /* A frame for the screen monitor when one is due: between two
+     * movements, and between two steps of a long one */
+    auto frame_when_due = [&]()
+    {
+        if (frames && std::chrono::steady_clock::now() - last_frame >= frame_interval)
+        {
+            publish_frame(qc, screen_path, frames);
+            last_frame = std::chrono::steady_clock::now();
+        }
+    };
 
     center_cursor(qc);
 
@@ -655,26 +699,18 @@ static int run_random_injection(qmp_connection* qc, bool is_rand_clicks,
     int MIN_DIST_X = -1 * MAX_DIST_X;
     int MAX_DIST_Y = (1<<15)/4;
     int MIN_DIST_Y = -1 * MAX_DIST_Y;
-    /* Spare areas (probably taskbar and icons) */
-    int LEFT_THRES = (1<<16) * DISPLAY_BORDER;
-    int BOTTOM_THRES = (1<<16) * (1.0 - DISPLAY_BORDER);
 
     int sleep = 0;
     int time_frame = 0;
 
     bool is_click = false;
+    bool to_button = false;
     int moves_next_click = gaussian_rand(CLK_MEAN, CLK_SIGMA);
 
     /* Loops, until stopped */
     while (!has_to_stop->load())
     {
-        /* A frame for the screen monitor, between two movements */
-        if (frames && std::chrono::steady_clock::now() - last_frame >=
-            std::chrono::seconds(SCREEN_FRAME_INTERVAL))
-        {
-            publish_frame(qc, screen_path, frames);
-            last_frame = std::chrono::steady_clock::now();
-        }
+        frame_when_due();
 
         if (coords->load())
         {
@@ -685,21 +721,25 @@ static int run_random_injection(qmp_connection* qc, bool is_rand_clicks,
             coords->store(0);
 
             is_click = true;
+            to_button = true;
         }
         else
         {
             /* Calculates the random displacement of the mouse cursor */
             dx = rand_approx_uniform(MIN_DIST_X, MAX_DIST_X);
             dy = rand_approx_uniform(MIN_DIST_Y, MAX_DIST_Y);
-            if (is_rand_clicks)
+            if (is_rand_clicks && --moves_next_click <= 0)
             {
-                moves_next_click--;
-
-                /* Inject clicks, if CLICK_THRESHOLD moves, since last click */
-                if (moves_next_click <= 0
-                    && (oy + dy) < BOTTOM_THRES && (ox + dx) > LEFT_THRES)
-                    is_click = true;
-
+                /*
+                 * A click where nothing is pressed by it: the top edge of
+                 * the screen, between a third and two thirds across. Where
+                 * the pointer happened to be, as it was, a click lands in
+                 * a window -- in a console it starts a selection that
+                 * stops the program writing to it -- or on an icon.
+                 */
+                dx = rand_approx_uniform((1 << 15) / 3, (1 << 15) * 2 / 3) - ox;
+                dy = (int)dim.dy - oy;
+                is_click = true;
             }
         }
         /* Calculates the actual distance to cover */
@@ -715,29 +755,37 @@ static int run_random_injection(qmp_connection* qc, bool is_rand_clicks,
         /* Reverse negative */
         time_frame = time_frame < dist ? dist + (dist-time_frame) : time_frame;
 
-        /* Moves the cursor smoothy */
-        translate(qc, &dim, (int)time_frame, ox, oy, dx, dy, &nx, &ny);
+        /* A button the monitor found is reached quickly: its dialog may be waiting */
+        if (to_button && time_frame > TO_BUTTON_MAX_US)
+            time_frame = TO_BUTTON_MAX_US;
+
+        /* Moves the cursor smoothy. A wander gives way to a button found meanwhile */
+        translate(qc, &dim, (int)time_frame, ox, oy, dx, dy, &nx, &ny, [&]()
+        {
+            frame_when_due();
+            return to_button || !coords->load();
+        });
 
         ox = nx;
         oy = ny;
 
-        if (is_click)
+        if (is_click && (to_button || !coords->load()))
         {
             PRINT_DEBUG("[HIDSIM] [INJECTOR] Clicking now at %d x %d\n", ox, oy);
-            is_click = false;
-            click(qc, left);
-
-            if (is_rand_clicks)
+            if (to_button)
+                click(qc, left);
+            else
             {
                 moves_next_click = gaussian_rand(CLK_MEAN, CLK_SIGMA);
-
-                /* Simple heuristic for employing double clicks and keypresses */
+                /* Every other one double, at random */
                 if (moves_next_click % 2 == 0)
-                {
+                    double_click(qc, left);
+                else
                     click(qc, left);
-                }
             }
         }
+        is_click = false;
+        to_button = false;
         /* Gaussian distributed waiting between smooth movements */
         sleep = (int) gaussian_rand(0, 10000);
 

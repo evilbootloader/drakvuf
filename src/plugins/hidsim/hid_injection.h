@@ -111,13 +111,17 @@
 #include <atomic>
 #include <mutex>
 
-/* Seconds between two frames of the screen dumped for the monitor */
-#define SCREEN_FRAME_INTERVAL 2
+/*
+ * Milliseconds between two frames of the screen dumped for the monitor. A
+ * dialog may wait three seconds for its button (pafish's do, sandbox job
+ * 831d5f4c): a frame, its reading and the way to the button fit in that.
+ */
+#define SCREEN_FRAME_INTERVAL_MS 1000
 
 /*
  * Injects random HID events or events specified in a template file.
  * screen_path is where the guest's screen is dumped: once for its size and,
- * with frames (random mode only), every SCREEN_FRAME_INTERVAL seconds for
+ * with frames (random mode only), every SCREEN_FRAME_INTERVAL_MS for
  * gui/screen_buttons, counted in frames. The QMP connection is this
  * thread's alone, so the dumps are too.
  */

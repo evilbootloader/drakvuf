@@ -145,6 +145,44 @@ int main()
         CHECK(mask[(70 * SCREEN_TEXT_SCALE) * w + 100 * SCREEN_TEXT_SCALE] == 255);
     }
 
+    /* A console's lines, each ending "... OK": text, not buttons (job 831d5f4c) */
+    std::vector<screen_word> console;
+    for (int line = 0; line < 6; line++)
+        console.push_back({"OK", 596 + 20 * line, 431 + 20 * line, 18, 11});
+    CHECK(pressed(console) == "");
+    /* Two dialogs with an OK each are still two buttons */
+    CHECK(pressed({{"OK", 544, 247, 23, 14}, {"OK", 1200, 600, 23, 14}}) == "ok");
+
+    /* A bold letter on a light button: its hole and its neighbour's gap are
+     * background, not ink -- they were, and "OK" became a block (job 831d5f4c) */
+    for (int dark = 0; dark < 2; dark++)
+    {
+        screen_frame page;
+        page.width = 200;
+        page.height = 100;
+        page.rgb.assign(200 * 100 * 3, dark ? 30 : 240);
+        auto paint = [&](int px, int py)
+        {
+            for (int ch = 0; ch < 3; ch++)
+                page.rgb[(py * 200 + px) * 3 + ch] = dark ? 230 : 20;
+        };
+        /* An O 16 wide and 20 tall with strokes 4 thick, and a bar 4 px right of it */
+        for (int py = 40; py < 60; py++)
+            for (int px = 90; px < 106; px++)
+                if (py < 44 || py >= 56 || px < 94 || px >= 102)
+                    paint(px, py);
+        for (int py = 40; py < 60; py++)
+            for (int px = 110; px < 114; px++)
+                paint(px, py);
+        int w = 0, h = 0;
+        std::vector<uint8_t> mask = screen_text_mask(page, &w, &h);
+        auto at = [&](int px, int py) { return mask[(size_t)(py * SCREEN_TEXT_SCALE) * w + px * SCREEN_TEXT_SCALE]; };
+        CHECK(at(91, 50) == 0);        /* the O's stroke */
+        CHECK(at(98, 50) == 255);      /* its hole */
+        CHECK(at(107, 50) == 255);     /* the gap to the bar */
+        CHECK(at(111, 50) == 0);       /* the bar */
+    }
+
     if (failures)
         return 1;
     puts("ok");

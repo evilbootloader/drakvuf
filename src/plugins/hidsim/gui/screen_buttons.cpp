@@ -49,6 +49,12 @@ const size_t SCREEN_BUTTON_TEXTS_COUNT =
 #define SAME_PLACE 24
 /* What tesseract must make of a word (0 to 100) for it to count as read */
 #define WORD_MIN_CONFIDENCE 60.0f
+/*
+ * A label read this many times on one screen is text, not buttons: a
+ * console's "... OK" at the end of every line (sandbox job 831d5f4c). A
+ * click there starts a selection, which stops the program writing to it.
+ */
+#define LABEL_MAX_REPEATS 2
 
 std::string screen_normalize(const std::string& text)
 {
@@ -112,6 +118,18 @@ bool choose_button(const std::vector<screen_word>& words, int width, int height,
     screen_word best = {};
     bool found = false;
 
+    /* How many times each word is on the screen */
+    std::vector<std::string> normal(words.size());
+    for (size_t i = 0; i < words.size(); i++)
+        normal[i] = screen_normalize(words[i].text);
+    auto repeats = [&](const std::string& text)
+    {
+        size_t n = 0;
+        for (const std::string& one : normal)
+            n += one == text;
+        return n;
+    };
+
     for (size_t i = 0; i < words.size(); i++)
     {
         const std::string one = screen_normalize(words[i].text);
@@ -145,7 +163,8 @@ bool choose_button(const std::vector<screen_word>& words, int width, int height,
             size_t rank = 0;
             while (rank < SCREEN_BUTTON_TEXTS_COUNT && text != SCREEN_BUTTON_TEXTS[rank])
                 rank++;
-            if (rank == SCREEN_BUTTON_TEXTS_COUNT || has_neighbour(words, i, j, box))
+            if (rank == SCREEN_BUTTON_TEXTS_COUNT || has_neighbour(words, i, j, box) ||
+                repeats(one) > LABEL_MAX_REPEATS)
                 continue;
 
             int x = box.x + box.w / 2;
@@ -254,8 +273,18 @@ bool frame_changed(const std::vector<uint32_t>& before, const std::vector<uint32
     return false;
 }
 
-/* Ink is this far from the mean brightness around it (0 to 255) */
+/*
+ * Ink is this far from the mean brightness around it (0 to 255), on the side
+ * away from the background: darker where the neighbourhood is light, lighter
+ * where it is dark. Either side, as until 2026-11-15, also took the light
+ * inside of a bold letter and the gaps between bold letters -- their
+ * neighbourhood's mean is pulled down by the letters -- and "OK" on a dialog
+ * button reached the recogniser as a solid block it could not read (sandbox
+ * job 831d5f4c: pafish's two dialogs, never pressed).
+ */
 #define INK_CONTRAST 40
+/* The mean brightness at and above which a neighbourhood is light */
+#define INK_LIGHT 128
 /* Half the side of the square that mean is taken over, in pixels */
 #define INK_RADIUS 12
 /* A letter is at most this wide and tall, and at least this tall, in pixels */
@@ -299,7 +328,8 @@ std::vector<uint8_t> screen_text_mask(const screen_frame& frame, int* width, int
             uint32_t total = sums[(size_t)y1 * (w + 1) + x1] - sums[(size_t)y0 * (w + 1) + x1]
                 - sums[(size_t)y1 * (w + 1) + x0] + sums[(size_t)y0 * (w + 1) + x0];
             int mean = (int)(total / (uint32_t)((y1 - y0) * (x1 - x0)));
-            if (std::abs((int)gray[(size_t)y * w + x] - mean) > INK_CONTRAST)
+            int g = (int)gray[(size_t)y * w + x];
+            if (mean >= INK_LIGHT ? g < mean - INK_CONTRAST : g > mean + INK_CONTRAST)
                 ink[(size_t)y * w + x] = 1;
         }
     }
