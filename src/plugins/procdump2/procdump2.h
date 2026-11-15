@@ -129,17 +129,17 @@ protected:
      * analysis -- not the injected one, not --procdump-new-processes-on-finish
      * -- and a sample still running then left no dump (sandbox jobs 295f5786
      * and 831d5f4c). Called again by DRAKVUF's stop loop until it is done, as
-     * the part's own stop_impl expects.
-     *
-     * Windows only, for now: the Linux part's stop dumps the processes still
-     * running too, and passing it on would change every Ubuntu analysis,
-     * which is the operator's to decide (sandbox_project CLAUDE.md).
+     * the part's own stop_impl expects. Both parts: an Ubuntu analysis now
+     * dumps its processes still running at the end too (operator,
+     * 2026-11-15).
      */
     bool stop_impl() override
     {
         bool done = true;
         if (wp)
             done = wp->stop() && done;
+        if (lp)
+            done = lp->stop() && done;
         return done && pluginex::stop_impl();
     }
 };
