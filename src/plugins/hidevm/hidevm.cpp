@@ -710,7 +710,6 @@ static void on_dll_hooked(drakvuf_t drakvuf, const dll_view_t* dll, const std::v
     PRINT_DEBUG("[HIDEVM] DLL hooked - done\n");
 }
 
-<<<<<<< HEAD
 // ---------------------------------------------------------------------------
 // Registry hiding for the Xen Platform PCI device (vendor ID 0x5853 == "XS").
 //
@@ -1082,7 +1081,8 @@ event_response_t hidevm::NtOpenKeyTransacted_cb(drakvuf_t, drakvuf_trap_info_t* 
 event_response_t hidevm::NtOpenKeyTransactedEx_cb(drakvuf_t, drakvuf_trap_info_t* info)
 {
     return hidevm_open_key_entry(this, this->drakvuf, info);
-=======
+}
+
 namespace
 {
 struct fastprox_offset_t
@@ -1180,7 +1180,6 @@ static void install_win10_or_win11_execquery_hooks(drakvuf_t drakvuf, wanted_hoo
 
     wanted_hooks.add_hook("SysWOW64\\wbem\\fastprox.dll", "IWbemServices::ExecQuery", e->offset_x32, log, IWbemServices__ExecQuery_args());
     wanted_hooks.add_hook("SysWOW64\\wbem\\fastprox.dll", "IWbemServices::ExecQueryAsync", e->offset_async_x32, log, IWbemServices__ExecQuery_args());
->>>>>>> pr-2
 }
 
 hidevm::hidevm(drakvuf_t drakvuf, const hidevm_config* config, output_format_t output): pluginex(drakvuf, output), drakvuf(drakvuf), format(output)
