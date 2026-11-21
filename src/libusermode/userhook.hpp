@@ -280,6 +280,13 @@ void userhooks_set_injection_mode(bool enable);
  */
 void drakvuf_userhook_lists_changed(drakvuf_t drakvuf);
 
+/** */
+ * Restrict userhooks to the process(es) with one of the given image names and
+ * to their descendants. An empty list disables the restriction.
+ */
+void userhooks_set_target_processes(const std::vector<std::string>& names);
+
+
 /**
  * Requests to stop the userhooks subsystem.
  * @param[in] drakvuf drakvuf context

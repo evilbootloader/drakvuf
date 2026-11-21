@@ -429,6 +429,20 @@ void apimon::usermode_print(drakvuf_trap_info* hit_info, const apimon_call& call
     );
 }
 
+
+event_response_t apimon::usermode_return_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info* info)
+{
+    auto params = libhook::GetTrapParams<ApimonReturnHookData>(info);
+
+
+    usermode_print(info, params->arguments, params->target);
+
+    auto hookID = make_hook_id(info, params->target_rsp);
+    ret_hooks.erase(hookID);
+
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
 static event_response_t usermode_hook_cb(drakvuf_t drakvuf, drakvuf_trap_info* info)
 {
     hook_target_entry_t* target = (hook_target_entry_t*)info->trap->data;

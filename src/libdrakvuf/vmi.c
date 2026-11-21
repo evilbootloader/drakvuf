@@ -121,7 +121,6 @@
 #include "../xen_helper/xen_helper.h"
 
 #include <xenctrl.h>
-
 #include "private.h"
 #include "libdrakvuf.h"
 #include "vmi.h"
@@ -299,10 +298,12 @@ void process_free_requests(drakvuf_t drakvuf)
 }
 
 /* Re-arm one breakpoint in the refreshed shadow copy of its page */
+
 static bool reapply_breakpoint(vmi_instance_t vmi, struct memcb_pass* pass, addr_t pa, struct wrapper* s)
 {
     drakvuf_t drakvuf = pass->drakvuf;
     uint8_t test = 0;
+
 
 #ifdef DRAKVUF_DEBUG
     for (GSList* t = s->traps; t; t = t->next)
@@ -359,6 +360,7 @@ static bool refresh_shadow_copy(vmi_instance_t vmi, struct memcb_pass* pass)
      * the list below is: what was recorded at the pre-write callback may be
      * gone by now. This also covers the IDRX path, whose pass carries no
      * remapped gfn when the page has none.
+
      */
     pass->remapped_gfn = (struct remapped_gfn*)g_hash_table_lookup(drakvuf->remapped_gfns, GSIZE_TO_POINTER(pass->gfn));
     if (!pass->remapped_gfn)
@@ -386,21 +388,14 @@ static bool refresh_shadow_copy(vmi_instance_t vmi, struct memcb_pass* pass)
     }
 
     /*
-     * pass->traps was looked up when the write was intercepted. Trap callbacks
-     * and the deferred removal may have removed breakpoints on this page
-     * since, which frees nodes of that list (remove_trap, g_slist_remove), so
-     * walk the CURRENT list instead and skip what is no longer a breakpoint.
-     * Upstream's d5b220de. Here the window is the common case rather than a
-     * corner: return_tracker removes transient return breakpoints on exactly
-     * the pages a packer writes, and under --parallel-events the removal is
-     * applied after the listen in which the post-write step event may still
-     * be pending -- so the stale list was walked after its nodes were freed.
-     * A reused node then holds a heap pointer as its pa, vmi_read_8_pa fails
-     * with "Critical error in re-copying remapped gfn" and the trace stops;
-     * a not-yet-reused one puts 0xCC into the shadow copy at a breakpoint
-     * that no longer exists.
+     * pass->traps was looked up when the write was intercepted. Callbacks and
+     * process_free_requests() may have removed breakpoints on this page since,
+     * which frees nodes of that list, so walk the current list instead.
      */
+
+
     GSList* loop = (GSList*)g_hash_table_lookup(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(pass->gfn));
+
 #ifdef DRAKVUF_DEBUG
     if (loop)
     {
@@ -408,6 +403,7 @@ static bool refresh_shadow_copy(vmi_instance_t vmi, struct memcb_pass* pass)
         trap_stats_page_copy(pass->remapped_gfn->o, first && first->traps ? first->traps->data : NULL);
     }
 #endif
+
     while (loop)
     {
         addr_t pa = GPOINTER_TO_SIZE(loop->data);
@@ -487,7 +483,7 @@ static event_response_t _post_mem_cb(drakvuf_t drakvuf, vmi_event_t* event)
      * We need to copy the newly written page to the remapped gfn
      * and reapply all traps. pass->traps is set only for a write to a page
      * that had breakpoints when the write was intercepted. Use it as that
-     * flag only: the list itself may have been freed since (refresh_shadow_copy).
+     * flag only: the list itself may have been freed since.
      */
     if ( pass->traps &&
         g_hash_table_lookup(drakvuf->breakpoint_lookup_gfn, GSIZE_TO_POINTER(pass->gfn)) &&
@@ -888,7 +884,7 @@ static event_response_t _int3_cb(drakvuf_t drakvuf, vmi_event_t* event)
 
     flush_vmi(drakvuf);
 
-#ifdef DEBUG
+#ifdef DRAKVUF_DEBUG
     reg_t cr3 = event->x86_regs->cr3;
     PRINT_DEBUG("INT3 event vCPU %u altp2m:%u CR3: 0x%"PRIx64" PA=0x%"PRIx64" RIP=0x%"PRIx64". Insn_length: %u\n",
         event->vcpu_id, event->slat_id, cr3, pa,
@@ -1229,7 +1225,7 @@ static event_response_t _debug_cb(drakvuf_t drakvuf, vmi_event_t* event)
 
     flush_vmi(drakvuf);
 
-#ifdef DEBUG
+#ifdef DRAKVUF_DEBUG
     addr_t pa = (event->debug_event.gfn << 12) + event->debug_event.offset;
     PRINT_DEBUG("Debug event vCPU %u altp2m:%u CR3: 0x%"PRIx64" PA=0x%"PRIx64" RIP=0x%"PRIx64". Insn_length: %u\n",
         event->vcpu_id, event->slat_id, event->x86_regs->cr3, pa,
@@ -1281,7 +1277,7 @@ static event_response_t _msr_cb(drakvuf_t drakvuf, vmi_event_t* event)
     event_response_t rsp = 0;
 
     flush_vmi(drakvuf);
-#ifdef DEBUG
+#ifdef DRAKVUF_DEBUG
     PRINT_DEBUG("MSR event vCPU %u altp2m:%u MSR=0x%"PRIx32" Value=0x%"PRIx64"\n",
         event->vcpu_id, event->slat_id, event->reg_event.msr, event->reg_event.value);
 #endif
@@ -1419,6 +1415,7 @@ static event_response_t io_cb(vmi_instance_t vmi, vmi_event_t* event)
     serial_callback_exit(drakvuf);
     return ret;
 }
+
 
 // Put the original byte back in the guest. A domain that is gone has nothing left to restore,
 // only the bookkeeping remains to be dropped
@@ -2205,6 +2202,7 @@ static status_t drain_ring(drakvuf_t drakvuf)
     return status;
 }
 
+
 /*
  * Ask the toolstack whether the guest is still there, the same way xl learns about a guest-initiated reboot or
  * power off. Returns true when it is not: the loop is interrupted with the matching exit reason and guest memory
@@ -2649,6 +2647,7 @@ static void drop_vmi_of_gone_domain(drakvuf_t drakvuf)
         // does for a live domain: the caller holds the VMI lock, so what is
         // left of the callbacks runs on this thread.
         stop_parallel_events(drakvuf);
+
         // While a generic mem_event is registered, LibVMI resets the access rights of every guest page on destroy: seconds of
         // hypercalls for a domain that is gone, so drop the event first
         vmi_clear_event(drakvuf->vmi, &drakvuf->mem_event, NULL);
@@ -2664,6 +2663,7 @@ void close_vmi(drakvuf_t drakvuf)
     xen_pause(drakvuf->xen, drakvuf->domID);
 
     trap_stats_print();
+
 
     drop_vmi_of_gone_domain(drakvuf);
 

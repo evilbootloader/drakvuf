@@ -152,68 +152,60 @@ event_response_t hidevm::ReturnNtDeviceIoControlFile_cb(drakvuf_t, drakvuf_trap_
     // Verify that hook for this thread was created
     if (this->ret_hooks.count(hook_ID))
     {
-        if (params->verifyResultCallParams(drakvuf, info))
+        if (this->stage == STAGE_WMI_OPEN_BLOCK)
         {
-            if (this->stage == STAGE_WMI_OPEN_BLOCK)
-            {
-                if (info->regs->rax == STATUS_WMI_GUID_NOT_FOUND)
-                {
-                    ACCESS_CONTEXT(ctx,
-                        .translate_mechanism = VMI_TM_PROCESS_DTB,
-                        .dtb = info->regs->cr3,
-                        .addr = this->addr_WmiKmRequestOpenBlock_Handle
-                    );
-                    // Set fake handle value of WmiGuid
-                    if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &this->FakeWmiGuidHandle))
-                    {
-                        if (VMI_SUCCESS == vmi_set_vcpureg(vmi, STATUS_SUCCESS, RAX, info->vcpu))
-                        {
-                            this->stage = STAGE_WMI_QUERY_GUID_INFORMATION;
-                        }
-                        else
-                        {
-                            this->stage = 0;
-                            PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_OPEN_GUID_BLOCK): Failed to set RAX to STATUS_SUCCESS\n");
-                        }
-                    }
-                    else
-                    {
-                        this->stage = 0;
-                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_OPEN_GUID_BLOCK) Failed to write fake WmiGuid Handle\n");
-                    }
-                }
-                this->ret_hooks.erase(hook_ID);
-            }
-            else if (this->stage == STAGE_WMI_QUERY_GUID_INFORMATION)
+            if (info->regs->rax == STATUS_WMI_GUID_NOT_FOUND)
             {
                 ACCESS_CONTEXT(ctx,
                     .translate_mechanism = VMI_TM_PROCESS_DTB,
                     .dtb = info->regs->cr3,
-                    .addr = this->addr_InputBuffer_Status
+                    .addr = this->addr_WmiKmRequestOpenBlock_Handle
                 );
-
-                uint64_t InputBuffer_Status = 0;
-                if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &InputBuffer_Status))
+                // Set fake handle value of WmiGuid
+                if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &this->FakeWmiGuidHandle))
                 {
-                    ctx.addr = this->addr_IoStatusBlock_Information;
-                    uint64_t IoStatusBlock_Information = 0x10;
-                    // IoStatusBlock.Information on return from NtDeviceIoControlFile with IOCTL_WMI_QUERY_GUID_INFORMATION should contain 0x10
-                    if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &IoStatusBlock_Information))
+                    if (VMI_SUCCESS == vmi_set_vcpureg(vmi, STATUS_SUCCESS, RAX, info->vcpu))
                     {
-                        if (VMI_SUCCESS == vmi_set_vcpureg(vmi, STATUS_SUCCESS, RAX, info->vcpu))
-                        {
-                            this->stage = STAGE_WMI_QUERY_ALL_DATA;
-                        }
-                        else
-                        {
-                            this->stage = 0;
-                            PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_GUID_INFORMATION): Failed to set RAX to STATUS_SUCCESS\n");
-                        }
+                        this->stage = STAGE_WMI_QUERY_GUID_INFORMATION;
                     }
                     else
                     {
                         this->stage = 0;
-                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_GUID_INFORMATION): Failed to write InputBuffer.Status\n");
+                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_OPEN_GUID_BLOCK): Failed to set RAX to STATUS_SUCCESS\n");
+                    }
+                }
+                else
+                {
+                    this->stage = 0;
+                    PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_OPEN_GUID_BLOCK) Failed to write fake WmiGuid Handle\n");
+                }
+            }
+            this->ret_hooks.erase(hook_ID);
+        }
+        else if (this->stage == STAGE_WMI_QUERY_GUID_INFORMATION)
+        {
+            ACCESS_CONTEXT(ctx,
+                .translate_mechanism = VMI_TM_PROCESS_DTB,
+                .dtb = info->regs->cr3,
+                .addr = this->addr_InputBuffer_Status
+            );
+
+            uint64_t InputBuffer_Status = 0;
+            if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &InputBuffer_Status))
+            {
+                ctx.addr = this->addr_IoStatusBlock_Information;
+                uint64_t IoStatusBlock_Information = 0x10;
+                // IoStatusBlock.Information on return from NtDeviceIoControlFile with IOCTL_WMI_QUERY_GUID_INFORMATION should contain 0x10
+                if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &IoStatusBlock_Information))
+                {
+                    if (VMI_SUCCESS == vmi_set_vcpureg(vmi, STATUS_SUCCESS, RAX, info->vcpu))
+                    {
+                        this->stage = STAGE_WMI_QUERY_ALL_DATA;
+                    }
+                    else
+                    {
+                        this->stage = 0;
+                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_GUID_INFORMATION): Failed to set RAX to STATUS_SUCCESS\n");
                     }
                 }
                 else
@@ -221,129 +213,134 @@ event_response_t hidevm::ReturnNtDeviceIoControlFile_cb(drakvuf_t, drakvuf_trap_
                     this->stage = 0;
                     PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_GUID_INFORMATION): Failed to write InputBuffer.Status\n");
                 }
-                this->addr_InputBuffer_Status = 0;
-                this->addr_IoStatusBlock_Information = 0;
-                this->ret_hooks.erase(hook_ID);
             }
-            else if (this->stage == STAGE_WMI_QUERY_ALL_DATA)
+            else
             {
-                uint32_t out_WmiKmQueryData_Length = 0;
-                uint32_t out_WmiKmQueryData_Flags = 0;
-                uint32_t out_WmiKmQueryData_DataLen = 0;
-                uint64_t out_IoStatusBlock_Information = 0;
+                this->stage = 0;
+                PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_GUID_INFORMATION): Failed to write InputBuffer.Status\n");
+            }
+            this->addr_InputBuffer_Status = 0;
+            this->addr_IoStatusBlock_Information = 0;
+            this->ret_hooks.erase(hook_ID);
+        }
+        else if (this->stage == STAGE_WMI_QUERY_ALL_DATA)
+        {
+            uint32_t out_WmiKmQueryData_Length = 0;
+            uint32_t out_WmiKmQueryData_Flags = 0;
+            uint32_t out_WmiKmQueryData_DataLen = 0;
+            uint64_t out_IoStatusBlock_Information = 0;
 
-                if (this->query_stage == 1)
+            if (this->query_stage == 1)
+            {
+                ACCESS_CONTEXT(ctx,
+                    .translate_mechanism = VMI_TM_PROCESS_DTB,
+                    .dtb = info->regs->cr3,
+                    .addr = this->addr_InputBuffer + WmiKmQueryData_Length
+                );
+                // Prepare data on first return from NtDeviceIoControlFile with IOCTL_WMI_QUERY_ALL_DATA
+                out_WmiKmQueryData_Length = 0x38;
+                if (VMI_SUCCESS == vmi_write_32(vmi, &ctx, &out_WmiKmQueryData_Length))
                 {
-                    ACCESS_CONTEXT(ctx,
-                        .translate_mechanism = VMI_TM_PROCESS_DTB,
-                        .dtb = info->regs->cr3,
-                        .addr = this->addr_InputBuffer + WmiKmQueryData_Length
-                    );
-                    // Prepare data on first return from NtDeviceIoControlFile with IOCTL_WMI_QUERY_ALL_DATA
-                    out_WmiKmQueryData_Length = 0x38;
-                    if (VMI_SUCCESS == vmi_write_32(vmi, &ctx, &out_WmiKmQueryData_Length))
+                    ctx.addr = this->addr_InputBuffer + WmiKmQueryData_Guid;
+                    if (VMI_SUCCESS == vmi_write(vmi, &ctx, sizeof(binThermalZoneGuid), (void*)binThermalZoneGuid, nullptr))
                     {
-                        ctx.addr = this->addr_InputBuffer + WmiKmQueryData_Guid;
-                        if (VMI_SUCCESS == vmi_write(vmi, &ctx, sizeof(binThermalZoneGuid), (void*)binThermalZoneGuid, nullptr))
+                        ctx.addr = this->addr_InputBuffer + WmiKmQueryData_Flags;
+                        out_WmiKmQueryData_Flags = 0x20;
+                        if (VMI_SUCCESS == vmi_write_32(vmi, &ctx, &out_WmiKmQueryData_Flags))
                         {
-                            ctx.addr = this->addr_InputBuffer + WmiKmQueryData_Flags;
-                            out_WmiKmQueryData_Flags = 0x20;
-                            if (VMI_SUCCESS == vmi_write_32(vmi, &ctx, &out_WmiKmQueryData_Flags))
+                            ctx.addr = this->addr_InputBuffer + WmiKmQueryData_DataLen;
+                            out_WmiKmQueryData_DataLen = sizeof(WMI_data);
+                            if (VMI_SUCCESS == vmi_write_32(vmi, &ctx, &out_WmiKmQueryData_DataLen))
                             {
-                                ctx.addr = this->addr_InputBuffer + WmiKmQueryData_DataLen;
-                                out_WmiKmQueryData_DataLen = sizeof(WMI_data);
-                                if (VMI_SUCCESS == vmi_write_32(vmi, &ctx, &out_WmiKmQueryData_DataLen))
+                                ctx.addr = this->addr_IoStatusBlock_Information;
+                                out_IoStatusBlock_Information = 0x38;
+                                if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &out_IoStatusBlock_Information))
                                 {
-                                    ctx.addr = this->addr_IoStatusBlock_Information;
-                                    out_IoStatusBlock_Information = 0x38;
-                                    if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &out_IoStatusBlock_Information))
+                                    if (VMI_SUCCESS == vmi_set_vcpureg(vmi, STATUS_SUCCESS, RAX, info->vcpu))
                                     {
-                                        if (VMI_SUCCESS == vmi_set_vcpureg(vmi, STATUS_SUCCESS, RAX, info->vcpu))
-                                        {
-                                            this->addr_InputBuffer = 0;
-                                            this->addr_IoStatusBlock_Information = 0;
-                                            this->query_stage = 2;
-                                        }
-                                        else
-                                        {
-                                            this->stage = 0;
-                                            PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to set RAX to STATUS_SUCCESS\n");
-                                        }
+                                        this->addr_InputBuffer = 0;
+                                        this->addr_IoStatusBlock_Information = 0;
+                                        this->query_stage = 2;
                                     }
                                     else
                                     {
                                         this->stage = 0;
-                                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write IoStatusBlock.Information (Bytes returned)\n");
+                                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to set RAX to STATUS_SUCCESS\n");
                                     }
                                 }
                                 else
                                 {
                                     this->stage = 0;
-                                    PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write InputBuffer.DataLen\n");
+                                    PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write IoStatusBlock.Information (Bytes returned)\n");
                                 }
                             }
                             else
                             {
                                 this->stage = 0;
-                                PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write InputBuffer.Flags\n");
+                                PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write InputBuffer.DataLen\n");
                             }
                         }
                         else
                         {
                             this->stage = 0;
-                            PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write InputBuffer.Guid\n");
+                            PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write InputBuffer.Flags\n");
                         }
                     }
                     else
                     {
                         this->stage = 0;
-                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write InputBuffer.Length\n");
+                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write InputBuffer.Guid\n");
                     }
                 }
-                else if (this->query_stage == 2)
+                else
                 {
-                    ACCESS_CONTEXT(ctx,
-                        .translate_mechanism = VMI_TM_PROCESS_DTB,
-                        .dtb = info->regs->cr3,
-                        .addr = this->addr_InputBuffer
-                    );
+                    this->stage = 0;
+                    PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 1: Failed to write InputBuffer.Length\n");
+                }
+            }
+            else if (this->query_stage == 2)
+            {
+                ACCESS_CONTEXT(ctx,
+                    .translate_mechanism = VMI_TM_PROCESS_DTB,
+                    .dtb = info->regs->cr3,
+                    .addr = this->addr_InputBuffer
+                );
 
-                    // Set fake data to OutputBuffer, that should be returned
-                    if (VMI_SUCCESS == vmi_write(vmi, &ctx, sizeof(WMI_data), (void*)WMI_data, nullptr))
+                // Set fake data to OutputBuffer, that should be returned
+                if (VMI_SUCCESS == vmi_write(vmi, &ctx, sizeof(WMI_data), (void*)WMI_data, nullptr))
+                {
+                    out_IoStatusBlock_Information = sizeof(WMI_data);
+                    ctx.addr = this->addr_IoStatusBlock_Information;
+                    if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &out_IoStatusBlock_Information))
                     {
-                        out_IoStatusBlock_Information = sizeof(WMI_data);
-                        ctx.addr = this->addr_IoStatusBlock_Information;
-                        if (VMI_SUCCESS == vmi_write_64(vmi, &ctx, &out_IoStatusBlock_Information))
+                        if (VMI_SUCCESS == vmi_set_vcpureg(vmi, STATUS_SUCCESS, RAX, info->vcpu))
                         {
-                            if (VMI_SUCCESS == vmi_set_vcpureg(vmi, STATUS_SUCCESS, RAX, info->vcpu))
-                            {
-                                this->addr_InputBuffer_Status = 0;
-                                this->addr_IoStatusBlock_Information = 0;
-                                this->NtClose_hook[hook_ID] = this->createSyscallHook("NtClose", &hidevm::NtClose_cb);
-                                fmt::print(this->format, "hidevm", drakvuf, info,
-                                    keyval("Reason", fmt::Qstr("MSAcpi_ThermalZoneTemperature query spoofed"))
-                                );
-                            }
-                            else
-                            {
-                                this->stage = 0;
-                                PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 2: Failed to write InputBuffer.Status\n");
-                            }
+                            this->addr_InputBuffer_Status = 0;
+                            this->addr_IoStatusBlock_Information = 0;
+                            this->NtClose_hook[hook_ID] = this->createSyscallHook("NtClose", &hidevm::NtClose_cb);
+                            fmt::print(this->format, "hidevm", drakvuf, info,
+                                keyval("Reason", fmt::Qstr("MSAcpi_ThermalZoneTemperature query spoofed"))
+                            );
                         }
                         else
                         {
                             this->stage = 0;
-                            PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 2: Failed to write IoStatusBlock.Information\n");
+                            PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 2: Failed to write InputBuffer.Status\n");
                         }
                     }
                     else
                     {
                         this->stage = 0;
-                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 2: Failed to write WMI data buffer\n");
+                        PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 2: Failed to write IoStatusBlock.Information\n");
                     }
                 }
-                this->ret_hooks.erase(hook_ID);
+                else
+                {
+                    this->stage = 0;
+                    PRINT_DEBUG("[HIDEVM] Breakpoint on return NtDeviceIoControlFile(IOCTL_WMI_QUERY_ALL_DATA) Step 2: Failed to write WMI data buffer\n");
+                }
             }
+            this->ret_hooks.erase(hook_ID);
         }
     }
 
@@ -713,6 +710,7 @@ static void on_dll_hooked(drakvuf_t drakvuf, const dll_view_t* dll, const std::v
     PRINT_DEBUG("[HIDEVM] DLL hooked - done\n");
 }
 
+<<<<<<< HEAD
 // ---------------------------------------------------------------------------
 // Registry hiding for the Xen Platform PCI device (vendor ID 0x5853 == "XS").
 //
@@ -1084,6 +1082,105 @@ event_response_t hidevm::NtOpenKeyTransacted_cb(drakvuf_t, drakvuf_trap_info_t* 
 event_response_t hidevm::NtOpenKeyTransactedEx_cb(drakvuf_t, drakvuf_trap_info_t* info)
 {
     return hidevm_open_key_entry(this, this->drakvuf, info);
+=======
+namespace
+{
+struct fastprox_offset_t
+{
+    uint32_t build;
+    addr_t offset_x64;
+    addr_t offset_async_x64;
+    addr_t offset_x32;
+    addr_t offset_async_x32;
+};
+
+// fastprox.dll is a different binary in almost every Windows 10 and
+// Windows 11 build, so IWbemServices::ExecQuery needs its own offset per
+// build (the single offset used for all of Windows 10 before was only
+// right for 1803).
+// ExecQueryAsync is hooked too: PowerShell's Get-WmiObject/Get-CimInstance
+// calls it instead of the synchronous ExecQuery, so without it the spoofing
+// never triggers for that (very common) client. Both take strQuery as their
+// 3rd argument in this ABI, so they share the same handler. Extracted from
+// Microsoft's public symbol server (fastprox.pdb) for the binaries shipped
+// on each release's installation media (System32 and SysWOW64).
+const fastprox_offset_t fastprox_offsets[] =
+{
+    { 10240, 0x2f640, 0x2f500, 0x0a4b0, 0x0a3c0 }, // Windows 10 1507
+    { 10586, 0x305b0, 0x30470, 0x0a3c0, 0x0a2d0 }, // 1511
+    { 14393, 0x2d0f0, 0x2cfb0, 0x2dba0, 0x2dab0 }, // 1607
+    { 15063, 0x04040, 0x03f00, 0x30570, 0x30490 }, // 1703
+    { 16299, 0x2b140, 0x2b000, 0x2ff30, 0x2fe50 }, // 1709
+    { 17134, 0x2b280, 0x2b140, 0x30690, 0x305b0 }, // 1803
+    { 17763, 0x2aae0, 0x05fa0, 0x2c8d0, 0x2c7f0 }, // 1809
+    { 18362, 0x0c8f0, 0x07210, 0x2d3e0, 0x2d2a0 }, // 1903
+    { 18363, 0x0c8f0, 0x07210, 0x2d3e0, 0x2d2a0 }, // 1909
+    { 19041, 0x0d740, 0x0d8c0, 0x0c7e0, 0x09fb0 }, // 2004
+    { 19042, 0x0d740, 0x0d8c0, 0x0c7e0, 0x09fb0 }, // 20H2
+    { 19043, 0x0d740, 0x0d8c0, 0x0c7e0, 0x09fb0 }, // 21H1
+    { 19044, 0x0d740, 0x0d8c0, 0x0c7e0, 0x09fb0 }, // 21H2
+    { 19045, 0x0d740, 0x0d8c0, 0x0c7e0, 0x09fb0 }, // 22H2
+    { 22000, 0x26fb0, 0x26e20, 0x28ef0, 0x2bb90 }, // Windows 11 21H2
+    { 22621, 0x1a6a0, 0x1a290, 0x0d490, 0x0ab80 }, // 22H2
+    { 22631, 0x1a6a0, 0x1a290, 0x0d490, 0x0ab80 }, // 23H2
+    { 26100, 0x363c0, 0x37000, 0x0d570, 0x0ae10 }, // 24H2
+    { 26200, 0x36560, 0x371a0, 0x0d580, 0x0ae10 }, // 25H2
+    { 28000, 0x3c020, 0x3b550, 0x0d840, 0x0ab80 }, // 26H1 (Insider)
+};
+} // namespace
+
+static const fastprox_offset_t* find_fastprox_offsets(uint32_t nt_build_number)
+{
+    for (const auto& e : fastprox_offsets)
+        if (e.build == nt_build_number)
+            return &e;
+
+    return nullptr;
+}
+
+// Windows 11 is reported as VMI_OS_WINDOWS_10 by LibVMI (same NT major/minor
+// version), and the fastprox.dll offsets differ per build on both, so the
+// exact build number is needed. NtBuildNumber sits at a fixed offset in
+// KUSER_SHARED_DATA since Windows Vista.
+static uint32_t read_nt_build_number(drakvuf_t drakvuf)
+{
+    auto vmi = vmi_lock_guard(drakvuf);
+
+    // KUSER_SHARED_DATA's well-known VA on x64 is 0xFFFFF78000000000 (was
+    // missing a trailing zero here, off by a factor of 16, which made
+    // vmi_translate_kv2p fail/return the wrong physical address).
+    addr_t kuser = vmi_get_address_width(vmi) == 8 ? 0xFFFFF78000000000 : 0xFFDF0000;
+    addr_t pkuser;
+    uint32_t nt_build_number = 0;
+    if (VMI_SUCCESS == vmi_translate_kv2p(vmi, kuser, &pkuser))
+        vmi_read_32_pa(vmi, pkuser + 0x260, &nt_build_number);
+
+    return nt_build_number;
+}
+
+// Windows 7 hooks IWbemServices::ExecQuery at a single fixed offset.
+// Windows 10 and Windows 11 (reported as VMI_OS_WINDOWS_10 by LibVMI too)
+// need a per-build offset (see find_fastprox_offsets()) and also hook
+// ExecQueryAsync. Early-return style to keep this decision out of the
+// caller's nesting.
+static void install_win10_or_win11_execquery_hooks(drakvuf_t drakvuf, wanted_hooks_t& wanted_hooks, const HookActions& log)
+{
+    uint32_t nt_build_number = read_nt_build_number(drakvuf);
+    const auto* e = find_fastprox_offsets(nt_build_number);
+    if (!e)
+    {
+        PRINT_DEBUG("[HIDEVM] Unrecognized Windows build %u, ExecQuery offset unknown, WQL spoofing disabled\n", nt_build_number);
+        return;
+    }
+
+    wanted_hooks.add_hook("System32\\wbem\\fastprox.dll", "IWbemServices::ExecQuery", e->offset_x64, log, IWbemServices__ExecQuery_args());
+    wanted_hooks.add_hook("System32\\wbem\\fastprox.dll", "IWbemServices::ExecQueryAsync", e->offset_async_x64, log, IWbemServices__ExecQuery_args());
+    if (!e->offset_x32)
+        return;
+
+    wanted_hooks.add_hook("SysWOW64\\wbem\\fastprox.dll", "IWbemServices::ExecQuery", e->offset_x32, log, IWbemServices__ExecQuery_args());
+    wanted_hooks.add_hook("SysWOW64\\wbem\\fastprox.dll", "IWbemServices::ExecQueryAsync", e->offset_async_x32, log, IWbemServices__ExecQuery_args());
+>>>>>>> pr-2
 }
 
 hidevm::hidevm(drakvuf_t drakvuf, const hidevm_config* config, output_format_t output): pluginex(drakvuf, output), drakvuf(drakvuf), format(output)
@@ -1092,7 +1189,10 @@ hidevm::hidevm(drakvuf_t drakvuf, const hidevm_config* config, output_format_t o
     if (config->delay)
     {
         vmi_lock_guard vmi(drakvuf);
-        addr_t kuser = vmi_get_address_width(vmi) == 8 ? 0xFFFFF7800000000 : 0xFFDF0000;
+        // KUSER_SHARED_DATA's well-known VA on x64 is 0xFFFFF78000000000
+        // (was missing a trailing zero here, off by a factor of 16, which
+        // made vmi_translate_kv2p fail/return the wrong physical address).
+        addr_t kuser = vmi_get_address_width(vmi) == 8 ? 0xFFFFF78000000000 : 0xFFDF0000;
         addr_t pkuser;
         if (VMI_SUCCESS != vmi_translate_kv2p(vmi, kuser, &pkuser))
         {
@@ -1172,9 +1272,6 @@ hidevm::hidevm(drakvuf_t drakvuf, const hidevm_config* config, output_format_t o
         addr_t offset_IWbemServices__ExecQuery_win7_x64 = 0x7100;
         addr_t offset_IWbemServices__ExecQuery_win7_x32 = 0x1ebe0;
 
-        addr_t offset_IWbemServices__ExecQuery_win10_x64 = 0x2b280;
-        addr_t offset_IWbemServices__ExecQuery_win10_x32 = 0x30690;
-
         switch (win_ver)
         {
             case VMI_OS_WINDOWS_7:
@@ -1182,8 +1279,7 @@ hidevm::hidevm(drakvuf_t drakvuf, const hidevm_config* config, output_format_t o
                 wanted_hooks.add_hook("SysWOW64\\wbem\\fastprox.dll", "IWbemServices::ExecQuery", offset_IWbemServices__ExecQuery_win7_x32, log, IWbemServices__ExecQuery_args());
                 break;
             case VMI_OS_WINDOWS_10:
-                wanted_hooks.add_hook("System32\\wbem\\fastprox.dll", "IWbemServices::ExecQuery", offset_IWbemServices__ExecQuery_win10_x64, log, IWbemServices__ExecQuery_args());
-                wanted_hooks.add_hook("SysWOW64\\wbem\\fastprox.dll", "IWbemServices::ExecQuery", offset_IWbemServices__ExecQuery_win10_x32, log, IWbemServices__ExecQuery_args());
+                install_win10_or_win11_execquery_hooks(drakvuf, wanted_hooks, log);
                 break;
             default:
                 break;

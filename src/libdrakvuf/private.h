@@ -220,7 +220,9 @@ struct drakvuf
     GHashTable* remove_traps;
 
     int interrupted;
-    bool domain_gone;    // the guest shut down or the domain was destroyed: do not touch guest memory any more (upstream 3ce4088c)
+
+    bool domain_gone;    // the guest shut down or the domain was destroyed: do not touch guest memory any more
+
     page_mode_t pm;
     unsigned int vcpus;
     uint64_t init_memsize;

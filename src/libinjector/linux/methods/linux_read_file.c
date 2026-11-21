@@ -206,7 +206,8 @@ event_response_t handle_read_file(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
             if (!call_open_syscall_cb(injector, info->regs))
                 return cleanup(drakvuf, info, true);
 
-            // Use FILE_BUF_SIZE for the first read, not injector->buffer.len which is 0
+            // buffer.len is 0 here (set in file init), request a full chunk
+
             if (!setup_read_syscall(injector, info->regs, injector->fd,
                     injector->virtual_memory_addr, FILE_BUF_SIZE))
                 return cleanup(drakvuf, info, true);

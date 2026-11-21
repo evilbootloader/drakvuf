@@ -724,8 +724,6 @@ event_response_t win_filetracer::create_file_ret_cb(drakvuf_t drakvuf, drakvuf_t
 {
     auto params = libhook::GetTrapParams<win_data>(info);
 
-    if (!params->verifyResultCallParams(drakvuf, info))
-        return VMI_EVENT_RESPONSE_NONE;
 
     uint32_t handle = 0;
     {
@@ -823,8 +821,6 @@ event_response_t win_filetracer::open_file_ret_cb(drakvuf_t drakvuf, drakvuf_tra
 {
     auto params = libhook::GetTrapParams<win_data>(info);
 
-    if (!params->verifyResultCallParams(drakvuf, info))
-        return VMI_EVENT_RESPONSE_NONE;
 
     uint32_t handle = 0;
     {
@@ -929,8 +925,6 @@ event_response_t win_filetracer::query_attributes_file_ret_cb(drakvuf_t drakvuf,
 {
     auto params = libhook::GetTrapParams<win_data>(info);
 
-    if (!params->verifyResultCallParams(drakvuf, info))
-        return VMI_EVENT_RESPONSE_NONE;
 
     auto [succ_1, file_attrs] = objattr_read(drakvuf, info, params->obj_attr);
     auto [succ_2, file_info] = basic_file_info_read(drakvuf, info, params->file_information);
@@ -976,8 +970,6 @@ event_response_t win_filetracer::query_full_attributes_file_ret_cb(drakvuf_t dra
 {
     auto params = libhook::GetTrapParams<win_data>(info);
 
-    if (!params->verifyResultCallParams(drakvuf, info))
-        return VMI_EVENT_RESPONSE_NONE;
 
     auto [succ_1, file_attrs] = objattr_read(drakvuf, info, params->obj_attr);
     auto [succ_2, file_info] = net_file_info_read(drakvuf, info, params->file_information);
@@ -1130,8 +1122,6 @@ event_response_t win_filetracer::query_information_file_ret_cb(drakvuf_t drakvuf
 {
     auto params = libhook::GetTrapParams<win_data>(info);
 
-    if (!params->verifyResultCallParams(drakvuf, info))
-        return VMI_EVENT_RESPONSE_NONE;
 
     switch (params->file_information_class )
     {

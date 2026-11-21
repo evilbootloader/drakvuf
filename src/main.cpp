@@ -336,6 +336,8 @@ static void print_usage()
         "\t                           Stop printing addresses of string arguments in apimon and memdump\n"
         "\t --userhook-injection-mode\n"
         "\t                           Use MmCopyVirtualMemory injection instead of PF injection in userhooks\n"
+        "\t --userhook-target-process <process name>\n"
+        "\t                           Only hook the processes with this name and their descendants (can be repeated multiple times)\n"
 #endif
 #if defined(ENABLE_PLUGIN_PROCDUMP) || defined(ENABLE_PLUGIN_PROCDUMP2)
         "\t --procdump-timeout <timeout>\n"
@@ -532,6 +534,7 @@ int main(int argc, char** argv)
         opt_sysret_mode,
         opt_userhook_no_addr,
         opt_userhook_injection_mode,
+        opt_userhook_target_process,
         opt_terminate,
         opt_termination_timeout,
         opt_traps_ttl,
@@ -626,6 +629,7 @@ int main(int argc, char** argv)
         {"sysret-mode", required_argument, NULL, opt_sysret_mode},
         {"userhook-no-addr", no_argument, NULL, opt_userhook_no_addr},
         {"userhook-injection-mode", no_argument, NULL, opt_userhook_injection_mode},
+        {"userhook-target-process", required_argument, NULL, opt_userhook_target_process},
         {"fast-singlestep", no_argument, NULL, 'F'},
         {"traps-ttl", required_argument, NULL, opt_traps_ttl},
         {"parallel-events", no_argument, NULL, opt_parallel_events},
@@ -897,6 +901,9 @@ int main(int argc, char** argv)
                 break;
             case opt_userhook_injection_mode:
                 options.userhook_injection_mode = true;
+                break;
+            case opt_userhook_target_process:
+                options.userhook_target_processes.push_back(optarg);
                 break;
             case opt_ignore_pid:
             {

@@ -471,43 +471,47 @@ int screen_monitor(const char* path, std::atomic<uint32_t>* frames,
 
     while (!has_to_stop->load())
     {
-        if (frames->load() == seen)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-        seen = frames->load();
-
-        /* A frame that cannot be read is the next one's problem */
-        if (!read_ppm(path, &frame))
-            continue;
-        /*
-         * Recognition costs a second of a core: only a frame that changed by
-         * more than the pointer is read, and one that stays is read again
-         * when a button pressed on it and still there may be pressed again.
-         */
-        std::vector<uint32_t> blocks = frame_blocks(frame);
-        const auto started = std::chrono::steady_clock::now();
-        if (!frame_changed(last, blocks) &&
-            started - read_at < std::chrono::seconds(PRESS_AGAIN_AFTER))
-            continue;
-        last = std::move(blocks);
-        read_at = started;
-
-        recognise(ocr, frame, &words);
-
-        int x, y;
-        std::string label;
-        if (choose_button(words, frame.width, frame.height, &x, &y, &label, pressed_lately, &history))
-        {
-            const auto now = std::chrono::steady_clock::now();
-            history.erase(std::remove_if(history.begin(), history.end(), [&](const pressed& p)
+        try {
+            if (frames->load() == seen)
             {
-                return now - p.at >= std::chrono::seconds(PRESS_AGAIN_AFTER);
-            }), history.end());
-            history.push_back({label, x, y, now});
-            fprintf(stderr, "[HIDSIM] [MONITOR] \"%s\" at %d x %d\n", label.c_str(), x, y);
-            coords->store((uint32_t)x << 16 | (uint32_t)y);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            seen = frames->load();
+
+            /* A frame that cannot be read is the next one's problem */
+            if (!read_ppm(path, &frame))
+                continue;
+            /*
+            * Recognition costs a second of a core: only a frame that changed by
+            * more than the pointer is read, and one that stays is read again
+            * when a button pressed on it and still there may be pressed again.
+            */
+            std::vector<uint32_t> blocks = frame_blocks(frame);
+            const auto started = std::chrono::steady_clock::now();
+            if (!frame_changed(last, blocks) &&
+                started - read_at < std::chrono::seconds(PRESS_AGAIN_AFTER))
+                continue;
+            last = std::move(blocks);
+            read_at = started;
+
+            recognise(ocr, frame, &words);
+
+            int x, y;
+            std::string label;
+            if (choose_button(words, frame.width, frame.height, &x, &y, &label, pressed_lately, &history))
+            {
+                const auto now = std::chrono::steady_clock::now();
+                history.erase(std::remove_if(history.begin(), history.end(), [&](const pressed& p)
+                {
+                    return now - p.at >= std::chrono::seconds(PRESS_AGAIN_AFTER);
+                }), history.end());
+                history.push_back({label, x, y, now});
+                fprintf(stderr, "[HIDSIM] [MONITOR] \"%s\" at %d x %d\n", label.c_str(), x, y);
+                coords->store((uint32_t)x << 16 | (uint32_t)y);
+            }
+        } catch (int x){
+            continue;
         }
     }
 
